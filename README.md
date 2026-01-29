@@ -81,6 +81,18 @@ let tx_hash = wallet.send_quick_liquidation(
 ).await?;
 ```
 
+### Connection Warmup (Save 5-20ms)
+
+Preestablish TCP/TLS connections before time-critical operations:
+
+```rust
+// Simple warmup
+wallet.warmup().await?;
+
+// Full preheat: connections + nonce + gas prices
+let ctx = wallet.preheat_full().await?;
+```
+
 ### Preheated Optimistic (Lowest Latency)
 
 ```rust

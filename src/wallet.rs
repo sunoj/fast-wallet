@@ -392,6 +392,50 @@ impl FastWallet {
         }
     }
 
+    // ==================== Connection Warmup ====================
+
+    /// Warm up HTTP connections with detailed results
+    ///
+    /// This establishes TCP/TLS connections to:
+    /// - Primary RPC endpoint
+    /// - All batch RPC endpoints (if configured)
+    ///
+    /// Can save 5-20ms per endpoint on subsequent requests.
+    /// Call this once during initialization or before time-critical operations.
+    ///
+    /// Returns (primary_ok, batch_count) where batch_count is the number
+    /// of successfully warmed batch endpoints.
+    pub async fn warmup_connections(&self) -> (bool, usize) {
+        // Warm up primary RPC
+        let primary_ok = self.rpc_client.warmup().await.is_ok();
+
+        // Warm up batch RPC endpoints
+        let batch_count = if let Some(batch_client) = &self.batch_client {
+            batch_client.warmup().await
+        } else {
+            0
+        };
+
+        (primary_ok, batch_count)
+    }
+
+    /// Full preheat: warm connections + allocate nonce + fetch gas
+    ///
+    /// This is the most comprehensive preheat, ideal for liquidation bots:
+    /// 1. Warms up HTTP connections (TCP/TLS handshakes)
+    /// 2. Allocates a nonce
+    /// 3. Fetches current gas prices
+    ///
+    /// Call this ~100-500ms before you expect to send a transaction.
+    pub async fn preheat_full(&self) -> WalletResult<PreheatedContext> {
+        // Warm connections and fetch gas in parallel
+        let (_, ctx) = tokio::join!(
+            self.warmup_connections(),
+            self.preheat(true)
+        );
+        ctx
+    }
+
     // ==================== Nonce Management ====================
 
     /// Sync nonce from chain

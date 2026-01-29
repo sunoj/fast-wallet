@@ -318,6 +318,55 @@ impl TransactionBroadcaster {
         self.endpoints.sort_by_key(|e| e.priority);
     }
 
+    /// Warm up HTTP connections to all endpoints
+    ///
+    /// Establishes TCP/TLS connections ahead of time by sending lightweight
+    /// `eth_chainId` requests. This can save 5-20ms per endpoint on subsequent
+    /// transaction broadcasts.
+    ///
+    /// Returns the number of successfully warmed connections.
+    pub async fn warmup(&self) -> usize {
+        let futures: Vec<_> = self
+            .endpoints
+            .iter()
+            .map(|endpoint| self.warmup_endpoint(endpoint))
+            .collect();
+
+        let results = join_all(futures).await;
+        results.into_iter().filter(|r| r.is_ok()).count()
+    }
+
+    /// Warm up a single endpoint
+    async fn warmup_endpoint(&self, endpoint: &RpcEndpoint) -> WalletResult<()> {
+        let request_body = json!({
+            "jsonrpc": "2.0",
+            "method": "eth_chainId",
+            "params": [],
+            "id": self.next_id(),
+        });
+
+        let mut request = self.client.post(&endpoint.url).json(&request_body);
+
+        if let Some((key, value)) = &endpoint.auth_header {
+            request = request.header(key, value);
+        }
+
+        let timeout_duration = endpoint.timeout.unwrap_or(self.default_timeout);
+
+        let response = timeout(timeout_duration, request.send())
+            .await
+            .map_err(|_| WalletError::Timeout)?
+            .map_err(|e| WalletError::NetworkError(e.to_string()))?;
+
+        // Just check that we got a valid response
+        let _: RpcResponse = response
+            .json()
+            .await
+            .map_err(|e| WalletError::RpcError(e.to_string()))?;
+
+        Ok(())
+    }
+
     /// Get next request ID
     fn next_id(&self) -> u64 {
         self.request_id.fetch_add(1, Ordering::Relaxed)

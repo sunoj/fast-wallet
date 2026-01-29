@@ -78,6 +78,16 @@ impl RpcClient {
         }
     }
 
+    /// Warm up the HTTP connection pool by sending a lightweight request
+    ///
+    /// This establishes TCP/TLS connections ahead of time, saving 5-20ms
+    /// on subsequent requests. Use this before time-critical operations.
+    pub async fn warmup(&self) -> WalletResult<()> {
+        // eth_chainId is the lightest RPC call - just returns the chain ID
+        let _: String = self.request("eth_chainId", json!([])).await?;
+        Ok(())
+    }
+
     /// Get next request ID (atomic, lock-free)
     #[inline]
     fn next_id(&self) -> u64 {
@@ -352,6 +362,21 @@ impl BatchRpcClient {
         }
 
         Err(last_err.unwrap_or_else(|| WalletError::RpcError("No RPC endpoints".to_string())))
+    }
+
+    /// Warm up HTTP connections to all endpoints
+    ///
+    /// Establishes TCP/TLS connections by sending lightweight requests.
+    /// Returns the number of successfully warmed connections.
+    pub async fn warmup(&self) -> usize {
+        let futures: Vec<_> = self.clients.iter().map(|c| c.warmup()).collect();
+        let results = join_all(futures).await;
+        results.into_iter().filter(|r| r.is_ok()).count()
+    }
+
+    /// Get the number of endpoints
+    pub fn endpoint_count(&self) -> usize {
+        self.clients.len()
     }
 }
 
