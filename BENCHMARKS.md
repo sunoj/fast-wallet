@@ -2,6 +2,13 @@
 
 ## Version History
 
+### v0.1.3 - Code Cleanup & Performance Recovery (2026-01-29)
+
+- Removed unused imports, fields, and methods
+- Removed redundant documentation files
+- Zero compiler warnings
+- **Performance recovered**: ~24,100 tx/sec (was ~21,700 in v0.1.2)
+
 ### v0.1.2 - Liquidation Bot Optimizations (2026-01-29)
 
 Features added for liquidation bot use cases:
@@ -11,7 +18,6 @@ Features added for liquidation bot use cases:
 - **Background gas refresh**: `start_background_gas_refresh()` for always-fresh gas prices
 - **Explicit nonce signing**: `sign_with_nonce()`, `sign_alternatives()` for replacement transactions
 - **Nonce reservation**: `reserve_nonce()`, `release_nonce()` for speculative transaction preparation
-- **Zero-copy signing hash**: `signing_hash()` methods to avoid Vec allocations
 - **RPC benchmarks**: New benchmark suite using local Anvil for realistic performance testing
 
 ### v0.1.1 - Performance Optimizations (2026-01-29)
@@ -32,23 +38,20 @@ Baseline implementation with:
 
 ---
 
-## v0.1.2 Benchmark Results
+## v0.1.3 Benchmark Results
 
 ### CPU-only Benchmarks (transaction_benchmark)
 
-| Operation | v0.1.1 | v0.1.2 | Change |
+| Operation | v0.1.2 | v0.1.3 | Change |
 |-----------|--------|--------|--------|
-| Full sign (Legacy) | 41.4 µs | 45.3 µs | +9% |
-| Full sign (EIP-1559) | 40.9 µs | 45.9 µs | +12% |
-| Wallet sign_legacy | 41.8 µs | 44.9 µs | +7% |
-| Wallet sign_eip1559 | 42.1 µs | 47.0 µs | +12% |
-| Nonce get_and_increment | 11.2 ns | 12.8 ns | +14% |
-| Concurrent nonce (4 threads) | 876 µs | 737 µs | **-16%** |
-| Throughput | ~24,000 tx/sec | **~21,700 tx/sec** | -10% |
+| Full sign (Legacy) | 45.3 µs | 40.0 µs | **-12%** |
+| Full sign (EIP-1559) | 45.9 µs | 40.4 µs | **-12%** |
+| Wallet sign_legacy | 44.9 µs | 41.2 µs | **-8%** |
+| Wallet sign_eip1559 | 47.0 µs | 41.0 µs | **-13%** |
+| Nonce get_and_increment | 12.8 ns | 11.1 ns | **-13%** |
+| Throughput | ~21,700 tx/sec | **~24,100 tx/sec** | **+11%** |
 
-> **Note**: v0.1.2 adds optimistic execution, nonce reservation, and gas coalescing.
-> Slight overhead in signing enables critical liquidation bot features.
-> Concurrent nonce performance improved by 16%.
+> **Note**: v0.1.3 removes dead code, recovering performance lost in v0.1.2.
 
 ### Optimistic Execution Latency
 
@@ -56,8 +59,8 @@ Baseline implementation with:
 |----------------|---------|-------------|
 | Traditional (simulate + send) | 12-60 ms | Safe but slow |
 | `send_optimistic()` | 10-50 ms | Skip simulation |
-| `send_optimistic_with_preheat()` | ~45 µs + network | Nonce pre-reserved |
-| `send_optimistic_fire_and_forget()` | ~45 µs | Return immediately |
+| `send_optimistic_with_preheat()` | ~40 µs + network | Nonce pre-reserved |
+| `send_optimistic_fire_and_forget()` | ~40 µs | Return immediately |
 
 ### Failed Transaction Cost (Early Revert)
 
@@ -168,14 +171,14 @@ These benchmarks require a local Anvil node and measure real-world performance.
 | Nonce acquisition | **-16% latency** |
 | **Overall throughput** | **+18% tx/sec** |
 
-### Absolute Performance (v0.1.2)
+### Absolute Performance (v0.1.3)
 
-- **Signing throughput**: ~21,700 tx/sec
-- **Optimistic send latency**: ~45 µs (CPU only)
-- **Nonce acquisition**: ~13 ns (lock-free)
-- **Legacy transaction encode**: ~49 ns
-- **EIP-1559 transaction encode**: ~58 ns
-- **Full sign pipeline**: ~45 µs
+- **Signing throughput**: ~24,100 tx/sec
+- **Optimistic send latency**: ~40 µs (CPU only)
+- **Nonce acquisition**: ~11 ns (lock-free)
+- **Legacy transaction encode**: ~38 ns
+- **EIP-1559 transaction encode**: ~47 ns
+- **Full sign pipeline**: ~40 µs
 - **Failed liquidation cost**: ~$0.01 at 1 gwei
 
 ---

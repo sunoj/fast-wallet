@@ -4,9 +4,9 @@ High-performance EVM wallet optimized for liquidation bots and MEV applications.
 
 ## Features
 
-- **~21,700 tx/sec** signing throughput
-- **~13ns** lock-free nonce acquisition
-- **~45µs** optimistic send latency (CPU only)
+- **~24,100 tx/sec** signing throughput
+- **~11ns** lock-free nonce acquisition
+- **~40µs** optimistic send latency (CPU only)
 - **Optimistic execution**: Skip simulation for lowest latency
 - **Fire-and-forget**: Return immediately, send in background
 - **Gas coalescing**: Multiple requests share single RPC call
