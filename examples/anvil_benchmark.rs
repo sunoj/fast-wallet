@@ -107,6 +107,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .chain_id(31337)
         .build_with_nonce(0)?;
 
+    // Legacy transaction signing
     let iterations = 10000;
     let start = Instant::now();
 
@@ -124,7 +125,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ops_per_sec = iterations as f64 / elapsed.as_secs_f64();
 
     println!(
-        "Signing speed: {:.0} tx/sec ({:.2} µs/tx)",
+        "Legacy signing: {:.0} tx/sec ({:.2} µs/tx)",
+        ops_per_sec,
+        elapsed.as_micros() as f64 / iterations as f64
+    );
+
+    // EIP-1559 transaction signing
+    let wallet = FastWalletBuilder::new(ANVIL_PRIVATE_KEY, ANVIL_RPC_URL)
+        .chain_id(31337)
+        .build_with_nonce(0)?;
+
+    let start = Instant::now();
+
+    for _ in 0..iterations {
+        let request = TransactionRequest::new()
+            .to(Address::repeat_byte(1))
+            .value(U256::from(1_000_000_000_000_000u64)) // 0.001 ETH
+            .gas_limit(21000)
+            .max_fee_per_gas(U256::from(50_000_000_000u64))      // 50 gwei
+            .max_priority_fee_per_gas(U256::from(2_000_000_000u64)); // 2 gwei
+
+        let _ = wallet.sign(request)?;
+    }
+
+    let elapsed = start.elapsed();
+    let ops_per_sec = iterations as f64 / elapsed.as_secs_f64();
+
+    println!(
+        "EIP-1559 signing: {:.0} tx/sec ({:.2} µs/tx)",
         ops_per_sec,
         elapsed.as_micros() as f64 / iterations as f64
     );

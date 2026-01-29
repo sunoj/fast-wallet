@@ -42,16 +42,18 @@ impl NonceTracker {
     /// Get the next nonce and increment (lock-free)
     ///
     /// This is the hot path - must be as fast as possible.
-    #[inline]
+    /// Uses AcqRel ordering which is sufficient for single-threaded hot path
+    /// while still providing visibility guarantees.
+    #[inline(always)]
     pub fn get_and_increment(&self) -> u64 {
         self.pending_count.fetch_add(1, Ordering::Relaxed);
-        self.current.fetch_add(1, Ordering::SeqCst)
+        self.current.fetch_add(1, Ordering::AcqRel)
     }
 
     /// Get the current nonce without incrementing
-    #[inline]
+    #[inline(always)]
     pub fn peek(&self) -> u64 {
-        self.current.load(Ordering::SeqCst)
+        self.current.load(Ordering::Acquire)
     }
 
     /// Get the number of pending transactions
@@ -72,7 +74,7 @@ impl NonceTracker {
         self.pending_count.fetch_sub(1, Ordering::Relaxed);
 
         // If the failed nonce is less than current, we might have a gap
-        let current = self.current.load(Ordering::SeqCst);
+        let current = self.current.load(Ordering::Acquire);
         if used_nonce < current {
             self.needs_sync.store(1, Ordering::Release);
         }
@@ -81,7 +83,8 @@ impl NonceTracker {
     /// Force set the nonce (used during sync)
     #[inline]
     pub fn set(&self, nonce: u64) {
-        self.current.store(nonce, Ordering::SeqCst);
+        // Use Release ordering to ensure all previous writes are visible
+        self.current.store(nonce, Ordering::Release);
         self.synced_nonce.store(nonce, Ordering::Release);
         self.needs_sync.store(0, Ordering::Release);
     }

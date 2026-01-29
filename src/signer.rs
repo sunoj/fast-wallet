@@ -7,7 +7,7 @@ use crate::crypto::{keccak256, public_key_to_address};
 use crate::error::{WalletError, WalletResult};
 use alloy_primitives::{Address, B256};
 use k256::ecdsa::{SigningKey, VerifyingKey};
-use k256::elliptic_curve::sec1::ToEncodedPoint as _;
+use k256::elliptic_curve::sec1::ToEncodedPoint;
 
 /// Recovery ID with chain ID for EIP-155
 #[derive(Debug, Clone, Copy)]
@@ -90,7 +90,7 @@ impl FastSigner {
     ///
     /// This is the core signing function, optimized for speed.
     /// The chain_id is used to compute the v value for EIP-155.
-    #[inline]
+    #[inline(always)]
     pub fn sign_hash(&self, hash: &B256, chain_id: u64) -> WalletResult<RecoverableSignature> {
         // Sign the hash using k256's recoverable signature
         let (signature, recovery_id) = self
@@ -98,8 +98,10 @@ impl FastSigner {
             .sign_prehash_recoverable(hash.as_slice())
             .map_err(|e| WalletError::SigningError(e.to_string()))?;
 
-        let r = B256::from_slice(&signature.r().to_bytes());
-        let s = B256::from_slice(&signature.s().to_bytes());
+        // Optimized: get signature bytes directly, avoiding intermediate to_bytes() calls
+        let sig_bytes: [u8; 64] = signature.to_bytes().into();
+        let r = B256::from_slice(&sig_bytes[..32]);
+        let s = B256::from_slice(&sig_bytes[32..]);
 
         // EIP-155: v = recovery_id + 35 + chain_id * 2
         let v = recovery_id.to_byte() as u64 + 35 + chain_id * 2;
@@ -110,15 +112,17 @@ impl FastSigner {
     /// Sign a message hash for EIP-1559 transactions (different v calculation)
     ///
     /// For EIP-1559/2930 transactions, v is just the recovery ID (0 or 1)
-    #[inline]
+    #[inline(always)]
     pub fn sign_hash_typed(&self, hash: &B256) -> WalletResult<RecoverableSignature> {
         let (signature, recovery_id) = self
             .signing_key
             .sign_prehash_recoverable(hash.as_slice())
             .map_err(|e| WalletError::SigningError(e.to_string()))?;
 
-        let r = B256::from_slice(&signature.r().to_bytes());
-        let s = B256::from_slice(&signature.s().to_bytes());
+        // Optimized: get signature bytes directly
+        let sig_bytes: [u8; 64] = signature.to_bytes().into();
+        let r = B256::from_slice(&sig_bytes[..32]);
+        let s = B256::from_slice(&sig_bytes[32..]);
         let v = recovery_id.to_byte() as u64;
 
         Ok(RecoverableSignature { r, s, v })

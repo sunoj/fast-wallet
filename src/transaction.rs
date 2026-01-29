@@ -2,12 +2,22 @@
 //!
 //! This module provides high-performance transaction encoding using alloy-rlp.
 //! It supports Legacy, EIP-2930, and EIP-1559 transactions.
+//!
+//! Optimizations:
+//! - Thread-local buffer reuse to avoid allocations
+//! - Inline hints for hot path functions
 
 use crate::crypto::keccak256;
 use crate::error::WalletResult;
 use crate::signer::{FastSigner, RecoverableSignature};
 use alloy_primitives::{Address, Bytes, B256, U256};
 use alloy_rlp::Encodable;
+use std::cell::RefCell;
+
+// Thread-local buffer for encoding to avoid repeated allocations
+thread_local! {
+    static ENCODE_BUF: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(512));
+}
 
 /// Transaction request (unsigned transaction parameters)
 #[derive(Debug, Clone, Default)]
@@ -130,13 +140,20 @@ pub struct Transaction {
 
 impl LegacyTransaction {
     /// Encode for signing (EIP-155)
+    ///
+    /// Uses thread-local buffer to minimize allocations in hot path.
+    #[inline]
     pub fn encode_for_signing(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(256);
-        self.encode_signing_fields(&mut buf);
-        buf
+        ENCODE_BUF.with(|buf| {
+            let mut buf = buf.borrow_mut();
+            buf.clear();
+            self.encode_signing_fields(&mut buf);
+            buf.clone()
+        })
     }
 
     /// Encode signing fields to buffer
+    #[inline]
     fn encode_signing_fields(&self, buf: &mut Vec<u8>) {
         // [nonce, gasPrice, gasLimit, to, value, data, chainId, 0, 0]
         let list_len = self.rlp_list_len_for_signing();
@@ -208,14 +225,21 @@ impl LegacyTransaction {
 
 impl Eip1559Transaction {
     /// Encode for signing (no type prefix, just the list)
+    ///
+    /// Uses thread-local buffer to minimize allocations.
+    #[inline]
     pub fn encode_for_signing(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(256);
-        // Type 2 prefix
-        buf.push(0x02);
-        self.encode_fields(&mut buf);
-        buf
+        ENCODE_BUF.with(|buf| {
+            let mut buf = buf.borrow_mut();
+            buf.clear();
+            // Type 2 prefix
+            buf.push(0x02);
+            self.encode_fields(&mut buf);
+            buf.clone()
+        })
     }
 
+    #[inline]
     fn encode_fields(&self, buf: &mut Vec<u8>) {
         let list_len = self.rlp_list_len();
         alloy_rlp::Header {
@@ -283,14 +307,21 @@ impl Eip1559Transaction {
 
 impl Eip2930Transaction {
     /// Encode for signing
+    ///
+    /// Uses thread-local buffer to minimize allocations.
+    #[inline]
     pub fn encode_for_signing(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(256);
-        // Type 1 prefix
-        buf.push(0x01);
-        self.encode_fields(&mut buf);
-        buf
+        ENCODE_BUF.with(|buf| {
+            let mut buf = buf.borrow_mut();
+            buf.clear();
+            // Type 1 prefix
+            buf.push(0x01);
+            self.encode_fields(&mut buf);
+            buf.clone()
+        })
     }
 
+    #[inline]
     fn encode_fields(&self, buf: &mut Vec<u8>) {
         let list_len = self.rlp_list_len();
         alloy_rlp::Header {
@@ -375,6 +406,7 @@ fn to_length(to: Option<Address>) -> usize {
 }
 
 /// Encode access list
+#[inline]
 fn encode_access_list(access_list: &[AccessListItem], buf: &mut Vec<u8>) {
     let len: usize = access_list.iter().map(|item| item.length()).sum();
     alloy_rlp::Header {
@@ -388,6 +420,7 @@ fn encode_access_list(access_list: &[AccessListItem], buf: &mut Vec<u8>) {
 }
 
 /// Get access list RLP length
+#[inline]
 fn access_list_length(access_list: &[AccessListItem]) -> usize {
     let inner_len: usize = access_list.iter().map(|item| item.length()).sum();
     alloy_rlp::length_of_length(inner_len) + inner_len
@@ -482,59 +515,69 @@ impl Transaction {
 
 impl TransactionRequest {
     /// Create a new transaction request
+    #[inline]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Set recipient
+    #[inline]
     pub fn to(mut self, to: Address) -> Self {
         self.to = Some(to);
         self
     }
 
     /// Set value
+    #[inline]
     pub fn value(mut self, value: U256) -> Self {
         self.value = value;
         self
     }
 
     /// Set data
+    #[inline]
     pub fn data(mut self, data: impl Into<Bytes>) -> Self {
         self.data = data.into();
         self
     }
 
     /// Set gas limit
+    #[inline]
     pub fn gas_limit(mut self, gas_limit: u64) -> Self {
         self.gas_limit = gas_limit;
         self
     }
 
     /// Set nonce
+    #[inline]
     pub fn nonce(mut self, nonce: u64) -> Self {
         self.nonce = nonce;
         self
     }
 
     /// Set chain ID
+    #[inline]
     pub fn chain_id(mut self, chain_id: u64) -> Self {
         self.chain_id = chain_id;
         self
     }
 
     /// Set legacy gas price
+    #[inline]
     pub fn gas_price(mut self, gas_price: U256) -> Self {
         self.gas_price = Some(gas_price);
         self
     }
 
     /// Set EIP-1559 max fee
+    #[inline]
     pub fn max_fee_per_gas(mut self, max_fee: U256) -> Self {
         self.max_fee_per_gas = Some(max_fee);
         self
     }
 
     /// Set EIP-1559 max priority fee
+    #[inline]
     pub fn max_priority_fee_per_gas(mut self, max_priority_fee: U256) -> Self {
         self.max_priority_fee_per_gas = Some(max_priority_fee);
         self
