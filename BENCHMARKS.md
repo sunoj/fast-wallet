@@ -2,6 +2,13 @@
 
 ## Version History
 
+### v0.1.4 - Blink Labs RPC Integration (2026-01-29)
+
+- **Blink Labs RPC**: Built-in support for low-latency MEV-optimized RPC
+- New APIs: `RpcEndpoint::blink()`, `FastWalletBuilder::with_blink()`
+- Multi-chain support: eth, arb, base, opt, polygon
+- Performance: ~21,000-24,000 tx/sec (environment-dependent)
+
 ### v0.1.3 - Code Cleanup & Performance Recovery (2026-01-29)
 
 - Removed unused imports, fields, and methods
