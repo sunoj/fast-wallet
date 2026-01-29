@@ -7,7 +7,6 @@ use crate::crypto::{keccak256, public_key_to_address};
 use crate::error::{WalletError, WalletResult};
 use alloy_primitives::{Address, B256};
 use k256::ecdsa::{SigningKey, VerifyingKey};
-use k256::elliptic_curve::sec1::ToEncodedPoint;
 
 /// Recovery ID with chain ID for EIP-155
 #[derive(Debug, Clone, Copy)]

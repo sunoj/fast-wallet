@@ -149,8 +149,6 @@ pub struct FastWallet {
     gas_price_cache: RwLock<Option<(U256, Instant)>>,
     /// Cached priority fee
     priority_fee_cache: RwLock<Option<(U256, Instant)>>,
-    /// Cached base fee
-    base_fee_cache: RwLock<Option<(U256, Instant)>>,
     /// Whether warmup has been done
     warmed_up: AtomicBool,
     /// Gas request coalescer
@@ -182,7 +180,6 @@ impl FastWallet {
             pending_semaphore: Semaphore::new(config.max_pending_txs),
             gas_price_cache: RwLock::new(None),
             priority_fee_cache: RwLock::new(None),
-            base_fee_cache: RwLock::new(None),
             warmed_up: AtomicBool::new(false),
             gas_coalescer: GasCoalescer::new(),
             config,
@@ -224,7 +221,6 @@ impl FastWallet {
             pending_semaphore: Semaphore::new(config.max_pending_txs),
             gas_price_cache: RwLock::new(None),
             priority_fee_cache: RwLock::new(None),
-            base_fee_cache: RwLock::new(None),
             warmed_up: AtomicBool::new(false),
             gas_coalescer: GasCoalescer::new(),
             config,
@@ -608,17 +604,7 @@ impl FastWallet {
         self.nonce_manager.fail(nonce);
     }
 
-    // ==================== Transaction Signing (Internal) ====================
-
-    /// Internal sign method used by other public methods
-    #[inline]
-    fn sign_internal(&self, mut request: TransactionRequest) -> WalletResult<Transaction> {
-        if request.gas_limit == 0 {
-            request.gas_limit = self.config.default_gas_limit;
-        }
-
-        request.build_and_sign(&self.signer)
-    }
+    // ==================== Transaction Signing ====================
 
     /// Sign using a preheated context
     ///
