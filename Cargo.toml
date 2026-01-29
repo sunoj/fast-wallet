@@ -1,0 +1,87 @@
+[package]
+name = "fast-wallet"
+version = "0.1.0"
+edition = "2021"
+description = "High-performance EVM wallet optimized for liquidation bots"
+authors = ["Fast Wallet Team"]
+
+[lib]
+name = "fast_wallet"
+path = "src/lib.rs"
+
+[[bin]]
+name = "fast-wallet"
+path = "src/main.rs"
+
+[[bench]]
+name = "transaction_benchmark"
+harness = false
+
+[dependencies]
+# Async runtime - tokio for high-performance async
+tokio = { version = "1.35", features = ["full", "sync", "time", "rt-multi-thread"] }
+
+# Fast crypto primitives
+k256 = { version = "0.13", features = ["ecdsa", "schnorr"] }
+sha3 = "0.10"  # Keccak256
+tiny-keccak = { version = "2.0", features = ["keccak"] }
+
+# RLP encoding - using alloy for fastest encoding
+alloy-rlp = { version = "0.3", features = ["derive"] }
+alloy-primitives = { version = "0.8", features = ["rlp"] }
+
+# Futures utilities
+futures = "0.3"
+
+# HTTP client for RPC
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Hex encoding/decoding
+hex = "0.4"
+
+# Random number generation for testing
+rand = "0.8"
+
+# Error handling
+thiserror = "1.0"
+anyhow = "1.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Parking lot for faster locks
+parking_lot = "0.12"
+
+# Dashmap for concurrent hashmap
+dashmap = "6.0"
+
+# Bytes manipulation
+bytes = "1.5"
+
+[dev-dependencies]
+# Benchmarking
+criterion = { version = "0.5", features = ["async_tokio"] }
+tokio-test = "0.4"
+
+# Mock server for testing
+wiremock = "0.6"
+
+# Timing utilities
+instant = "0.1"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.bench]
+opt-level = 3
+lto = "thin"
+debug = false

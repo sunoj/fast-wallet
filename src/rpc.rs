@@ -1,0 +1,389 @@
+//! High-performance JSON-RPC client for EVM chains
+//!
+//! This module provides an optimized RPC client with:
+//! - Connection pooling
+//! - Parallel request support
+//! - Minimal serialization overhead
+
+use crate::error::{WalletError, WalletResult};
+use alloy_primitives::{Address, B256, U256};
+use futures::future::join_all;
+use reqwest::Client;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+/// JSON-RPC request
+#[derive(Debug, Serialize)]
+struct RpcRequest<'a> {
+    jsonrpc: &'static str,
+    method: &'a str,
+    params: Value,
+    id: u64,
+}
+
+/// JSON-RPC response
+#[derive(Debug, Deserialize)]
+struct RpcResponse<T> {
+    #[allow(dead_code)]
+    jsonrpc: String,
+    #[allow(dead_code)]
+    id: u64,
+    result: Option<T>,
+    error: Option<RpcError>,
+}
+
+/// JSON-RPC error
+#[derive(Debug, Deserialize)]
+struct RpcError {
+    code: i64,
+    message: String,
+    #[allow(dead_code)]
+    data: Option<Value>,
+}
+
+/// High-performance RPC client
+pub struct RpcClient {
+    client: Client,
+    url: String,
+    request_id: AtomicU64,
+}
+
+impl RpcClient {
+    /// Create a new RPC client with optimized settings
+    pub fn new(url: impl Into<String>) -> WalletResult<Self> {
+        let client = Client::builder()
+            .pool_max_idle_per_host(10)
+            .pool_idle_timeout(Duration::from_secs(30))
+            .timeout(Duration::from_secs(30))
+            .tcp_nodelay(true)
+            .build()
+            .map_err(|e| WalletError::NetworkError(e.to_string()))?;
+
+        Ok(Self {
+            client,
+            url: url.into(),
+            request_id: AtomicU64::new(1),
+        })
+    }
+
+    /// Create with custom client configuration
+    pub fn with_client(client: Client, url: impl Into<String>) -> Self {
+        Self {
+            client,
+            url: url.into(),
+            request_id: AtomicU64::new(1),
+        }
+    }
+
+    /// Get next request ID (atomic, lock-free)
+    #[inline]
+    fn next_id(&self) -> u64 {
+        self.request_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Execute a raw JSON-RPC request
+    async fn request<T: for<'de> Deserialize<'de>>(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> WalletResult<T> {
+        let req = RpcRequest {
+            jsonrpc: "2.0",
+            method,
+            params,
+            id: self.next_id(),
+        };
+
+        let response = self
+            .client
+            .post(&self.url)
+            .json(&req)
+            .send()
+            .await
+            .map_err(|e| WalletError::NetworkError(e.to_string()))?;
+
+        let rpc_response: RpcResponse<T> = response
+            .json()
+            .await
+            .map_err(|e| WalletError::RpcError(e.to_string()))?;
+
+        if let Some(error) = rpc_response.error {
+            return Err(WalletError::RpcError(format!(
+                "RPC error {}: {}",
+                error.code, error.message
+            )));
+        }
+
+        rpc_response
+            .result
+            .ok_or_else(|| WalletError::RpcError("Empty response".to_string()))
+    }
+
+    /// Get the current nonce for an address
+    pub async fn get_nonce(&self, address: Address) -> WalletResult<u64> {
+        let result: String = self
+            .request(
+                "eth_getTransactionCount",
+                json!([format!("{:?}", address), "pending"]),
+            )
+            .await?;
+
+        parse_u64_hex(&result)
+    }
+
+    /// Get the current nonce at latest block (confirmed transactions only)
+    pub async fn get_nonce_latest(&self, address: Address) -> WalletResult<u64> {
+        let result: String = self
+            .request(
+                "eth_getTransactionCount",
+                json!([format!("{:?}", address), "latest"]),
+            )
+            .await?;
+
+        parse_u64_hex(&result)
+    }
+
+    /// Get the balance of an address
+    pub async fn get_balance(&self, address: Address) -> WalletResult<U256> {
+        let result: String = self
+            .request("eth_getBalance", json!([format!("{:?}", address), "latest"]))
+            .await?;
+
+        parse_u256_hex(&result)
+    }
+
+    /// Get the current gas price
+    pub async fn gas_price(&self) -> WalletResult<U256> {
+        let result: String = self.request("eth_gasPrice", json!([])).await?;
+        parse_u256_hex(&result)
+    }
+
+    /// Get EIP-1559 fee data
+    pub async fn max_priority_fee(&self) -> WalletResult<U256> {
+        let result: String = self.request("eth_maxPriorityFeePerGas", json!([])).await?;
+        parse_u256_hex(&result)
+    }
+
+    /// Get the current block number
+    pub async fn block_number(&self) -> WalletResult<u64> {
+        let result: String = self.request("eth_blockNumber", json!([])).await?;
+        parse_u64_hex(&result)
+    }
+
+    /// Get the chain ID
+    pub async fn chain_id(&self) -> WalletResult<u64> {
+        let result: String = self.request("eth_chainId", json!([])).await?;
+        parse_u64_hex(&result)
+    }
+
+    /// Send a raw transaction
+    ///
+    /// Returns the transaction hash
+    pub async fn send_raw_transaction(&self, raw_tx: &str) -> WalletResult<B256> {
+        let result: String = self
+            .request("eth_sendRawTransaction", json!([raw_tx]))
+            .await?;
+
+        parse_b256_hex(&result)
+    }
+
+    /// Send raw transaction bytes (convenience method)
+    pub async fn send_raw_transaction_bytes(&self, tx_bytes: &[u8]) -> WalletResult<B256> {
+        let hex_tx = format!("0x{}", hex::encode(tx_bytes));
+        self.send_raw_transaction(&hex_tx).await
+    }
+
+    /// Get transaction receipt
+    pub async fn get_transaction_receipt(&self, tx_hash: B256) -> WalletResult<Option<Value>> {
+        let result: Option<Value> = self
+            .request(
+                "eth_getTransactionReceipt",
+                json!([format!("{:?}", tx_hash)]),
+            )
+            .await?;
+
+        Ok(result)
+    }
+
+    /// Wait for transaction receipt with timeout
+    pub async fn wait_for_receipt(
+        &self,
+        tx_hash: B256,
+        timeout: Duration,
+        poll_interval: Duration,
+    ) -> WalletResult<Value> {
+        let start = std::time::Instant::now();
+
+        loop {
+            if start.elapsed() > timeout {
+                return Err(WalletError::Timeout);
+            }
+
+            if let Some(receipt) = self.get_transaction_receipt(tx_hash).await? {
+                return Ok(receipt);
+            }
+
+            tokio::time::sleep(poll_interval).await;
+        }
+    }
+
+    /// Estimate gas for a transaction
+    pub async fn estimate_gas(
+        &self,
+        from: Address,
+        to: Option<Address>,
+        value: Option<U256>,
+        data: Option<&[u8]>,
+    ) -> WalletResult<u64> {
+        let mut params = serde_json::Map::new();
+        params.insert("from".to_string(), json!(format!("{:?}", from)));
+
+        if let Some(to) = to {
+            params.insert("to".to_string(), json!(format!("{:?}", to)));
+        }
+
+        if let Some(value) = value {
+            params.insert("value".to_string(), json!(format!("{:#x}", value)));
+        }
+
+        if let Some(data) = data {
+            params.insert("data".to_string(), json!(format!("0x{}", hex::encode(data))));
+        }
+
+        let result: String = self.request("eth_estimateGas", json!([params])).await?;
+        parse_u64_hex(&result)
+    }
+
+    /// Call a contract (read-only)
+    pub async fn call(
+        &self,
+        to: Address,
+        data: &[u8],
+        block: Option<&str>,
+    ) -> WalletResult<Vec<u8>> {
+        let params = json!({
+            "to": format!("{:?}", to),
+            "data": format!("0x{}", hex::encode(data)),
+        });
+
+        let block = block.unwrap_or("latest");
+        let result: String = self.request("eth_call", json!([params, block])).await?;
+
+        let hex_str = result.strip_prefix("0x").unwrap_or(&result);
+        hex::decode(hex_str).map_err(|e| WalletError::RpcError(e.to_string()))
+    }
+}
+
+/// Parse hex string to u64
+fn parse_u64_hex(s: &str) -> WalletResult<u64> {
+    let s = s.strip_prefix("0x").unwrap_or(s);
+    u64::from_str_radix(s, 16).map_err(|e| WalletError::RpcError(e.to_string()))
+}
+
+/// Parse hex string to U256
+fn parse_u256_hex(s: &str) -> WalletResult<U256> {
+    U256::from_str_radix(s.strip_prefix("0x").unwrap_or(s), 16)
+        .map_err(|e| WalletError::RpcError(e.to_string()))
+}
+
+/// Parse hex string to B256
+fn parse_b256_hex(s: &str) -> WalletResult<B256> {
+    let s = s.strip_prefix("0x").unwrap_or(s);
+    let bytes = hex::decode(s)?;
+    if bytes.len() != 32 {
+        return Err(WalletError::RpcError(format!(
+            "Invalid hash length: {}",
+            bytes.len()
+        )));
+    }
+    Ok(B256::from_slice(&bytes))
+}
+
+/// Batch RPC client for sending multiple requests in parallel
+pub struct BatchRpcClient {
+    clients: Vec<Arc<RpcClient>>,
+    current: AtomicU64,
+}
+
+impl BatchRpcClient {
+    /// Create a new batch client with multiple RPC endpoints
+    pub fn new(urls: Vec<String>) -> WalletResult<Self> {
+        let clients: WalletResult<Vec<_>> = urls
+            .into_iter()
+            .map(|url| RpcClient::new(url).map(Arc::new))
+            .collect();
+
+        Ok(Self {
+            clients: clients?,
+            current: AtomicU64::new(0),
+        })
+    }
+
+    /// Get the next client (round-robin)
+    pub fn next_client(&self) -> Arc<RpcClient> {
+        let idx = self.current.fetch_add(1, Ordering::Relaxed) as usize;
+        self.clients[idx % self.clients.len()].clone()
+    }
+
+    /// Send transaction to all endpoints in parallel
+    pub async fn broadcast_transaction(&self, raw_tx: &str) -> WalletResult<B256> {
+        let futures: Vec<_> = self
+            .clients
+            .iter()
+            .map(|client| {
+                let client = client.clone();
+                let tx = raw_tx.to_string();
+                async move { client.send_raw_transaction(&tx).await }
+            })
+            .collect();
+
+        let results = join_all(futures).await;
+
+        // Return first success, or last error
+        let mut last_err = None;
+        for result in results {
+            match result {
+                Ok(hash) => return Ok(hash),
+                Err(e) => last_err = Some(e),
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| WalletError::RpcError("No RPC endpoints".to_string())))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_u64_hex() {
+        assert_eq!(parse_u64_hex("0x0").unwrap(), 0);
+        assert_eq!(parse_u64_hex("0x1").unwrap(), 1);
+        assert_eq!(parse_u64_hex("0xff").unwrap(), 255);
+        assert_eq!(parse_u64_hex("0x5208").unwrap(), 21000);
+        assert_eq!(parse_u64_hex("5208").unwrap(), 21000);
+    }
+
+    #[test]
+    fn test_parse_u256_hex() {
+        let val = parse_u256_hex("0xde0b6b3a7640000").unwrap(); // 1 ETH in wei
+        assert_eq!(val, U256::from(1_000_000_000_000_000_000u64));
+    }
+
+    #[test]
+    fn test_parse_b256_hex() {
+        let hash_str = "0x0000000000000000000000000000000000000000000000000000000000000001";
+        let hash = parse_b256_hex(hash_str).unwrap();
+        assert_eq!(hash[31], 1);
+    }
+
+    #[test]
+    fn test_rpc_client_creation() {
+        let client = RpcClient::new("http://localhost:8545").unwrap();
+        assert_eq!(client.url, "http://localhost:8545");
+    }
+}
