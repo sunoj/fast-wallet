@@ -56,6 +56,12 @@ pub struct WalletConfig {
     pub gas_cache_duration: Duration,
     /// Background gas refresh interval (None = disabled)
     pub background_gas_refresh: Option<Duration>,
+    /// Default gas price for optimistic sends when cache is empty (in wei)
+    /// Default: 1 gwei
+    pub optimistic_default_gas_price: U256,
+    /// Default gas limit for optimistic liquidation sends
+    /// Default: 150,000 (typical liquidation cost)
+    pub optimistic_default_gas_limit: u64,
 }
 
 impl Default for WalletConfig {
@@ -69,6 +75,8 @@ impl Default for WalletConfig {
             use_eip1559: true,
             gas_cache_duration: Duration::from_millis(500),
             background_gas_refresh: None, // Disabled by default
+            optimistic_default_gas_price: U256::from(1_000_000_000u64), // 1 gwei
+            optimistic_default_gas_limit: 150_000, // Typical liquidation gas
         }
     }
 }
@@ -788,6 +796,152 @@ impl FastWallet {
         self.send(request).await
     }
 
+    // ========================================================================
+    // Optimistic Execution (skip simulation for lowest latency)
+    // ========================================================================
+
+    /// Send transaction optimistically without simulation
+    ///
+    /// This skips eth_call simulation and sends directly to the network.
+    /// Use this when:
+    /// - Speed is more important than gas savings
+    /// - Your contract reverts early with minimal gas cost on failure
+    /// - You're competing for MEV opportunities
+    ///
+    /// Failed transactions still consume gas up to the revert point.
+    /// For liquidation contracts that check health factor early, this is typically 3-5k gas.
+    #[inline]
+    pub async fn send_optimistic(&self, request: TransactionRequest) -> WalletResult<B256> {
+        let tx = self.sign(request)?;
+        self.send_signed(&tx).await
+    }
+
+    /// Send optimistic liquidation with pre-configured low gas settings
+    ///
+    /// Optimized for liquidation bots:
+    /// - Uses provided gas price (no RPC fetch)
+    /// - Uses provided gas limit (no estimation)
+    /// - Skips all simulation
+    ///
+    /// # Arguments
+    /// * `to` - Liquidation contract address
+    /// * `data` - Encoded liquidation call (e.g., `liquidate(user, asset, amount)`)
+    /// * `gas_limit` - Pre-calculated gas limit for the liquidation
+    /// * `gas_price` - Pre-fetched gas price (from background refresh)
+    ///
+    /// # Example
+    /// ```ignore
+    /// // Pre-calculate during idle time
+    /// let gas_limit = 150_000; // Known liquidation cost
+    /// let gas_price = wallet.get_gas_price().await?; // From cache
+    ///
+    /// // When opportunity detected - fastest path
+    /// let tx_hash = wallet.send_optimistic_liquidation(
+    ///     liquidation_contract,
+    ///     encoded_call,
+    ///     gas_limit,
+    ///     gas_price,
+    /// ).await?;
+    /// ```
+    #[inline]
+    pub async fn send_optimistic_liquidation(
+        &self,
+        to: Address,
+        data: Bytes,
+        gas_limit: u64,
+        gas_price: U256,
+    ) -> WalletResult<B256> {
+        let request = TransactionRequest::new()
+            .to(to)
+            .data(data)
+            .gas_limit(gas_limit)
+            .gas_price(gas_price);
+
+        self.send_optimistic(request).await
+    }
+
+    /// Send optimistic with preheated context (fastest possible path)
+    ///
+    /// Combines preheating with optimistic execution:
+    /// - Nonce already reserved
+    /// - Gas prices already cached
+    /// - No simulation
+    /// - Direct to network
+    ///
+    /// This is the absolute lowest latency path for liquidation bots.
+    #[inline]
+    pub async fn send_optimistic_with_preheat(
+        &self,
+        ctx: &PreheatedContext,
+        to: Address,
+        data: Bytes,
+        gas_limit: u64,
+    ) -> WalletResult<B256> {
+        let gas_price = ctx
+            .gas_price
+            .unwrap_or(self.config.optimistic_default_gas_price);
+
+        let request = TransactionRequest::new()
+            .to(to)
+            .data(data)
+            .gas_limit(gas_limit)
+            .gas_price(gas_price);
+
+        let tx = self.sign_with_preheat(ctx, request)?;
+        self.send_signed(&tx).await
+    }
+
+    /// Quick liquidation with minimal parameters (uses config defaults)
+    ///
+    /// Fastest path when you just have the contract call data:
+    /// - Uses preheated or cached gas price
+    /// - Uses default gas limit from config
+    /// - No simulation, no RPC calls
+    #[inline]
+    pub async fn send_quick_liquidation(
+        &self,
+        to: Address,
+        data: Bytes,
+    ) -> WalletResult<B256> {
+        let gas_price = self.gas_price_cache.read().clone()
+            .map(|(price, _)| price)
+            .unwrap_or(self.config.optimistic_default_gas_price);
+
+        let request = TransactionRequest::new()
+            .to(to)
+            .data(data)
+            .gas_limit(self.config.optimistic_default_gas_limit)
+            .gas_price(gas_price);
+
+        self.send_optimistic(request).await
+    }
+
+    /// Fire-and-forget optimistic send (don't wait for tx hash)
+    ///
+    /// Returns immediately after signing, sends in background.
+    /// Use when you need absolute minimum latency and don't need the tx hash immediately.
+    ///
+    /// # Returns
+    /// - Transaction hash (computed locally, not confirmed by RPC)
+    /// - JoinHandle to await the actual send result if needed
+    #[inline]
+    pub fn send_optimistic_fire_and_forget(
+        self: &Arc<Self>,
+        request: TransactionRequest,
+    ) -> WalletResult<(B256, tokio::task::JoinHandle<WalletResult<B256>>)> {
+        let tx = self.sign(request)?;
+        let tx_hash = tx.hash();
+        let wallet = Arc::clone(self);
+
+        let handle = tokio::spawn(async move { wallet.send_signed(&tx).await });
+
+        Ok((tx_hash, handle))
+    }
+
+    // ========================================================================
+    // Regular send methods
+    // ========================================================================
+
     /// Send ETH transfer (convenience method)
     pub async fn send_eth(
         &self,
@@ -938,6 +1092,30 @@ impl FastWalletBuilder {
     /// Set gas cache duration
     pub fn gas_cache_duration(mut self, duration: Duration) -> Self {
         self.config.gas_cache_duration = duration;
+        self
+    }
+
+    /// Set background gas refresh interval
+    pub fn background_gas_refresh(mut self, interval: Duration) -> Self {
+        self.config.background_gas_refresh = Some(interval);
+        self
+    }
+
+    /// Set default gas price for optimistic sends
+    pub fn optimistic_default_gas_price(mut self, price: U256) -> Self {
+        self.config.optimistic_default_gas_price = price;
+        self
+    }
+
+    /// Set default gas limit for optimistic liquidation sends
+    pub fn optimistic_default_gas_limit(mut self, limit: u64) -> Self {
+        self.config.optimistic_default_gas_limit = limit;
+        self
+    }
+
+    /// Set the entire config at once
+    pub fn config(mut self, config: WalletConfig) -> Self {
+        self.config = config;
         self
     }
 

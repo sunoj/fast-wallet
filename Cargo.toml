@@ -25,6 +25,10 @@ harness = false
 name = "anvil_benchmark"
 path = "examples/anvil_benchmark.rs"
 
+[[example]]
+name = "liquidation_bot"
+path = "examples/liquidation_bot.rs"
+
 [dependencies]
 # Async runtime - tokio for high-performance async
 tokio = { version = "1.35", features = ["full", "sync", "time", "rt-multi-thread"] }
