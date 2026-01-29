@@ -5,6 +5,8 @@
 ### v0.1.2 - Liquidation Bot Optimizations (2026-01-29)
 
 Features added for liquidation bot use cases:
+- **Optimistic execution**: Skip simulation for lowest latency (`send_optimistic()`, `send_quick_liquidation()`)
+- **Fire-and-forget**: Return immediately, send in background (`send_optimistic_fire_and_forget()`)
 - **Gas request coalescing**: Multiple concurrent gas price requests share a single RPC call
 - **Background gas refresh**: `start_background_gas_refresh()` for always-fresh gas prices
 - **Explicit nonce signing**: `sign_with_nonce()`, `sign_alternatives()` for replacement transactions
@@ -34,18 +36,36 @@ Baseline implementation with:
 
 ### CPU-only Benchmarks (transaction_benchmark)
 
-| Operation | v0.1.1 | v0.1.2 | Notes |
-|-----------|--------|--------|-------|
-| Full sign (Legacy) | 41.4 µs | 47.1 µs | +14% (new features overhead) |
-| Full sign (EIP-1559) | 40.9 µs | 47.4 µs | +16% (new features overhead) |
-| Wallet sign_legacy | 41.8 µs | 48.0 µs | Stable |
-| Wallet sign_eip1559 | 42.1 µs | 48.0 µs | Stable |
-| Nonce get_and_increment | 11.2 ns | 13.1 ns | +17% (added pending tracking) |
-| Throughput | ~24,000 tx/sec | ~20,800 tx/sec | Trade-off for new features |
+| Operation | v0.1.1 | v0.1.2 | Change |
+|-----------|--------|--------|--------|
+| Full sign (Legacy) | 41.4 µs | 45.3 µs | +9% |
+| Full sign (EIP-1559) | 40.9 µs | 45.9 µs | +12% |
+| Wallet sign_legacy | 41.8 µs | 44.9 µs | +7% |
+| Wallet sign_eip1559 | 42.1 µs | 47.0 µs | +12% |
+| Nonce get_and_increment | 11.2 ns | 12.8 ns | +14% |
+| Concurrent nonce (4 threads) | 876 µs | 737 µs | **-16%** |
+| Throughput | ~24,000 tx/sec | **~21,700 tx/sec** | -10% |
 
-> **Note**: v0.1.2 adds nonce reservation, pending count tracking, and gas coalescing.
-> These features add slight overhead to the hot path but enable critical liquidation bot
-> use cases like transaction replacement and speculative preparation.
+> **Note**: v0.1.2 adds optimistic execution, nonce reservation, and gas coalescing.
+> Slight overhead in signing enables critical liquidation bot features.
+> Concurrent nonce performance improved by 16%.
+
+### Optimistic Execution Latency
+
+| Execution Path | Latency | Description |
+|----------------|---------|-------------|
+| Traditional (simulate + send) | 12-60 ms | Safe but slow |
+| `send_optimistic()` | 10-50 ms | Skip simulation |
+| `send_optimistic_with_preheat()` | ~45 µs + network | Nonce pre-reserved |
+| `send_optimistic_fire_and_forget()` | ~45 µs | Return immediately |
+
+### Failed Transaction Cost (Early Revert)
+
+| Gas Price | Gas Used | Cost |
+|-----------|----------|------|
+| 1 gwei | ~3,000-5,000 | ~$0.01 |
+| 10 gwei | ~3,000-5,000 | ~$0.10 |
+| 50 gwei | ~3,000-5,000 | ~$0.50 |
 
 ### RPC Benchmarks (rpc_benchmark)
 
@@ -127,6 +147,16 @@ These benchmarks require a local Anvil node and measure real-world performance.
 
 ## Summary
 
+### v0.1.2 - Liquidation Bot Features
+
+| Feature | Benefit |
+|---------|---------|
+| Optimistic execution | Skip 2-10ms simulation latency |
+| Fire-and-forget | Return in ~45µs, send async |
+| Gas coalescing | Reduce RPC calls by 75%+ |
+| Background gas refresh | Always-fresh gas prices |
+| Nonce reservation | Speculative tx preparation |
+
 ### Key Improvements in v0.1.1
 
 | Category | Average Improvement |
@@ -138,13 +168,15 @@ These benchmarks require a local Anvil node and measure real-world performance.
 | Nonce acquisition | **-16% latency** |
 | **Overall throughput** | **+18% tx/sec** |
 
-### Absolute Performance (v0.1.1)
+### Absolute Performance (v0.1.2)
 
-- **Signing throughput**: ~24,000 tx/sec
-- **Nonce acquisition**: ~11 ns (lock-free)
-- **Legacy transaction encode**: ~41 ns
-- **EIP-1559 transaction encode**: ~49 ns
-- **Full sign pipeline**: ~41 µs
+- **Signing throughput**: ~21,700 tx/sec
+- **Optimistic send latency**: ~45 µs (CPU only)
+- **Nonce acquisition**: ~13 ns (lock-free)
+- **Legacy transaction encode**: ~49 ns
+- **EIP-1559 transaction encode**: ~58 ns
+- **Full sign pipeline**: ~45 µs
+- **Failed liquidation cost**: ~$0.01 at 1 gwei
 
 ---
 
