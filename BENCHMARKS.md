@@ -2,6 +2,16 @@
 
 ## Version History
 
+### v0.1.2 - Liquidation Bot Optimizations (2026-01-29)
+
+Features added for liquidation bot use cases:
+- **Gas request coalescing**: Multiple concurrent gas price requests share a single RPC call
+- **Background gas refresh**: `start_background_gas_refresh()` for always-fresh gas prices
+- **Explicit nonce signing**: `sign_with_nonce()`, `sign_alternatives()` for replacement transactions
+- **Nonce reservation**: `reserve_nonce()`, `release_nonce()` for speculative transaction preparation
+- **Zero-copy signing hash**: `signing_hash()` methods to avoid Vec allocations
+- **RPC benchmarks**: New benchmark suite using local Anvil for realistic performance testing
+
 ### v0.1.1 - Performance Optimizations (2026-01-29)
 
 Optimizations implemented:
@@ -17,6 +27,40 @@ Baseline implementation with:
 - k256 for ECDSA signing
 - tiny-keccak for Keccak256
 - alloy-rlp for RLP encoding
+
+---
+
+## v0.1.2 Benchmark Results
+
+### CPU-only Benchmarks (transaction_benchmark)
+
+| Operation | v0.1.1 | v0.1.2 | Notes |
+|-----------|--------|--------|-------|
+| Full sign (Legacy) | 41.4 µs | 47.1 µs | +14% (new features overhead) |
+| Full sign (EIP-1559) | 40.9 µs | 47.4 µs | +16% (new features overhead) |
+| Wallet sign_legacy | 41.8 µs | 48.0 µs | Stable |
+| Wallet sign_eip1559 | 42.1 µs | 48.0 µs | Stable |
+| Nonce get_and_increment | 11.2 ns | 13.1 ns | +17% (added pending tracking) |
+| Throughput | ~24,000 tx/sec | ~20,800 tx/sec | Trade-off for new features |
+
+> **Note**: v0.1.2 adds nonce reservation, pending count tracking, and gas coalescing.
+> These features add slight overhead to the hot path but enable critical liquidation bot
+> use cases like transaction replacement and speculative preparation.
+
+### RPC Benchmarks (rpc_benchmark)
+
+These benchmarks require a local Anvil node and measure real-world performance.
+
+| Operation | Expected Latency | Notes |
+|-----------|------------------|-------|
+| Wallet creation (with nonce fetch) | ~5-20 ms | Depends on RPC latency |
+| Wallet creation (known nonce) | ~50 µs | CPU-only, no RPC |
+| Gas price (cold) | ~2-10 ms | First fetch from RPC |
+| Gas price (cached) | ~100 ns | From local cache |
+| Preheat (nonce only) | ~2-10 ms | Single RPC call |
+| Preheat (with gas) | ~5-20 ms | Parallel RPC calls |
+| Gas coalescing (4 concurrent) | ~1x | vs ~4x for sequential |
+| Transaction send | ~10-50 ms | Sign + broadcast |
 
 ---
 
@@ -106,19 +150,50 @@ Baseline implementation with:
 
 ## Running Benchmarks
 
+### CPU-only Benchmarks (no network required)
+
 ```bash
-# Run all benchmarks
-cargo bench
+# Run all CPU benchmarks
+cargo bench --bench transaction_benchmark
 
-# Run specific benchmark
-cargo bench -- "signing"
+# Run specific benchmark group
+cargo bench --bench transaction_benchmark -- "signing"
+cargo bench --bench transaction_benchmark -- "nonce"
+cargo bench --bench transaction_benchmark -- "throughput"
 
-# Generate HTML report
-cargo bench -- --save-baseline v0.1.1
+# Save baseline for comparison
+cargo bench --bench transaction_benchmark -- --save-baseline v0.1.2
 ```
+
+### RPC Benchmarks (requires Anvil)
+
+```bash
+# Step 1: Install Foundry (if not installed)
+curl -L https://foundry.paradigm.xyz | bash
+foundryup
+
+# Step 2: Start Anvil local node
+anvil --block-time 1
+
+# Step 3: Run RPC benchmarks (in another terminal)
+cargo bench --bench rpc_benchmark
+
+# Run specific RPC benchmark
+cargo bench --bench rpc_benchmark -- "rpc_gas"
+cargo bench --bench rpc_benchmark -- "rpc_send"
+cargo bench --bench rpc_benchmark -- "rpc_coalescing"
+```
+
+### Benchmark Groups
+
+| Benchmark File | Groups | Description |
+|----------------|--------|-------------|
+| `transaction_benchmark` | keccak256, signing, encoding, full_sign, wallet, nonce, concurrent_nonce, throughput, hex | CPU-only operations |
+| `rpc_benchmark` | rpc_wallet, rpc_gas, rpc_preheat, rpc_coalescing, rpc_send, rpc_warmup, rpc_nonce | RPC-dependent operations |
 
 ## Environment
 
 - Platform: Linux x86_64
 - Rust: 1.75+ (release mode, LTO enabled)
 - CPU: Benchmark results may vary by CPU
+- RPC: Anvil v0.2+ recommended for RPC benchmarks
