@@ -99,6 +99,134 @@ impl RpcEndpoint {
         }
     }
 
+    // ========================================================================
+    // Built-in Public RPC Endpoints
+    // ========================================================================
+
+    /// LlamaNodes RPC - High reliability public endpoint
+    pub fn llama() -> Self {
+        Self::public("https://eth.llamarpc.com").with_priority(30)
+    }
+
+    /// PublicNode RPC - Fast and privacy-first
+    pub fn publicnode() -> Self {
+        Self::public("https://ethereum-rpc.publicnode.com").with_priority(30)
+    }
+
+    /// 1RPC - Privacy-preserving RPC relay
+    pub fn one_rpc() -> Self {
+        Self::public("https://1rpc.io/eth").with_priority(35)
+    }
+
+    /// Cloudflare Ethereum Gateway
+    pub fn cloudflare() -> Self {
+        Self::public("https://cloudflare-eth.com").with_priority(40)
+    }
+
+    /// Ankr Public RPC
+    pub fn ankr() -> Self {
+        Self::public("https://rpc.ankr.com/eth").with_priority(40)
+    }
+
+    /// DRPC Public Endpoint
+    pub fn drpc() -> Self {
+        Self::public("https://eth.drpc.org").with_priority(35)
+    }
+
+    /// Blast API Public RPC
+    pub fn blast() -> Self {
+        Self::public("https://eth-mainnet.public.blastapi.io").with_priority(40)
+    }
+
+    /// BlockPI Public RPC
+    pub fn blockpi() -> Self {
+        Self::public("https://ethereum.blockpi.network/v1/rpc/public").with_priority(45)
+    }
+
+    /// OMNIA Tech Public RPC
+    pub fn omnia() -> Self {
+        Self::public("https://endpoints.omniatech.io/v1/eth/mainnet/public").with_priority(45)
+    }
+
+    /// Tenderly Public Gateway
+    pub fn tenderly() -> Self {
+        Self::public("https://gateway.tenderly.co/public/mainnet").with_priority(40)
+    }
+
+    /// Merkle RPC
+    pub fn merkle() -> Self {
+        Self::public("https://eth.merkle.io").with_priority(45)
+    }
+
+    /// MEV Blocker RPC - Protects against MEV attacks
+    pub fn mev_blocker() -> Self {
+        Self {
+            url: "https://rpc.mevblocker.io".to_string(),
+            auth_header: None,
+            is_private: true, // MEV protected
+            priority: 25,
+            timeout: Some(Duration::from_secs(5)),
+        }
+    }
+
+    /// MEV Blocker Fast Mode
+    pub fn mev_blocker_fast() -> Self {
+        Self {
+            url: "https://rpc.mevblocker.io/fast".to_string(),
+            auth_header: None,
+            is_private: true,
+            priority: 20,
+            timeout: Some(Duration::from_secs(3)),
+        }
+    }
+
+    /// Flashbots Protect RPC (no auth required for basic protection)
+    pub fn flashbots_protect() -> Self {
+        Self {
+            url: "https://rpc.flashbots.net".to_string(),
+            auth_header: None,
+            is_private: true,
+            priority: 15,
+            timeout: Some(Duration::from_secs(5)),
+        }
+    }
+
+    /// Flashbots Fast Mode
+    pub fn flashbots_fast() -> Self {
+        Self {
+            url: "https://rpc.flashbots.net/fast".to_string(),
+            auth_header: None,
+            is_private: true,
+            priority: 12,
+            timeout: Some(Duration::from_secs(3)),
+        }
+    }
+
+    /// bloXroute RPC (Virginia, US East)
+    pub fn bloxroute_virginia() -> Self {
+        Self::public("https://virginia.rpc.blxrbdn.com").with_priority(30)
+    }
+
+    /// bloXroute RPC (UK, Europe)
+    pub fn bloxroute_uk() -> Self {
+        Self::public("https://uk.rpc.blxrbdn.com").with_priority(30)
+    }
+
+    /// bloXroute RPC (Singapore, Asia)
+    pub fn bloxroute_singapore() -> Self {
+        Self::public("https://singapore.rpc.blxrbdn.com").with_priority(30)
+    }
+
+    /// SecureRPC
+    pub fn securerpc() -> Self {
+        Self::public("https://api.securerpc.com/v1").with_priority(40)
+    }
+
+    /// Builder0x69 RPC
+    pub fn builder0x69() -> Self {
+        Self::public("https://rpc.builder0x69.io").with_priority(35)
+    }
+
     /// Set priority
     pub fn with_priority(mut self, priority: u8) -> Self {
         self.priority = priority;
@@ -568,6 +696,85 @@ impl BroadcasterBuilder {
         self
     }
 
+    // ========================================================================
+    // Convenience Methods for Common Setups
+    // ========================================================================
+
+    /// Add all default public RPC endpoints (recommended for broadcast redundancy)
+    ///
+    /// Adds: LlamaNodes, PublicNode, 1RPC, DRPC, Ankr, Cloudflare
+    pub fn add_default_public_rpcs(mut self) -> Self {
+        self.endpoints.push(RpcEndpoint::llama());
+        self.endpoints.push(RpcEndpoint::publicnode());
+        self.endpoints.push(RpcEndpoint::one_rpc());
+        self.endpoints.push(RpcEndpoint::drpc());
+        self.endpoints.push(RpcEndpoint::ankr());
+        self.endpoints.push(RpcEndpoint::cloudflare());
+        self
+    }
+
+    /// Add all available public RPC endpoints for maximum broadcast coverage
+    ///
+    /// Includes all default RPCs plus: Blast, BlockPI, OMNIA, Tenderly, Merkle, SecureRPC
+    pub fn add_all_public_rpcs(mut self) -> Self {
+        // Core reliable endpoints
+        self.endpoints.push(RpcEndpoint::llama());
+        self.endpoints.push(RpcEndpoint::publicnode());
+        self.endpoints.push(RpcEndpoint::one_rpc());
+        self.endpoints.push(RpcEndpoint::drpc());
+        self.endpoints.push(RpcEndpoint::ankr());
+        self.endpoints.push(RpcEndpoint::cloudflare());
+        // Additional endpoints
+        self.endpoints.push(RpcEndpoint::blast());
+        self.endpoints.push(RpcEndpoint::blockpi());
+        self.endpoints.push(RpcEndpoint::omnia());
+        self.endpoints.push(RpcEndpoint::tenderly());
+        self.endpoints.push(RpcEndpoint::merkle());
+        self.endpoints.push(RpcEndpoint::securerpc());
+        self.endpoints.push(RpcEndpoint::builder0x69());
+        self
+    }
+
+    /// Add MEV protection endpoints (protects against sandwich attacks and frontrunning)
+    ///
+    /// Adds: Flashbots Protect, Flashbots Fast, MEV Blocker, MEV Blocker Fast
+    pub fn add_mev_protection(mut self) -> Self {
+        self.endpoints.push(RpcEndpoint::flashbots_protect());
+        self.endpoints.push(RpcEndpoint::flashbots_fast());
+        self.endpoints.push(RpcEndpoint::mev_blocker());
+        self.endpoints.push(RpcEndpoint::mev_blocker_fast());
+        self
+    }
+
+    /// Add bloXroute regional endpoints for low-latency broadcasting
+    ///
+    /// Adds: Virginia (US East), UK (Europe), Singapore (Asia)
+    pub fn add_regional_rpcs(mut self) -> Self {
+        self.endpoints.push(RpcEndpoint::bloxroute_virginia());
+        self.endpoints.push(RpcEndpoint::bloxroute_uk());
+        self.endpoints.push(RpcEndpoint::bloxroute_singapore());
+        self
+    }
+
+    /// Add a recommended set of endpoints for liquidation bots
+    ///
+    /// Includes: MEV protection + regional low-latency + default public RPCs
+    pub fn add_liquidation_preset(self) -> Self {
+        self.add_mev_protection()
+            .add_regional_rpcs()
+            .add_default_public_rpcs()
+    }
+
+    /// Add a minimal set of reliable endpoints
+    ///
+    /// Adds: LlamaNodes, PublicNode, 1RPC
+    pub fn add_minimal_rpcs(mut self) -> Self {
+        self.endpoints.push(RpcEndpoint::llama());
+        self.endpoints.push(RpcEndpoint::publicnode());
+        self.endpoints.push(RpcEndpoint::one_rpc());
+        self
+    }
+
     /// Add a custom endpoint
     pub fn add_endpoint(mut self, endpoint: RpcEndpoint) -> Self {
         self.endpoints.push(endpoint);
@@ -648,5 +855,71 @@ mod tests {
         assert_eq!(broadcaster.endpoints[0].priority, 10);
         assert_eq!(broadcaster.endpoints[1].priority, 100);
         assert_eq!(broadcaster.endpoints[2].priority, 200);
+    }
+
+    #[test]
+    fn test_built_in_public_endpoints() {
+        // Test that all built-in endpoints can be created
+        let llama = RpcEndpoint::llama();
+        assert!(llama.url.contains("llamarpc"));
+        assert!(!llama.is_private);
+
+        let publicnode = RpcEndpoint::publicnode();
+        assert!(publicnode.url.contains("publicnode"));
+
+        let mev_blocker = RpcEndpoint::mev_blocker();
+        assert!(mev_blocker.is_private);
+        assert!(mev_blocker.url.contains("mevblocker"));
+
+        let flashbots = RpcEndpoint::flashbots_protect();
+        assert!(flashbots.is_private);
+        assert!(flashbots.url.contains("flashbots"));
+    }
+
+    #[test]
+    fn test_convenience_methods() {
+        // Test add_default_public_rpcs
+        let broadcaster = BroadcasterBuilder::new()
+            .add_default_public_rpcs()
+            .build()
+            .unwrap();
+        assert_eq!(broadcaster.endpoints.len(), 6);
+
+        // Test add_all_public_rpcs
+        let broadcaster = BroadcasterBuilder::new()
+            .add_all_public_rpcs()
+            .build()
+            .unwrap();
+        assert_eq!(broadcaster.endpoints.len(), 13);
+
+        // Test add_mev_protection
+        let broadcaster = BroadcasterBuilder::new()
+            .add_mev_protection()
+            .build()
+            .unwrap();
+        assert_eq!(broadcaster.endpoints.len(), 4);
+        assert!(broadcaster.endpoints.iter().all(|e| e.is_private));
+
+        // Test add_regional_rpcs
+        let broadcaster = BroadcasterBuilder::new()
+            .add_regional_rpcs()
+            .build()
+            .unwrap();
+        assert_eq!(broadcaster.endpoints.len(), 3);
+
+        // Test add_liquidation_preset
+        let broadcaster = BroadcasterBuilder::new()
+            .add_liquidation_preset()
+            .build()
+            .unwrap();
+        // MEV (4) + Regional (3) + Default (6) = 13
+        assert_eq!(broadcaster.endpoints.len(), 13);
+
+        // Test add_minimal_rpcs
+        let broadcaster = BroadcasterBuilder::new()
+            .add_minimal_rpcs()
+            .build()
+            .unwrap();
+        assert_eq!(broadcaster.endpoints.len(), 3);
     }
 }

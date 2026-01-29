@@ -2,6 +2,14 @@
 
 ## Version History
 
+### v0.1.5 - Built-in Public RPC Presets (2026-01-29)
+
+- **20+ built-in public RPC endpoints**: LlamaNodes, PublicNode, 1RPC, DRPC, Ankr, Cloudflare, Blast, BlockPI, OMNIA, Tenderly, Merkle, SecureRPC, Builder0x69
+- **MEV protection endpoints**: Flashbots Protect/Fast, MEV Blocker/Fast
+- **Regional endpoints**: bloXroute Virginia, UK, Singapore
+- **Convenience methods**: `add_default_public_rpcs()`, `add_all_public_rpcs()`, `add_mev_protection()`, `add_regional_rpcs()`, `add_liquidation_preset()`, `add_minimal_rpcs()`
+- Performance: ~21,000-24,000 tx/sec (unchanged)
+
 ### v0.1.4 - Blink Labs RPC Integration (2026-01-29)
 
 - **Blink Labs RPC**: Built-in support for low-latency MEV-optimized RPC

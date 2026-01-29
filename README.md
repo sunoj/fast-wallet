@@ -146,6 +146,14 @@ let wallet = FastWalletBuilder::new(private_key, primary_rpc)
     .broadcast_rpcs(vec![rpc1, rpc2])
     .build()
     .await?;
+
+// Using built-in public RPC presets
+use fast_wallet::{BroadcasterBuilder, BroadcastStrategy};
+
+let broadcaster = BroadcasterBuilder::new()
+    .add_liquidation_preset()  // MEV protection + regional + public RPCs
+    .strategy(BroadcastStrategy::RaceAll)
+    .build()?;
 ```
 
 ### Send Methods
@@ -157,6 +165,39 @@ let wallet = FastWalletBuilder::new(private_key, primary_rpc)
 | `send_quick_liquidation()` | Liquidation with defaults | 10-50ms |
 | `send_optimistic_with_preheat()` | Preheated + optimistic | ~45µs + network |
 | `send_optimistic_fire_and_forget()` | Return immediately | ~45µs |
+
+### Built-in RPC Presets
+
+```rust
+use fast_wallet::{BroadcasterBuilder, RpcEndpoint};
+
+// Individual endpoints
+let llama = RpcEndpoint::llama();
+let mev_blocker = RpcEndpoint::mev_blocker();
+let flashbots = RpcEndpoint::flashbots_protect();
+
+// Convenience presets
+let broadcaster = BroadcasterBuilder::new()
+    .add_default_public_rpcs()   // LlamaNodes, PublicNode, 1RPC, DRPC, Ankr, Cloudflare
+    .add_mev_protection()         // Flashbots Protect, MEV Blocker
+    .add_regional_rpcs()          // bloXroute Virginia/UK/Singapore
+    .build()?;
+
+// Or use the liquidation preset (includes all of the above)
+let broadcaster = BroadcasterBuilder::new()
+    .add_liquidation_preset()
+    .build()?;
+```
+
+**Available Presets:**
+| Method | Endpoints |
+|--------|-----------|
+| `add_default_public_rpcs()` | LlamaNodes, PublicNode, 1RPC, DRPC, Ankr, Cloudflare |
+| `add_all_public_rpcs()` | All public + Blast, BlockPI, OMNIA, Tenderly, Merkle |
+| `add_mev_protection()` | Flashbots Protect/Fast, MEV Blocker/Fast |
+| `add_regional_rpcs()` | bloXroute Virginia, UK, Singapore |
+| `add_liquidation_preset()` | MEV protection + Regional + Default public |
+| `add_minimal_rpcs()` | LlamaNodes, PublicNode, 1RPC |
 
 ### Configuration
 
