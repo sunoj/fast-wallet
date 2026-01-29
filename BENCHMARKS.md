@@ -2,13 +2,26 @@
 
 ## Version History
 
-### v0.1.5 - Built-in Public RPC Presets (2026-01-29)
+### v0.1.5 - Built-in Public RPC Presets & Connection Warmup (2026-01-29)
 
-- **20+ built-in public RPC endpoints**: LlamaNodes, PublicNode, 1RPC, DRPC, Ankr, Cloudflare, Blast, BlockPI, OMNIA, Tenderly, Merkle, SecureRPC, Builder0x69
-- **MEV protection endpoints**: Flashbots Protect/Fast, MEV Blocker/Fast
+**Built-in RPC Endpoints:**
+- **20+ public RPC endpoints**: LlamaNodes, PublicNode, 1RPC, DRPC, Ankr, Cloudflare, Blast, BlockPI, OMNIA, Tenderly, Merkle, SecureRPC, Builder0x69
+- **MEV protection**: Flashbots Protect/Fast, MEV Blocker/Fast
 - **Regional endpoints**: bloXroute Virginia, UK, Singapore
 - **Convenience methods**: `add_default_public_rpcs()`, `add_all_public_rpcs()`, `add_mev_protection()`, `add_regional_rpcs()`, `add_liquidation_preset()`, `add_minimal_rpcs()`
-- Performance: ~21,000-24,000 tx/sec (unchanged)
+
+**HTTP Connection Warmup:**
+- `warmup()` / `warmup_connections()` - Pre-establish TCP/TLS connections
+- `preheat_full()` - Full preheat (connections + nonce + gas)
+- **Latency savings**: 5-20ms per endpoint on first request
+
+**Benchmark Results:**
+| Metric | Value |
+|--------|-------|
+| Throughput | ~19,500-20,300 tx/sec |
+| Nonce acquisition | ~13.2 ns |
+| Full sign (Legacy) | ~50 µs |
+| Connection warmup savings | 5-20 ms |
 
 ### v0.1.4 - Blink Labs RPC Integration (2026-01-29)
 
@@ -99,6 +112,18 @@ These benchmarks require a local Anvil node and measure real-world performance.
 | Preheat (with gas) | ~5-20 ms | Parallel RPC calls |
 | Gas coalescing (4 concurrent) | ~1x | vs ~4x for sequential |
 | Transaction send | ~10-50 ms | Sign + broadcast |
+
+### Connection Warmup Impact
+
+| Scenario | Latency | Description |
+|----------|---------|-------------|
+| Cold first request | 5-20 ms | TCP/TLS handshake required |
+| Warm cached request | 0.5-2 ms | Connection reused from pool |
+| Cold liquidation flow | 15-60 ms | New connection + send |
+| Warm liquidation flow | 10-50 ms | Existing connection |
+| Preheated liquidation | 5-20 ms | All resources ready |
+
+**Savings from warmup:** 5-20ms per endpoint (TCP + TLS handshake avoided)
 
 ---
 
@@ -239,7 +264,20 @@ cargo bench --bench rpc_benchmark -- "rpc_coalescing"
 | Benchmark File | Groups | Description |
 |----------------|--------|-------------|
 | `transaction_benchmark` | keccak256, signing, encoding, full_sign, wallet, nonce, concurrent_nonce, throughput, hex | CPU-only operations |
-| `rpc_benchmark` | rpc_wallet, rpc_gas, rpc_preheat, rpc_coalescing, rpc_send, rpc_warmup, rpc_nonce | RPC-dependent operations |
+| `rpc_benchmark` | rpc_wallet, rpc_gas, rpc_preheat, rpc_coalescing, rpc_send, rpc_warmup, rpc_nonce, connection_warmup, liquidation_flow, warmup_connections | RPC-dependent operations |
+
+### Connection Warmup Benchmarks (requires Anvil)
+
+```bash
+# Compare cold vs warm connection latency
+cargo bench --bench rpc_benchmark -- "connection_warmup"
+
+# Test full liquidation flow with different warmup strategies
+cargo bench --bench rpc_benchmark -- "liquidation_flow"
+
+# Measure warmup_connections and preheat_full timing
+cargo bench --bench rpc_benchmark -- "warmup_connections"
+```
 
 ## Environment
 
