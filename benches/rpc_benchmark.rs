@@ -354,6 +354,233 @@ fn bench_warmup(c: &mut Criterion) {
     group.finish();
 }
 
+/// Benchmark connection warmup impact - simulates realistic liquidation scenario
+///
+/// This benchmark compares:
+/// 1. Cold connection: First RPC call requires TCP/TLS handshake
+/// 2. Warm connection: Connection already established via warmup
+fn bench_connection_warmup_impact(c: &mut Criterion) {
+    let rt = Runtime::new().unwrap();
+
+    if !check_anvil(&rt) {
+        eprintln!("⚠️  Anvil not running, skipping connection warmup benchmarks");
+        return;
+    }
+
+    let mut group = c.benchmark_group("connection_warmup");
+    group.sample_size(20);
+    group.measurement_time(Duration::from_secs(15));
+
+    // Scenario 1: Cold start - create fresh client and immediately send
+    // This measures the full latency including TCP/TLS handshake
+    group.bench_function("cold_first_request", |b| {
+        b.to_async(&rt).iter(|| async {
+            // Create a new HTTP client (no connection pooling reuse)
+            let client = reqwest::Client::builder()
+                .pool_max_idle_per_host(0)  // Disable connection reuse
+                .build()
+                .unwrap();
+
+            let start = std::time::Instant::now();
+            let _ = client
+                .post(ANVIL_RPC_URL)
+                .json(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "eth_chainId",
+                    "params": [],
+                    "id": 1
+                }))
+                .send()
+                .await
+                .unwrap();
+            start.elapsed()
+        })
+    });
+
+    // Scenario 2: Warm connection - reuse established connection
+    group.bench_function("warm_cached_request", |b| {
+        // Create client with connection pool
+        let client = rt.block_on(async {
+            let c = reqwest::Client::builder()
+                .pool_max_idle_per_host(5)
+                .build()
+                .unwrap();
+            // Warmup: establish connection
+            let _ = c
+                .post(ANVIL_RPC_URL)
+                .json(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "eth_chainId",
+                    "params": [],
+                    "id": 1
+                }))
+                .send()
+                .await
+                .unwrap();
+            c
+        });
+
+        b.to_async(&rt).iter(|| {
+            let c = client.clone();
+            async move {
+                let start = std::time::Instant::now();
+                let _ = c
+                    .post(ANVIL_RPC_URL)
+                    .json(&serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "method": "eth_chainId",
+                        "params": [],
+                        "id": 1
+                    }))
+                    .send()
+                    .await
+                    .unwrap();
+                start.elapsed()
+            }
+        })
+    });
+
+    group.finish();
+}
+
+/// Benchmark full liquidation flow with and without warmup
+fn bench_liquidation_flow(c: &mut Criterion) {
+    let rt = Runtime::new().unwrap();
+
+    if !check_anvil(&rt) {
+        return;
+    }
+
+    let mut group = c.benchmark_group("liquidation_flow");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(20));
+
+    // Scenario 1: Cold start liquidation (no warmup)
+    // Simulates: opportunity detected -> create wallet -> send tx
+    group.bench_function("cold_liquidation", |b| {
+        b.to_async(&rt).iter_custom(|iters| async move {
+            let mut total = Duration::ZERO;
+
+            for _ in 0..iters {
+                // Simulate cold start: new wallet, no warmup
+                let wallet = FastWalletBuilder::new(ANVIL_PRIVATE_KEY, ANVIL_RPC_URL)
+                    .chain_id(31337)
+                    .build_with_nonce(0)  // Skip nonce fetch for fair comparison
+                    .unwrap();
+
+                let start = std::time::Instant::now();
+
+                // Immediately try to send (cold connection)
+                let request = TransactionRequest::new()
+                    .to(Address::repeat_byte(0xbb))
+                    .value(U256::from(1_000_000_000_000u64))
+                    .gas_limit(21000)
+                    .gas_price(U256::from(1_000_000_000u64));
+
+                let _ = wallet.send(request).await;
+                total += start.elapsed();
+            }
+            total
+        })
+    });
+
+    // Scenario 2: Warmed liquidation
+    // Simulates: wallet ready with warm connections -> send tx
+    group.bench_function("warm_liquidation", |b| {
+        // Pre-create and warm the wallet
+        let wallet = rt.block_on(async {
+            let w = FastWalletBuilder::new(ANVIL_PRIVATE_KEY, ANVIL_RPC_URL)
+                .chain_id(31337)
+                .build()
+                .await
+                .unwrap();
+            w.warmup().await.unwrap();
+            w
+        });
+
+        b.to_async(&rt).iter(|| {
+            let request = TransactionRequest::new()
+                .to(Address::repeat_byte(0xbb))
+                .value(U256::from(1_000_000_000_000u64))
+                .gas_limit(21000)
+                .gas_price(U256::from(1_000_000_000u64));
+
+            wallet.send(request.clone())
+        })
+    });
+
+    // Scenario 3: Full preheat liquidation (most optimized)
+    // Simulates: preheat_full -> immediately send with context
+    group.bench_function("preheated_liquidation", |b| {
+        // Pre-create and warm the wallet
+        let wallet = rt.block_on(async {
+            let w = FastWalletBuilder::new(ANVIL_PRIVATE_KEY, ANVIL_RPC_URL)
+                .chain_id(31337)
+                .build()
+                .await
+                .unwrap();
+            w.warmup().await.unwrap();
+            w
+        });
+
+        b.to_async(&rt).iter(|| async {
+            // Preheat (connection already warm, so this is fast)
+            let ctx = wallet.preheat(true).await.unwrap();
+
+            let request = TransactionRequest::new()
+                .to(Address::repeat_byte(0xbb))
+                .value(U256::from(1_000_000_000_000u64))
+                .gas_limit(21000);
+
+            wallet.send_with_preheat(&ctx, request).await
+        })
+    });
+
+    group.finish();
+}
+
+/// Benchmark warmup_connections specifically
+fn bench_warmup_connections(c: &mut Criterion) {
+    let rt = Runtime::new().unwrap();
+
+    if !check_anvil(&rt) {
+        return;
+    }
+
+    let mut group = c.benchmark_group("warmup_connections");
+    group.sample_size(20);
+
+    // Test warmup_connections timing
+    group.bench_function("warmup_primary_rpc", |b| {
+        b.to_async(&rt).iter(|| async {
+            let wallet = FastWalletBuilder::new(ANVIL_PRIVATE_KEY, ANVIL_RPC_URL)
+                .chain_id(31337)
+                .build_with_nonce(0)
+                .unwrap();
+
+            wallet.warmup_connections().await
+        })
+    });
+
+    // Test preheat_full timing
+    group.bench_function("preheat_full", |b| {
+        let wallet = rt.block_on(async {
+            FastWalletBuilder::new(ANVIL_PRIVATE_KEY, ANVIL_RPC_URL)
+                .chain_id(31337)
+                .build()
+                .await
+                .unwrap()
+        });
+
+        b.to_async(&rt).iter(|| async {
+            let ctx = wallet.preheat_full().await.unwrap();
+            wallet.cancel_preheat(ctx);
+        })
+    });
+
+    group.finish();
+}
+
 /// Benchmark nonce sync
 fn bench_nonce_sync(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
@@ -395,6 +622,9 @@ criterion_group!(
         bench_send_transaction,
         bench_warmup,
         bench_nonce_sync,
+        bench_connection_warmup_impact,
+        bench_liquidation_flow,
+        bench_warmup_connections,
 );
 
 criterion_main!(rpc_benches);
