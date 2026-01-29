@@ -5,6 +5,7 @@
 //! - Pre-warming/preheating for lowest latency
 //! - Async transaction submission
 //! - Parallel transaction broadcasting
+//! - Gas request coalescing for reduced RPC calls
 
 use crate::error::{WalletError, WalletResult};
 use crate::nonce::SingleAddressNonceManager;
@@ -13,11 +14,28 @@ use crate::signer::FastSigner;
 use crate::transaction::{Transaction, TransactionRequest};
 use alloy_primitives::{Address, Bytes, B256, U256};
 use futures::future::join_all;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::Semaphore;
+use tokio::sync::{broadcast, Semaphore};
+
+/// Gas fetch coalescer - ensures multiple concurrent gas requests share a single RPC call
+struct GasCoalescer {
+    /// In-flight gas price request sender
+    gas_price_tx: Mutex<Option<broadcast::Sender<U256>>>,
+    /// In-flight priority fee request sender
+    priority_fee_tx: Mutex<Option<broadcast::Sender<U256>>>,
+}
+
+impl GasCoalescer {
+    fn new() -> Self {
+        Self {
+            gas_price_tx: Mutex::new(None),
+            priority_fee_tx: Mutex::new(None),
+        }
+    }
+}
 
 /// Configuration for FastWallet
 #[derive(Debug, Clone)]
@@ -36,6 +54,8 @@ pub struct WalletConfig {
     pub use_eip1559: bool,
     /// Gas price cache duration
     pub gas_cache_duration: Duration,
+    /// Background gas refresh interval (None = disabled)
+    pub background_gas_refresh: Option<Duration>,
 }
 
 impl Default for WalletConfig {
@@ -48,6 +68,7 @@ impl Default for WalletConfig {
             poll_interval: Duration::from_millis(500),
             use_eip1559: true,
             gas_cache_duration: Duration::from_millis(500),
+            background_gas_refresh: None, // Disabled by default
         }
     }
 }
@@ -107,7 +128,7 @@ impl PreheatedContext {
 /// - Automatic nonce management (no need to pass nonce)
 /// - Preheating API for lowest latency
 /// - Multi-RPC broadcasting
-/// - Gas price caching
+/// - Gas price caching with request coalescing
 pub struct FastWallet {
     signer: FastSigner,
     nonce_manager: SingleAddressNonceManager,
@@ -124,6 +145,8 @@ pub struct FastWallet {
     base_fee_cache: RwLock<Option<(U256, Instant)>>,
     /// Whether warmup has been done
     warmed_up: AtomicBool,
+    /// Gas request coalescer
+    gas_coalescer: GasCoalescer,
 }
 
 impl FastWallet {
@@ -153,6 +176,7 @@ impl FastWallet {
             priority_fee_cache: RwLock::new(None),
             base_fee_cache: RwLock::new(None),
             warmed_up: AtomicBool::new(false),
+            gas_coalescer: GasCoalescer::new(),
             config,
         })
     }
@@ -194,6 +218,7 @@ impl FastWallet {
             priority_fee_cache: RwLock::new(None),
             base_fee_cache: RwLock::new(None),
             warmed_up: AtomicBool::new(false),
+            gas_coalescer: GasCoalescer::new(),
             config,
         })
     }
@@ -256,6 +281,29 @@ impl FastWallet {
     #[inline]
     pub fn is_warmed_up(&self) -> bool {
         self.warmed_up.load(Ordering::Acquire)
+    }
+
+    /// Start background gas price refresh
+    ///
+    /// This spawns a background task that periodically fetches gas prices,
+    /// ensuring they're always fresh when `preheat()` is called.
+    ///
+    /// Returns a handle that can be used to stop the background task.
+    pub fn start_background_gas_refresh(self: &Arc<Self>) -> Option<tokio::task::JoinHandle<()>> {
+        let interval = self.config.background_gas_refresh?;
+        let wallet = Arc::clone(self);
+
+        Some(tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            loop {
+                ticker.tick().await;
+                // Refresh gas prices - ignore errors
+                let _ = tokio::join!(
+                    wallet.get_gas_price(),
+                    wallet.get_priority_fee()
+                );
+            }
+        }))
     }
 
     /// Preheat a transaction - allocate nonce and optionally fetch gas prices
@@ -356,7 +404,7 @@ impl FastWallet {
 
     // ==================== Gas Price ====================
 
-    /// Get cached or fresh gas price
+    /// Get cached or fresh gas price (with request coalescing)
     pub async fn get_gas_price(&self) -> WalletResult<U256> {
         // Check cache first
         {
@@ -368,7 +416,29 @@ impl FastWallet {
             }
         }
 
-        // Fetch fresh price
+        // Check if there's an in-flight request we can join
+        let rx = {
+            let mut tx_guard = self.gas_coalescer.gas_price_tx.lock();
+            if let Some(tx) = tx_guard.as_ref() {
+                // Join existing request
+                Some(tx.subscribe())
+            } else {
+                // We're the first, create a new channel
+                let (tx, _) = broadcast::channel(1);
+                *tx_guard = Some(tx);
+                None
+            }
+        };
+
+        if let Some(mut receiver) = rx {
+            // Wait for the in-flight request
+            if let Ok(price) = receiver.recv().await {
+                return Ok(price);
+            }
+            // Sender dropped - fall through to fetch directly
+        }
+
+        // We're the leader (or fallback) - fetch the price
         let price = self.rpc_client.gas_price().await?;
 
         // Update cache
@@ -377,10 +447,18 @@ impl FastWallet {
             *cache = Some((price, Instant::now()));
         }
 
+        // Broadcast to waiters and clear the in-flight flag
+        {
+            let mut tx_guard = self.gas_coalescer.gas_price_tx.lock();
+            if let Some(tx) = tx_guard.take() {
+                let _ = tx.send(price);
+            }
+        }
+
         Ok(price)
     }
 
-    /// Get cached or fresh priority fee (for EIP-1559)
+    /// Get cached or fresh priority fee (with request coalescing)
     pub async fn get_priority_fee(&self) -> WalletResult<U256> {
         // Check cache first
         {
@@ -392,13 +470,40 @@ impl FastWallet {
             }
         }
 
-        // Fetch fresh fee
+        // Check if there's an in-flight request we can join
+        let rx = {
+            let mut tx_guard = self.gas_coalescer.priority_fee_tx.lock();
+            if let Some(tx) = tx_guard.as_ref() {
+                Some(tx.subscribe())
+            } else {
+                let (tx, _) = broadcast::channel(1);
+                *tx_guard = Some(tx);
+                None
+            }
+        };
+
+        if let Some(mut receiver) = rx {
+            if let Ok(fee) = receiver.recv().await {
+                return Ok(fee);
+            }
+            // Sender dropped - fall through to fetch directly
+        }
+
+        // We're the leader (or fallback) - fetch the fee
         let fee = self.rpc_client.max_priority_fee().await?;
 
         // Update cache
         {
             let mut cache = self.priority_fee_cache.write();
             *cache = Some((fee, Instant::now()));
+        }
+
+        // Broadcast to waiters
+        {
+            let mut tx_guard = self.gas_coalescer.priority_fee_tx.lock();
+            if let Some(tx) = tx_guard.take() {
+                let _ = tx.send(fee);
+            }
         }
 
         Ok(fee)
@@ -438,6 +543,68 @@ impl FastWallet {
         request.nonce = self.nonce_manager.get_nonce();
         request.chain_id = self.config.chain_id;
 
+        if request.gas_limit == 0 {
+            request.gas_limit = self.config.default_gas_limit;
+        }
+
+        request.build_and_sign(&self.signer)
+    }
+
+    /// Sign a transaction with explicit nonce (does NOT increment internal counter)
+    ///
+    /// Use this when you want to pre-sign multiple alternative transactions
+    /// with the same nonce and choose which one to send later.
+    ///
+    /// WARNING: Using this incorrectly can result in nonce conflicts.
+    #[inline]
+    pub fn sign_with_nonce(&self, mut request: TransactionRequest, nonce: u64) -> WalletResult<Transaction> {
+        request.nonce = nonce;
+        request.chain_id = self.config.chain_id;
+
+        if request.gas_limit == 0 {
+            request.gas_limit = self.config.default_gas_limit;
+        }
+
+        request.build_and_sign(&self.signer)
+    }
+
+    /// Sign multiple alternative transactions with the same nonce
+    ///
+    /// Useful for liquidation bots that want to pre-sign different strategies
+    /// and choose the best one based on simulation results.
+    ///
+    /// Returns transactions signed with the CURRENT nonce (without incrementing).
+    #[inline]
+    pub fn sign_alternatives(&self, requests: Vec<TransactionRequest>) -> Vec<WalletResult<Transaction>> {
+        let nonce = self.nonce_manager.peek();
+        requests
+            .into_iter()
+            .map(|req| self.sign_with_nonce(req, nonce))
+            .collect()
+    }
+
+    /// Reserve a nonce for later use
+    ///
+    /// Increments the internal counter and returns the nonce.
+    /// Use with `sign_with_nonce()` to sign a transaction later.
+    #[inline]
+    pub fn reserve_nonce(&self) -> u64 {
+        self.nonce_manager.get_nonce()
+    }
+
+    /// Release a reserved nonce (mark as failed)
+    ///
+    /// Call this if you reserved a nonce but decided not to use it.
+    #[inline]
+    pub fn release_nonce(&self, nonce: u64) {
+        self.nonce_manager.fail(nonce);
+    }
+
+    // ==================== Transaction Signing (Internal) ====================
+
+    /// Internal sign method used by other public methods
+    #[inline]
+    fn sign_internal(&self, mut request: TransactionRequest) -> WalletResult<Transaction> {
         if request.gas_limit == 0 {
             request.gas_limit = self.config.default_gas_limit;
         }

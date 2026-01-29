@@ -152,6 +152,20 @@ impl LegacyTransaction {
         })
     }
 
+    /// Compute signing hash directly without returning encoded bytes
+    ///
+    /// This is more efficient than encode_for_signing() + keccak256() as it
+    /// avoids the Vec clone.
+    #[inline]
+    pub fn signing_hash(&self) -> B256 {
+        ENCODE_BUF.with(|buf| {
+            let mut buf = buf.borrow_mut();
+            buf.clear();
+            self.encode_signing_fields(&mut buf);
+            keccak256(&buf)
+        })
+    }
+
     /// Encode signing fields to buffer
     #[inline]
     fn encode_signing_fields(&self, buf: &mut Vec<u8>) {
@@ -239,6 +253,18 @@ impl Eip1559Transaction {
         })
     }
 
+    /// Compute signing hash directly without returning encoded bytes
+    #[inline]
+    pub fn signing_hash(&self) -> B256 {
+        ENCODE_BUF.with(|buf| {
+            let mut buf = buf.borrow_mut();
+            buf.clear();
+            buf.push(0x02);
+            self.encode_fields(&mut buf);
+            keccak256(&buf)
+        })
+    }
+
     #[inline]
     fn encode_fields(&self, buf: &mut Vec<u8>) {
         let list_len = self.rlp_list_len();
@@ -318,6 +344,18 @@ impl Eip2930Transaction {
             buf.push(0x01);
             self.encode_fields(&mut buf);
             buf.clone()
+        })
+    }
+
+    /// Compute signing hash directly without returning encoded bytes
+    #[inline]
+    pub fn signing_hash(&self) -> B256 {
+        ENCODE_BUF.with(|buf| {
+            let mut buf = buf.borrow_mut();
+            buf.clear();
+            buf.push(0x01);
+            self.encode_fields(&mut buf);
+            keccak256(&buf)
         })
     }
 
@@ -436,9 +474,14 @@ impl TypedTransaction {
         }
     }
 
-    /// Get signing hash
+    /// Get signing hash (optimized - no Vec allocation)
+    #[inline]
     pub fn signing_hash(&self) -> B256 {
-        keccak256(&self.encode_for_signing())
+        match self {
+            TypedTransaction::Legacy(tx) => tx.signing_hash(),
+            TypedTransaction::Eip2930(tx) => tx.signing_hash(),
+            TypedTransaction::Eip1559(tx) => tx.signing_hash(),
+        }
     }
 
     /// Encode signed transaction
