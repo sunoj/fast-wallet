@@ -54,7 +54,7 @@ pub use error::{WalletError, WalletResult};
 pub use nonce::NonceManager;
 pub use signer::FastSigner;
 pub use transaction::{Transaction, TransactionRequest, TypedTransaction};
-pub use wallet::{FastWallet, FastWalletBuilder, WalletConfig};
+pub use wallet::{FastWallet, FastWalletBuilder, PreheatedContext, WalletConfig};
 
 /// Re-export commonly used types
 pub mod types {
