@@ -1039,9 +1039,59 @@ impl FastWalletBuilder {
         }
     }
 
+    /// Create a wallet using Blink Labs RPC (Ethereum mainnet)
+    ///
+    /// Blink Labs provides low-latency RPC optimized for MEV and liquidation bots.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let wallet = FastWalletBuilder::with_blink(
+    ///     "0xYOUR_PRIVATE_KEY",
+    ///     "your_blink_api_key"
+    /// )
+    /// .chain_id(1)
+    /// .build()
+    /// .await?;
+    /// ```
+    pub fn with_blink(private_key: impl Into<String>, api_key: impl Into<String>) -> Self {
+        let api_key = api_key.into();
+        Self {
+            private_key: private_key.into(),
+            primary_rpc: format!("https://eth.blinklabs.xyz/v1/{}", api_key),
+            broadcast_rpcs: Vec::new(),
+            config: WalletConfig::default(),
+            initial_nonce: None,
+        }
+    }
+
+    /// Create a wallet using Blink Labs RPC for a specific chain
+    ///
+    /// Supported chains: eth, arb, base, opt, polygon
+    pub fn with_blink_chain(
+        private_key: impl Into<String>,
+        chain: &str,
+        api_key: impl Into<String>,
+    ) -> Self {
+        let api_key = api_key.into();
+        Self {
+            private_key: private_key.into(),
+            primary_rpc: format!("https://{}.blinklabs.xyz/v1/{}", chain, api_key),
+            broadcast_rpcs: Vec::new(),
+            config: WalletConfig::default(),
+            initial_nonce: None,
+        }
+    }
+
     /// Add RPC endpoints for parallel broadcasting
     pub fn broadcast_rpcs(mut self, rpcs: Vec<String>) -> Self {
         self.broadcast_rpcs = rpcs;
+        self
+    }
+
+    /// Add Blink Labs RPC as a broadcast endpoint
+    pub fn add_blink_broadcast(mut self, api_key: impl Into<String>) -> Self {
+        self.broadcast_rpcs
+            .push(format!("https://eth.blinklabs.xyz/v1/{}", api_key.into()));
         self
     }
 

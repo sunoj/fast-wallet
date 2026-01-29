@@ -67,6 +67,38 @@ impl RpcEndpoint {
         }
     }
 
+    /// Create a Blink Labs RPC endpoint
+    ///
+    /// Blink Labs provides low-latency RPC optimized for MEV and liquidation bots.
+    /// Get an API key at: https://blinklabs.xyz
+    ///
+    /// # Example
+    /// ```ignore
+    /// let endpoint = RpcEndpoint::blink("your_api_key");
+    /// ```
+    pub fn blink(api_key: impl Into<String>) -> Self {
+        Self {
+            url: format!("https://eth.blinklabs.xyz/v1/{}", api_key.into()),
+            auth_header: None,
+            is_private: false,
+            priority: 20, // High priority (lower than Flashbots, higher than public)
+            timeout: Some(Duration::from_secs(3)), // Fast timeout for low-latency
+        }
+    }
+
+    /// Create a Blink Labs RPC endpoint with custom chain
+    ///
+    /// Supported chains: eth, arb, base, opt, polygon
+    pub fn blink_chain(chain: &str, api_key: impl Into<String>) -> Self {
+        Self {
+            url: format!("https://{}.blinklabs.xyz/v1/{}", chain, api_key.into()),
+            auth_header: None,
+            is_private: false,
+            priority: 20,
+            timeout: Some(Duration::from_secs(3)),
+        }
+    }
+
     /// Set priority
     pub fn with_priority(mut self, priority: u8) -> Self {
         self.priority = priority;
@@ -524,6 +556,18 @@ impl BroadcasterBuilder {
         self
     }
 
+    /// Add a Blink Labs RPC endpoint (Ethereum mainnet)
+    pub fn add_blink(mut self, api_key: impl Into<String>) -> Self {
+        self.endpoints.push(RpcEndpoint::blink(api_key));
+        self
+    }
+
+    /// Add a Blink Labs RPC endpoint for a specific chain
+    pub fn add_blink_chain(mut self, chain: &str, api_key: impl Into<String>) -> Self {
+        self.endpoints.push(RpcEndpoint::blink_chain(chain, api_key));
+        self
+    }
+
     /// Add a custom endpoint
     pub fn add_endpoint(mut self, endpoint: RpcEndpoint) -> Self {
         self.endpoints.push(endpoint);
@@ -571,6 +615,11 @@ mod tests {
         let flashbots = RpcEndpoint::flashbots("test_key");
         assert!(flashbots.is_private);
         assert_eq!(flashbots.priority, 10);
+
+        let blink = RpcEndpoint::blink("test_api_key");
+        assert!(!blink.is_private);
+        assert_eq!(blink.priority, 20);
+        assert!(blink.url.contains("blinklabs.xyz"));
     }
 
     #[test]

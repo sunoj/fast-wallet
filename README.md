@@ -128,15 +128,22 @@ let wallet = FastWalletBuilder::new(private_key, rpc_url)
     .build()
     .await?;
 
+// Using Blink Labs RPC (low-latency, MEV-optimized)
+let wallet = FastWalletBuilder::with_blink(private_key, "your_blink_api_key")
+    .chain_id(1)
+    .build()
+    .await?;
+
 // Sync with known nonce (faster startup)
 let wallet = FastWalletBuilder::new(private_key, rpc_url)
     .chain_id(1)
     .build_with_nonce(0)?;
 
-// With multiple RPC endpoints
+// With multiple RPC endpoints (including Blink)
 let wallet = FastWalletBuilder::new(private_key, primary_rpc)
     .chain_id(1)
-    .broadcast_rpcs(vec![rpc1, rpc2, rpc3])
+    .add_blink_broadcast("your_blink_api_key")
+    .broadcast_rpcs(vec![rpc1, rpc2])
     .build()
     .await?;
 ```
