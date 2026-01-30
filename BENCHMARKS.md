@@ -2,6 +2,21 @@
 
 ## Version History
 
+### v0.1.6 - secp256k1-ffi Backend (50% Faster Signing) (2026-01-30)
+
+**New secp256k1-ffi Feature:**
+- Optional Bitcoin Core's C library backend for maximum signing performance
+- Uses precomputed multiplication tables from libsecp256k1
+- **50% faster** than pure Rust k256 implementation
+
+**Benchmark Results:**
+| Backend | Throughput | Signing Latency | Improvement |
+|---------|------------|-----------------|-------------|
+| k256 (default) | ~21,000 tx/sec | ~46 µs | - |
+| secp256k1-ffi | **~31,500 tx/sec** | **~30 µs** | **+50%** |
+
+Enable with: `features = ["secp256k1-ffi"]`
+
 ### v0.1.5 - Built-in Public RPC Presets & Connection Warmup (2026-01-29)
 
 **Built-in RPC Endpoints:**
@@ -15,7 +30,7 @@
 - `preheat_full()` - Full preheat (connections + nonce + gas)
 - **Latency savings**: 5-20ms per endpoint on first request
 
-**Benchmark Results:**
+**Benchmark Results (k256):**
 | Metric | Value |
 |--------|-------|
 | Throughput | ~19,500-20,300 tx/sec |

@@ -4,9 +4,10 @@ High-performance EVM wallet optimized for liquidation bots and MEV applications.
 
 ## Features
 
-- **~20,000 tx/sec** signing throughput
+- **~31,500 tx/sec** signing throughput (with `secp256k1-ffi`)
 - **~13ns** lock-free nonce acquisition
-- **~50µs** optimistic send latency (CPU only)
+- **~30µs** signing latency (with `secp256k1-ffi`)
+- **Dual signing backends**: Pure Rust (k256) or Bitcoin Core's C library (1.5x faster)
 - **Connection warmup**: Save 5-20ms with pre-established TCP/TLS connections
 - **20+ built-in RPC presets**: Public, MEV-protected, and regional endpoints
 - **Optimistic execution**: Skip simulation for lowest latency
@@ -22,6 +23,21 @@ High-performance EVM wallet optimized for liquidation bots and MEV applications.
 fast-wallet = { git = "https://github.com/user/fast-wallet" }
 tokio = { version = "1.35", features = ["full"] }
 alloy-primitives = "0.8"
+
+# For maximum performance (requires C compiler):
+# fast-wallet = { git = "https://github.com/user/fast-wallet", features = ["secp256k1-ffi"] }
+```
+
+### Signing Backend Comparison
+
+| Backend | Throughput | Signing Latency | Notes |
+|---------|------------|-----------------|-------|
+| `k256` (default) | ~21,000 tx/sec | ~46 µs | Pure Rust, no dependencies |
+| `secp256k1-ffi` | **~31,500 tx/sec** | **~30 µs** | Bitcoin Core's C library, 50% faster |
+
+Enable the faster backend with:
+```toml
+fast-wallet = { version = "0.1", features = ["secp256k1-ffi"] }
 ```
 
 ### Basic Usage

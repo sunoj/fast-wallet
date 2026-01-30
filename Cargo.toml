@@ -1,6 +1,6 @@
 [package]
 name = "fast-wallet"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2021"
 description = "High-performance EVM wallet optimized for liquidation bots"
 authors = ["Fast Wallet Team"]
@@ -29,6 +29,12 @@ path = "examples/anvil_benchmark.rs"
 name = "liquidation_bot"
 path = "examples/liquidation_bot.rs"
 
+[features]
+default = []
+# Use Bitcoin Core's libsecp256k1 for ~2-3x faster signing
+# Requires C compiler for build
+secp256k1-ffi = ["secp256k1"]
+
 [dependencies]
 # Async runtime - tokio for high-performance async
 tokio = { version = "1.35", features = ["full", "sync", "time", "rt-multi-thread"] }
@@ -37,6 +43,9 @@ tokio = { version = "1.35", features = ["full", "sync", "time", "rt-multi-thread
 k256 = { version = "0.13", features = ["ecdsa", "schnorr"] }
 sha3 = "0.10"  # Keccak256
 tiny-keccak = { version = "2.0", features = ["keccak"] }
+
+# Bitcoin Core's secp256k1 C library (optional, faster)
+secp256k1 = { version = "0.29", features = ["global-context", "recovery"], optional = true }
 
 # RLP encoding - using alloy for fastest encoding
 alloy-rlp = { version = "0.3", features = ["derive"] }

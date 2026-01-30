@@ -1,12 +1,25 @@
-//! Fast transaction signer using k256
+//! Fast transaction signer
 //!
-//! This module provides high-performance ECDSA signing using the k256 crate,
-//! which is one of the fastest pure-Rust secp256k1 implementations.
+//! This module provides high-performance ECDSA signing with two backends:
+//!
+//! - **k256** (default): Pure Rust implementation, no external dependencies
+//! - **secp256k1-ffi** (optional): Bitcoin Core's C library, ~2-3x faster
+//!
+//! Enable the `secp256k1-ffi` feature for maximum performance:
+//! ```toml
+//! fast-wallet = { version = "0.1", features = ["secp256k1-ffi"] }
+//! ```
 
 use crate::crypto::{keccak256, public_key_to_address};
 use crate::error::{WalletError, WalletResult};
 use alloy_primitives::{Address, B256};
+
+// Conditional imports based on feature
+#[cfg(not(feature = "secp256k1-ffi"))]
 use k256::ecdsa::{SigningKey, VerifyingKey};
+
+#[cfg(feature = "secp256k1-ffi")]
+use secp256k1::{Message, PublicKey, SecretKey, SECP256K1};
 
 /// Recovery ID with chain ID for EIP-155
 #[derive(Debug, Clone, Copy)]
@@ -28,6 +41,11 @@ impl RecoverableSignature {
     }
 }
 
+// ============================================================================
+// k256 Implementation (Pure Rust, default)
+// ============================================================================
+
+#[cfg(not(feature = "secp256k1-ffi"))]
 /// Fast ECDSA signer with pre-computed public key and address
 pub struct FastSigner {
     signing_key: SigningKey,
@@ -35,6 +53,27 @@ pub struct FastSigner {
     address: Address,
 }
 
+// ============================================================================
+// secp256k1-ffi Implementation (Bitcoin Core's C library, faster)
+// ============================================================================
+
+#[cfg(feature = "secp256k1-ffi")]
+/// Fast ECDSA signer using Bitcoin Core's libsecp256k1
+///
+/// This implementation uses the global precomputed context for maximum speed.
+/// The context includes precomputed multiplication tables that make signing
+/// ~2-3x faster than the pure Rust implementation.
+pub struct FastSigner {
+    secret_key: SecretKey,
+    public_key: PublicKey,
+    address: Address,
+}
+
+// ============================================================================
+// k256 Implementation
+// ============================================================================
+
+#[cfg(not(feature = "secp256k1-ffi"))]
 impl FastSigner {
     /// Create a new signer from a private key (32 bytes)
     pub fn new(private_key: &[u8; 32]) -> WalletResult<Self> {
@@ -77,12 +116,6 @@ impl FastSigner {
     #[inline]
     pub fn address(&self) -> Address {
         self.address
-    }
-
-    /// Get the verifying (public) key
-    #[inline]
-    pub fn verifying_key(&self) -> &VerifyingKey {
-        &self.verifying_key
     }
 
     /// Sign a message hash (32 bytes) with EIP-155 recovery ID
@@ -143,11 +176,132 @@ impl FastSigner {
     }
 }
 
+// ============================================================================
+// secp256k1-ffi Implementation (Bitcoin Core's C library)
+// ============================================================================
+
+#[cfg(feature = "secp256k1-ffi")]
+impl FastSigner {
+    /// Create a new signer from a private key (32 bytes)
+    ///
+    /// Uses the global precomputed context from libsecp256k1 for fastest signing.
+    pub fn new(private_key: &[u8; 32]) -> WalletResult<Self> {
+        let secret_key = SecretKey::from_slice(private_key)
+            .map_err(|e| WalletError::InvalidPrivateKey(e.to_string()))?;
+
+        // Use the global context with precomputed tables
+        let public_key = PublicKey::from_secret_key(SECP256K1, &secret_key);
+
+        // Get uncompressed public key bytes (65 bytes with 0x04 prefix)
+        let pubkey_bytes = public_key.serialize_uncompressed();
+        // Skip the 0x04 prefix
+        let address = public_key_to_address(&pubkey_bytes[1..]);
+
+        Ok(Self {
+            secret_key,
+            public_key,
+            address,
+        })
+    }
+
+    /// Create a new signer from a hex-encoded private key
+    pub fn from_hex(hex_key: &str) -> WalletResult<Self> {
+        let hex_key = hex_key.strip_prefix("0x").unwrap_or(hex_key);
+        let key_bytes = hex::decode(hex_key)?;
+
+        if key_bytes.len() != 32 {
+            return Err(WalletError::InvalidPrivateKey(format!(
+                "Expected 32 bytes, got {}",
+                key_bytes.len()
+            )));
+        }
+
+        let mut private_key = [0u8; 32];
+        private_key.copy_from_slice(&key_bytes);
+        Self::new(&private_key)
+    }
+
+    /// Get the Ethereum address
+    #[inline]
+    pub fn address(&self) -> Address {
+        self.address
+    }
+
+    /// Sign a message hash (32 bytes) with EIP-155 recovery ID
+    ///
+    /// Uses Bitcoin Core's libsecp256k1 with precomputed multiplication tables.
+    /// This is ~2-3x faster than the pure Rust implementation.
+    #[inline(always)]
+    pub fn sign_hash(&self, hash: &B256, chain_id: u64) -> WalletResult<RecoverableSignature> {
+        let message = Message::from_digest_slice(hash.as_slice())
+            .map_err(|e| WalletError::SigningError(e.to_string()))?;
+
+        // Sign using the global context with precomputed tables
+        let recoverable_sig = SECP256K1.sign_ecdsa_recoverable(&message, &self.secret_key);
+
+        let (recovery_id, sig_bytes) = recoverable_sig.serialize_compact();
+
+        let r = B256::from_slice(&sig_bytes[..32]);
+        let s = B256::from_slice(&sig_bytes[32..]);
+
+        // EIP-155: v = recovery_id + 35 + chain_id * 2
+        let v = recovery_id.to_i32() as u64 + 35 + chain_id * 2;
+
+        Ok(RecoverableSignature { r, s, v })
+    }
+
+    /// Sign a message hash for EIP-1559 transactions (different v calculation)
+    ///
+    /// For EIP-1559/2930 transactions, v is just the recovery ID (0 or 1)
+    #[inline(always)]
+    pub fn sign_hash_typed(&self, hash: &B256) -> WalletResult<RecoverableSignature> {
+        let message = Message::from_digest_slice(hash.as_slice())
+            .map_err(|e| WalletError::SigningError(e.to_string()))?;
+
+        let recoverable_sig = SECP256K1.sign_ecdsa_recoverable(&message, &self.secret_key);
+
+        let (recovery_id, sig_bytes) = recoverable_sig.serialize_compact();
+
+        let r = B256::from_slice(&sig_bytes[..32]);
+        let s = B256::from_slice(&sig_bytes[32..]);
+        let v = recovery_id.to_i32() as u64;
+
+        Ok(RecoverableSignature { r, s, v })
+    }
+
+    /// Sign arbitrary data by first hashing with Keccak256
+    #[inline]
+    pub fn sign_data(&self, data: &[u8], chain_id: u64) -> WalletResult<RecoverableSignature> {
+        let hash = keccak256(data);
+        self.sign_hash(&hash, chain_id)
+    }
+
+    /// Sign with Ethereum signed message prefix
+    pub fn sign_message(&self, message: &[u8], chain_id: u64) -> WalletResult<RecoverableSignature> {
+        let prefixed = format!("\x19Ethereum Signed Message:\n{}", message.len());
+        let mut data = prefixed.into_bytes();
+        data.extend_from_slice(message);
+        self.sign_data(&data, chain_id)
+    }
+}
+
+#[cfg(not(feature = "secp256k1-ffi"))]
 impl Clone for FastSigner {
     fn clone(&self) -> Self {
         Self {
             signing_key: self.signing_key.clone(),
             verifying_key: self.verifying_key,
+            address: self.address,
+        }
+    }
+}
+
+#[cfg(feature = "secp256k1-ffi")]
+impl Clone for FastSigner {
+    fn clone(&self) -> Self {
+        Self {
+            secret_key: self.secret_key,
+            public_key: self.public_key,
             address: self.address,
         }
     }
