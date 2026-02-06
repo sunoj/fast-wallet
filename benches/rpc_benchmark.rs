@@ -15,7 +15,7 @@
 
 use criterion::{criterion_group, criterion_main, Criterion};
 use fast_wallet::{FastWalletBuilder, TransactionRequest};
-use alloy_primitives::{Address, U256};
+use alloy::primitives::{Address, U256};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::runtime::Runtime;
@@ -275,7 +275,7 @@ fn bench_send_transaction(c: &mut Criterion) {
     group.sample_size(10); // Fewer samples as these actually send txs
 
     // Sign + Send
-    group.bench_function("sign_and_send", |b| {
+    group.bench_function("send", |b| {
         b.to_async(&rt).iter_custom(|iters| async move {
             let wallet = FastWalletBuilder::new(ANVIL_PRIVATE_KEY, ANVIL_RPC_URL)
                 .chain_id(31337)

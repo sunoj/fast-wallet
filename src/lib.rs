@@ -15,7 +15,7 @@
 //!
 //! ```rust,no_run
 //! use fast_wallet::{FastWalletBuilder, TransactionRequest};
-//! use alloy_primitives::{Address, U256};
+//! use alloy::primitives::{Address, U256};
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! // Create a wallet with multiple RPC endpoints
@@ -58,5 +58,5 @@ pub use wallet::{FastWallet, FastWalletBuilder, PreheatedContext, WalletConfig};
 
 /// Re-export commonly used types
 pub mod types {
-    pub use alloy_primitives::{Address, Bytes, B256, U256};
+    pub use alloy::primitives::{Address, Bytes, B256, U256};
 }

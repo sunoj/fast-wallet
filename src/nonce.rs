@@ -7,7 +7,7 @@
 //! - Background synchronization with the blockchain
 //! - Automatic nonce recovery on failures
 
-use alloy_primitives::Address;
+use alloy::primitives::Address;
 use dashmap::DashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -68,12 +68,28 @@ impl NonceTracker {
         self.pending_count.fetch_sub(1, Ordering::Relaxed);
     }
 
-    /// Mark a nonce as failed and potentially trigger resync
+    /// Mark a nonce as failed and attempt to reclaim it.
+    ///
+    /// If the failed nonce is the most recently allocated one (current - 1),
+    /// it is reclaimed via CAS to avoid nonce gaps. Otherwise, a resync
+    /// is flagged because there is a gap that only the chain can resolve.
     #[inline]
     pub fn fail(&self, used_nonce: u64) {
         self.pending_count.fetch_sub(1, Ordering::Relaxed);
 
-        // If the failed nonce is less than current, we might have a gap
+        // Try to reclaim: if used_nonce == current - 1, CAS current back
+        // This handles the common case of cancelling the most recent preheat.
+        let expected = used_nonce + 1;
+        if self
+            .current
+            .compare_exchange(expected, used_nonce, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            // Successfully reclaimed the nonce
+            return;
+        }
+
+        // Could not reclaim (other nonces allocated after this one) - flag for resync
         let current = self.current.load(Ordering::Acquire);
         if used_nonce < current {
             self.needs_sync.store(1, Ordering::Release);

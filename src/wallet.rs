@@ -12,27 +12,28 @@ use crate::nonce::SingleAddressNonceManager;
 use crate::rpc::{BatchRpcClient, RpcClient};
 use crate::signer::FastSigner;
 use crate::transaction::{Transaction, TransactionRequest};
-use alloy_primitives::{Address, Bytes, B256, U256};
+use alloy::primitives::{Address, Bytes, B256, U256};
 use futures::future::join_all;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::RwLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{broadcast, Semaphore};
+use tokio::sync::Semaphore;
 
-/// Gas fetch coalescer - ensures multiple concurrent gas requests share a single RPC call
-struct GasCoalescer {
-    /// In-flight gas price request sender
-    gas_price_tx: Mutex<Option<broadcast::Sender<U256>>>,
-    /// In-flight priority fee request sender
-    priority_fee_tx: Mutex<Option<broadcast::Sender<U256>>>,
+/// Gas fetch serializer - uses double-checked locking to ensure only one RPC call
+/// is made when multiple concurrent requests need gas prices.
+struct GasFetchSerializer {
+    /// Mutex to serialize gas price fetch (only one RPC call at a time)
+    gas_price_fetch: tokio::sync::Mutex<()>,
+    /// Mutex to serialize priority fee fetch
+    priority_fee_fetch: tokio::sync::Mutex<()>,
 }
 
-impl GasCoalescer {
+impl GasFetchSerializer {
     fn new() -> Self {
         Self {
-            gas_price_tx: Mutex::new(None),
-            priority_fee_tx: Mutex::new(None),
+            gas_price_fetch: tokio::sync::Mutex::new(()),
+            priority_fee_fetch: tokio::sync::Mutex::new(()),
         }
     }
 }
@@ -62,6 +63,13 @@ pub struct WalletConfig {
     /// Default gas limit for optimistic liquidation sends
     /// Default: 150,000 (typical liquidation cost)
     pub optimistic_default_gas_limit: u64,
+    /// Maximum age for cached gas prices before they are considered stale
+    /// Even if background refresh is running, prices older than this are rejected.
+    /// Default: 30 seconds
+    pub max_gas_cache_age: Duration,
+    /// Timeout for acquiring pending transaction permit
+    /// Default: 100ms (fail fast for liquidation bots)
+    pub pending_acquire_timeout: Duration,
 }
 
 impl Default for WalletConfig {
@@ -77,6 +85,8 @@ impl Default for WalletConfig {
             background_gas_refresh: None, // Disabled by default
             optimistic_default_gas_price: U256::from(1_000_000_000u64), // 1 gwei
             optimistic_default_gas_limit: 150_000, // Typical liquidation gas
+            max_gas_cache_age: Duration::from_secs(30),
+            pending_acquire_timeout: Duration::from_millis(100),
         }
     }
 }
@@ -151,8 +161,8 @@ pub struct FastWallet {
     priority_fee_cache: RwLock<Option<(U256, Instant)>>,
     /// Whether warmup has been done
     warmed_up: AtomicBool,
-    /// Gas request coalescer
-    gas_coalescer: GasCoalescer,
+    /// Gas fetch serializer (double-checked locking for coalescing)
+    gas_serializer: GasFetchSerializer,
 }
 
 impl FastWallet {
@@ -181,7 +191,7 @@ impl FastWallet {
             gas_price_cache: RwLock::new(None),
             priority_fee_cache: RwLock::new(None),
             warmed_up: AtomicBool::new(false),
-            gas_coalescer: GasCoalescer::new(),
+            gas_serializer: GasFetchSerializer::new(),
             config,
         })
     }
@@ -222,7 +232,7 @@ impl FastWallet {
             gas_price_cache: RwLock::new(None),
             priority_fee_cache: RwLock::new(None),
             warmed_up: AtomicBool::new(false),
-            gas_coalescer: GasCoalescer::new(),
+            gas_serializer: GasFetchSerializer::new(),
             config,
         })
     }
@@ -452,41 +462,25 @@ impl FastWallet {
 
     // ==================== Gas Price ====================
 
-    /// Get cached or fresh gas price (with request coalescing)
+    /// Get cached or fresh gas price (with double-checked locking for coalescing)
+    ///
+    /// Uses a tokio::sync::Mutex to serialize RPC calls: multiple concurrent callers
+    /// will share a single fetch result. This is correct even if the fetch fails.
     pub async fn get_gas_price(&self) -> WalletResult<U256> {
-        // Check cache first
-        {
-            let cache = self.gas_price_cache.read();
-            if let Some((price, timestamp)) = cache.as_ref() {
-                if timestamp.elapsed() < self.config.gas_cache_duration {
-                    return Ok(*price);
-                }
-            }
+        // Fast path: check cache (lock-free read)
+        if let Some(price) = self.read_gas_cache(&self.gas_price_cache) {
+            return Ok(price);
         }
 
-        // Check if there's an in-flight request we can join
-        let rx = {
-            let mut tx_guard = self.gas_coalescer.gas_price_tx.lock();
-            if let Some(tx) = tx_guard.as_ref() {
-                // Join existing request
-                Some(tx.subscribe())
-            } else {
-                // We're the first, create a new channel
-                let (tx, _) = broadcast::channel(1);
-                *tx_guard = Some(tx);
-                None
-            }
-        };
+        // Slow path: serialize fetch via async mutex (only one RPC call at a time)
+        let _guard = self.gas_serializer.gas_price_fetch.lock().await;
 
-        if let Some(mut receiver) = rx {
-            // Wait for the in-flight request
-            if let Ok(price) = receiver.recv().await {
-                return Ok(price);
-            }
-            // Sender dropped - fall through to fetch directly
+        // Double-check: another thread may have refreshed while we waited
+        if let Some(price) = self.read_gas_cache(&self.gas_price_cache) {
+            return Ok(price);
         }
 
-        // We're the leader (or fallback) - fetch the price
+        // We're the sole fetcher - make the RPC call
         let price = self.rpc_client.gas_price().await?;
 
         // Update cache
@@ -495,66 +489,47 @@ impl FastWallet {
             *cache = Some((price, Instant::now()));
         }
 
-        // Broadcast to waiters and clear the in-flight flag
-        {
-            let mut tx_guard = self.gas_coalescer.gas_price_tx.lock();
-            if let Some(tx) = tx_guard.take() {
-                let _ = tx.send(price);
-            }
-        }
-
         Ok(price)
     }
 
-    /// Get cached or fresh priority fee (with request coalescing)
+    /// Get cached or fresh priority fee (with double-checked locking for coalescing)
     pub async fn get_priority_fee(&self) -> WalletResult<U256> {
-        // Check cache first
-        {
-            let cache = self.priority_fee_cache.read();
-            if let Some((fee, timestamp)) = cache.as_ref() {
-                if timestamp.elapsed() < self.config.gas_cache_duration {
-                    return Ok(*fee);
-                }
-            }
+        // Fast path: check cache (lock-free read)
+        if let Some(fee) = self.read_gas_cache(&self.priority_fee_cache) {
+            return Ok(fee);
         }
 
-        // Check if there's an in-flight request we can join
-        let rx = {
-            let mut tx_guard = self.gas_coalescer.priority_fee_tx.lock();
-            if let Some(tx) = tx_guard.as_ref() {
-                Some(tx.subscribe())
-            } else {
-                let (tx, _) = broadcast::channel(1);
-                *tx_guard = Some(tx);
-                None
-            }
-        };
+        // Slow path: serialize fetch
+        let _guard = self.gas_serializer.priority_fee_fetch.lock().await;
 
-        if let Some(mut receiver) = rx {
-            if let Ok(fee) = receiver.recv().await {
-                return Ok(fee);
-            }
-            // Sender dropped - fall through to fetch directly
+        // Double-check
+        if let Some(fee) = self.read_gas_cache(&self.priority_fee_cache) {
+            return Ok(fee);
         }
 
-        // We're the leader (or fallback) - fetch the fee
         let fee = self.rpc_client.max_priority_fee().await?;
 
-        // Update cache
         {
             let mut cache = self.priority_fee_cache.write();
             *cache = Some((fee, Instant::now()));
         }
 
-        // Broadcast to waiters
-        {
-            let mut tx_guard = self.gas_coalescer.priority_fee_tx.lock();
-            if let Some(tx) = tx_guard.take() {
-                let _ = tx.send(fee);
-            }
-        }
-
         Ok(fee)
+    }
+
+    /// Read a gas cache value if it's fresh enough.
+    /// Returns None if cache is empty, expired, or exceeds max age.
+    #[inline]
+    fn read_gas_cache(&self, cache: &RwLock<Option<(U256, Instant)>>) -> Option<U256> {
+        let guard = cache.read();
+        guard.as_ref().and_then(|(price, timestamp)| {
+            let age = timestamp.elapsed();
+            if age < self.config.gas_cache_duration && age < self.config.max_gas_cache_age {
+                Some(*price)
+            } else {
+                None
+            }
+        })
     }
 
     /// Force refresh gas prices
@@ -739,42 +714,20 @@ impl FastWallet {
         request.build_and_sign(&self.signer)
     }
 
-    // Backwards compatibility aliases
-    #[inline]
-    pub fn sign_transaction(&self, request: TransactionRequest) -> WalletResult<Transaction> {
-        self.sign(request)
-    }
-
-    #[inline]
-    pub fn sign_eip1559_transaction(
-        &self,
-        to: Address,
-        value: U256,
-        data: Bytes,
-        gas_limit: u64,
-        max_fee_per_gas: U256,
-        max_priority_fee_per_gas: U256,
-    ) -> WalletResult<Transaction> {
-        self.sign_eip1559(to, value, data, gas_limit, max_fee_per_gas, max_priority_fee_per_gas)
-    }
-
-    #[inline]
-    pub fn sign_legacy_transaction(
-        &self,
-        to: Address,
-        value: U256,
-        data: Bytes,
-        gas_limit: u64,
-        gas_price: U256,
-    ) -> WalletResult<Transaction> {
-        self.sign_legacy(to, value, data, gas_limit, gas_price)
-    }
-
     // ==================== Transaction Sending ====================
 
     /// Send a pre-signed transaction
+    ///
+    /// Uses a timeout when acquiring the pending transaction permit to avoid
+    /// blocking indefinitely when many transactions are in-flight.
     pub async fn send_signed(&self, tx: &Transaction) -> WalletResult<B256> {
-        let _permit = self.pending_semaphore.acquire().await.unwrap();
+        let _permit = tokio::time::timeout(
+            self.config.pending_acquire_timeout,
+            self.pending_semaphore.acquire(),
+        )
+        .await
+        .map_err(|_| WalletError::Timeout)?
+        .map_err(|_| WalletError::RpcError("Semaphore closed".to_string()))?;
 
         let hex_tx = tx.to_hex();
 
@@ -819,11 +772,6 @@ impl FastWallet {
     ) -> WalletResult<B256> {
         let tx = self.sign_with_preheat(ctx, request)?;
         self.send_signed(&tx).await
-    }
-
-    // Backwards compatibility alias
-    pub async fn sign_and_send(&self, request: TransactionRequest) -> WalletResult<B256> {
-        self.send(request).await
     }
 
     // ========================================================================
@@ -933,8 +881,15 @@ impl FastWallet {
         to: Address,
         data: Bytes,
     ) -> WalletResult<B256> {
-        let gas_price = self.gas_price_cache.read().clone()
-            .map(|(price, _)| price)
+        let gas_price = self.gas_price_cache.read()
+            .as_ref()
+            .and_then(|(price, ts)| {
+                if ts.elapsed() < self.config.max_gas_cache_age {
+                    Some(*price)
+                } else {
+                    None
+                }
+            })
             .unwrap_or(self.config.optimistic_default_gas_price);
 
         let request = TransactionRequest::new()

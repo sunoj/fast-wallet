@@ -11,7 +11,7 @@ use fast_wallet::{
     wallet::FastWalletBuilder,
     BroadcasterBuilder, BroadcastStrategy, RpcEndpoint,
 };
-use alloy_primitives::{Address, Bytes, B256, U256};
+use alloy::primitives::{Address, Bytes, B256, U256};
 use std::sync::Arc;
 use std::thread;
 
@@ -187,7 +187,7 @@ fn test_wallet_sequential_transactions() {
 
     for i in 0..10 {
         let tx = wallet
-            .sign_legacy_transaction(
+            .sign_legacy(
                 Address::repeat_byte(i as u8),
                 U256::from(1_000_000_000_000_000_000u64),
                 Bytes::new(),
@@ -218,7 +218,7 @@ fn test_wallet_mixed_transaction_types() {
 
     // Legacy transaction
     let legacy = wallet
-        .sign_legacy_transaction(
+        .sign_legacy(
             Address::repeat_byte(1),
             U256::from(1_000_000_000_000_000_000u64),
             Bytes::new(),
@@ -229,7 +229,7 @@ fn test_wallet_mixed_transaction_types() {
 
     // EIP-1559 transaction
     let eip1559 = wallet
-        .sign_eip1559_transaction(
+        .sign_eip1559(
             Address::repeat_byte(2),
             U256::from(1_000_000_000_000_000_000u64),
             Bytes::new(),
@@ -328,7 +328,7 @@ fn test_signing_performance_baseline() {
 
     for _ in 0..iterations {
         let _ = wallet
-            .sign_legacy_transaction(
+            .sign_legacy(
                 Address::repeat_byte(1),
                 U256::from(1_000_000_000_000_000_000u64),
                 Bytes::new(),

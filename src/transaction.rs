@@ -10,8 +10,8 @@
 use crate::crypto::keccak256;
 use crate::error::WalletResult;
 use crate::signer::{FastSigner, RecoverableSignature};
-use alloy_primitives::{Address, Bytes, B256, U256};
-use alloy_rlp::Encodable;
+use alloy::primitives::{Address, Bytes, B256, U256};
+use alloy::rlp::Encodable;
 use std::cell::RefCell;
 
 // Thread-local buffer for encoding to avoid repeated allocations
@@ -45,14 +45,14 @@ pub struct AccessListItem {
 }
 
 impl Encodable for AccessListItem {
-    fn encode(&self, out: &mut dyn alloy_rlp::BufMut) {
+    fn encode(&self, out: &mut dyn alloy::rlp::BufMut) {
         // Encode as [address, [storage_keys...]]
         let storage_len: usize = self.storage_keys.iter().map(|k| k.length()).sum();
-        let storage_header_len = alloy_rlp::length_of_length(storage_len);
+        let storage_header_len = alloy::rlp::length_of_length(storage_len);
 
         let list_len = self.address.length() + storage_header_len + storage_len;
 
-        alloy_rlp::Header {
+        alloy::rlp::Header {
             list: true,
             payload_length: list_len,
         }
@@ -61,7 +61,7 @@ impl Encodable for AccessListItem {
         self.address.encode(out);
 
         // Encode storage keys as a list
-        alloy_rlp::Header {
+        alloy::rlp::Header {
             list: true,
             payload_length: storage_len,
         }
@@ -74,9 +74,9 @@ impl Encodable for AccessListItem {
 
     fn length(&self) -> usize {
         let storage_len: usize = self.storage_keys.iter().map(|k| k.length()).sum();
-        let storage_header_len = alloy_rlp::length_of_length(storage_len);
+        let storage_header_len = alloy::rlp::length_of_length(storage_len);
         let list_len = self.address.length() + storage_header_len + storage_len;
-        alloy_rlp::length_of_length(list_len) + list_len
+        alloy::rlp::length_of_length(list_len) + list_len
     }
 }
 
@@ -171,7 +171,7 @@ impl LegacyTransaction {
     fn encode_signing_fields(&self, buf: &mut Vec<u8>) {
         // [nonce, gasPrice, gasLimit, to, value, data, chainId, 0, 0]
         let list_len = self.rlp_list_len_for_signing();
-        alloy_rlp::Header {
+        alloy::rlp::Header {
             list: true,
             payload_length: list_len,
         }
@@ -205,7 +205,7 @@ impl LegacyTransaction {
         let mut buf = Vec::with_capacity(256);
 
         let list_len = self.rlp_list_len_signed(sig);
-        alloy_rlp::Header {
+        alloy::rlp::Header {
             list: true,
             payload_length: list_len,
         }
@@ -268,7 +268,7 @@ impl Eip1559Transaction {
     #[inline]
     fn encode_fields(&self, buf: &mut Vec<u8>) {
         let list_len = self.rlp_list_len();
-        alloy_rlp::Header {
+        alloy::rlp::Header {
             list: true,
             payload_length: list_len,
         }
@@ -304,7 +304,7 @@ impl Eip1559Transaction {
         buf.push(0x02);
 
         let list_len = self.rlp_list_len_signed(sig);
-        alloy_rlp::Header {
+        alloy::rlp::Header {
             list: true,
             payload_length: list_len,
         }
@@ -362,7 +362,7 @@ impl Eip2930Transaction {
     #[inline]
     fn encode_fields(&self, buf: &mut Vec<u8>) {
         let list_len = self.rlp_list_len();
-        alloy_rlp::Header {
+        alloy::rlp::Header {
             list: true,
             payload_length: list_len,
         }
@@ -396,7 +396,7 @@ impl Eip2930Transaction {
         buf.push(0x01);
 
         let list_len = self.rlp_list_len_signed(sig);
-        alloy_rlp::Header {
+        alloy::rlp::Header {
             list: true,
             payload_length: list_len,
         }
@@ -447,7 +447,7 @@ fn to_length(to: Option<Address>) -> usize {
 #[inline]
 fn encode_access_list(access_list: &[AccessListItem], buf: &mut Vec<u8>) {
     let len: usize = access_list.iter().map(|item| item.length()).sum();
-    alloy_rlp::Header {
+    alloy::rlp::Header {
         list: true,
         payload_length: len,
     }
@@ -461,7 +461,7 @@ fn encode_access_list(access_list: &[AccessListItem], buf: &mut Vec<u8>) {
 #[inline]
 fn access_list_length(access_list: &[AccessListItem]) -> usize {
     let inner_len: usize = access_list.iter().map(|item| item.length()).sum();
-    alloy_rlp::length_of_length(inner_len) + inner_len
+    alloy::rlp::length_of_length(inner_len) + inner_len
 }
 
 impl TypedTransaction {

@@ -13,7 +13,7 @@
 //! anvil --fork-url https://eth.llamarpc.com --block-time 1
 
 use fast_wallet::{FastWalletBuilder, TransactionRequest};
-use alloy_primitives::{Address, U256};
+use alloy::primitives::{Address, U256};
 use std::time::{Duration, Instant};
 
 // Anvil default private keys (DO NOT USE IN PRODUCTION)

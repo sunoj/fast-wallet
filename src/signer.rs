@@ -12,10 +12,7 @@
 
 use crate::crypto::{keccak256, public_key_to_address};
 use crate::error::{WalletError, WalletResult};
-use alloy_primitives::{Address, B256};
-
-// Conditional imports based on feature
-#[cfg(not(feature = "secp256k1-ffi"))]
+use alloy::primitives::{Address, B256};
 use k256::ecdsa::{SigningKey, VerifyingKey};
 
 #[cfg(feature = "secp256k1-ffi")]
@@ -136,7 +133,9 @@ impl FastSigner {
         let s = B256::from_slice(&sig_bytes[32..]);
 
         // EIP-155: v = recovery_id + 35 + chain_id * 2
-        let v = recovery_id.to_byte() as u64 + 35 + chain_id * 2;
+        let rec_id = recovery_id.to_byte();
+        debug_assert!(rec_id <= 1, "unexpected recovery_id: {rec_id}");
+        let v = rec_id as u64 + 35 + chain_id * 2;
 
         Ok(RecoverableSignature { r, s, v })
     }
@@ -155,7 +154,9 @@ impl FastSigner {
         let sig_bytes: [u8; 64] = signature.to_bytes().into();
         let r = B256::from_slice(&sig_bytes[..32]);
         let s = B256::from_slice(&sig_bytes[32..]);
-        let v = recovery_id.to_byte() as u64;
+        let rec_id = recovery_id.to_byte();
+        debug_assert!(rec_id <= 1, "unexpected recovery_id: {rec_id}");
+        let v = rec_id as u64;
 
         Ok(RecoverableSignature { r, s, v })
     }
@@ -245,7 +246,9 @@ impl FastSigner {
         let s = B256::from_slice(&sig_bytes[32..]);
 
         // EIP-155: v = recovery_id + 35 + chain_id * 2
-        let v = recovery_id.to_i32() as u64 + 35 + chain_id * 2;
+        let rec_id = recovery_id.to_i32();
+        debug_assert!((0..=1).contains(&rec_id), "unexpected recovery_id: {rec_id}");
+        let v = rec_id as u64 + 35 + chain_id * 2;
 
         Ok(RecoverableSignature { r, s, v })
     }
@@ -264,7 +267,9 @@ impl FastSigner {
 
         let r = B256::from_slice(&sig_bytes[..32]);
         let s = B256::from_slice(&sig_bytes[32..]);
-        let v = recovery_id.to_i32() as u64;
+        let rec_id = recovery_id.to_i32();
+        debug_assert!((0..=1).contains(&rec_id), "unexpected recovery_id: {rec_id}");
+        let v = rec_id as u64;
 
         Ok(RecoverableSignature { r, s, v })
     }

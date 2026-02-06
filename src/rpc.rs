@@ -6,7 +6,7 @@
 //! - Minimal serialization overhead
 
 use crate::error::{WalletError, WalletResult};
-use alloy_primitives::{Address, B256, U256};
+use alloy::primitives::{Address, B256, U256};
 use futures::future::join_all;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};

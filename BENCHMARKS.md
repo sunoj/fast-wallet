@@ -2,6 +2,25 @@
 
 ## Version History
 
+### v0.1.7 - Concurrency & Correctness Audit Fixes (2026-02-06)
+
+**Critical Bug Fixes:**
+- **Gas coalescing race condition**: Replaced broadcast-channel pattern with `tokio::sync::Mutex` double-checked locking to eliminate TOCTOU race
+- **Nonce leak on cancel_preheat**: Added CAS-based nonce reclamation in `NonceTracker::fail()` — reclaims the nonce when possible, flags resync otherwise
+- **Semaphore deadlock**: Added `tokio::time::timeout` to `pending_semaphore.acquire()` (configurable via `pending_acquire_timeout`, default 100ms)
+- **Blocking lock in async context**: Replaced `parking_lot::Mutex` gas coalescer with `tokio::sync::Mutex` to avoid blocking the tokio runtime
+- **RwLock guard lifetime**: Fixed gas cache reads to drop `RwLock` guard before awaiting, preventing potential deadlocks
+
+**Safety Improvements:**
+- Added `max_gas_cache_age` (default 30s) as hard cap on gas price staleness
+- Added `debug_assert!` for ECDSA recovery_id validation in both k256 and secp256k1-ffi backends
+- `WalletConfig` gains `max_gas_cache_age` and `pending_acquire_timeout` fields
+
+**Dependency Cleanup:**
+- Removed unused: `sha3`, `rand`, `anyhow`, `bytes`
+- Removed unused dev-deps: `wiremock`, `tokio-test`, `instant`
+- Trimmed redundant tokio features (`full` already includes `sync`, `time`, `rt-multi-thread`)
+
 ### v0.1.6 - secp256k1-ffi Backend (50% Faster Signing) (2026-01-30)
 
 **New secp256k1-ffi Feature:**

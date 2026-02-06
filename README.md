@@ -22,7 +22,7 @@ High-performance EVM wallet optimized for liquidation bots and MEV applications.
 [dependencies]
 fast-wallet = { git = "https://github.com/user/fast-wallet" }
 tokio = { version = "1.35", features = ["full"] }
-alloy-primitives = "0.8"
+alloy = { version = "1.0", features = ["rlp"] }
 
 # For maximum performance (requires C compiler):
 # fast-wallet = { git = "https://github.com/user/fast-wallet", features = ["secp256k1-ffi"] }
@@ -44,7 +44,7 @@ fast-wallet = { version = "0.1", features = ["secp256k1-ffi"] }
 
 ```rust
 use fast_wallet::{FastWalletBuilder, TransactionRequest};
-use alloy_primitives::{Address, U256};
+use alloy::primitives::{Address, U256};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

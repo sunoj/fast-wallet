@@ -16,7 +16,7 @@ use fast_wallet::{
     transaction::{Eip1559Transaction, LegacyTransaction, Transaction, TransactionRequest},
     wallet::FastWalletBuilder,
 };
-use alloy_primitives::{Address, Bytes, B256, U256};
+use alloy::primitives::{Address, Bytes, B256, U256};
 
 const TEST_PRIVATE_KEY: &str =
     "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
@@ -155,8 +155,8 @@ fn bench_full_transaction_sign(c: &mut Criterion) {
     group.finish();
 }
 
-/// Benchmark wallet sign_transaction (includes nonce management)
-fn bench_wallet_sign_transaction(c: &mut Criterion) {
+/// Benchmark wallet sign (includes nonce management)
+fn bench_wallet_sign(c: &mut Criterion) {
     let wallet = FastWalletBuilder::new(TEST_PRIVATE_KEY, "http://localhost:8545")
         .chain_id(1)
         .build_with_nonce(0)
@@ -164,10 +164,10 @@ fn bench_wallet_sign_transaction(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("wallet");
 
-    group.bench_function("sign_legacy_transaction", |b| {
+    group.bench_function("sign_legacy", |b| {
         b.iter(|| {
             wallet
-                .sign_legacy_transaction(
+                .sign_legacy(
                     Address::repeat_byte(1),
                     U256::from(1_000_000_000_000_000_000u64),
                     Bytes::new(),
@@ -178,10 +178,10 @@ fn bench_wallet_sign_transaction(c: &mut Criterion) {
         })
     });
 
-    group.bench_function("sign_eip1559_transaction", |b| {
+    group.bench_function("sign_eip1559", |b| {
         b.iter(|| {
             wallet
-                .sign_eip1559_transaction(
+                .sign_eip1559(
                     Address::repeat_byte(1),
                     U256::from(1_000_000_000_000_000_000u64),
                     Bytes::new(),
@@ -272,7 +272,7 @@ fn bench_throughput(c: &mut Criterion) {
                 .gas_limit(21000)
                 .gas_price(U256::from(20_000_000_000u64));
 
-            wallet.sign_transaction(black_box(request)).unwrap()
+            wallet.sign(black_box(request)).unwrap()
         })
     });
 
@@ -310,7 +310,7 @@ criterion_group!(
     bench_sign_hash,
     bench_transaction_encoding,
     bench_full_transaction_sign,
-    bench_wallet_sign_transaction,
+    bench_wallet_sign,
     bench_nonce_management,
     bench_concurrent_nonce,
     bench_throughput,

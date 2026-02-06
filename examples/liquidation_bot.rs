@@ -7,7 +7,7 @@
 //!
 //! Run with: cargo run --example liquidation_bot
 
-use alloy_primitives::{address, Address, Bytes, U256};
+use alloy::primitives::{address, Address, Bytes, U256};
 use fast_wallet::{FastWalletBuilder, WalletConfig};
 use std::sync::Arc;
 use std::time::Duration;

@@ -8,7 +8,7 @@
 
 use crate::error::{WalletError, WalletResult};
 use crate::transaction::Transaction;
-use alloy_primitives::B256;
+use alloy::primitives::B256;
 use futures::future::{select_all, join_all};
 use futures::FutureExt;
 use reqwest::Client;

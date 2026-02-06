@@ -2,7 +2,7 @@
 //!
 //! This is a simple demonstration of the fast-wallet library capabilities.
 
-use alloy_primitives::{Address, U256};
+use alloy::primitives::{Address, U256};
 use fast_wallet::TransactionRequest;
 use tracing::info;
 
@@ -35,7 +35,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("2. Sign and send a transaction:");
     println!("   ```rust");
-    println!("   let tx = wallet.sign_legacy_transaction(");
+    println!("   let tx = wallet.sign_legacy(");
     println!("       to_address,");
     println!("       U256::from(1_000_000_000_000_000_000u64), // 1 ETH");
     println!("       Bytes::new(),");
@@ -108,7 +108,7 @@ fn run_signing_benchmark() {
             .gas_limit(21000)
             .gas_price(U256::from(20_000_000_000u64));
 
-        let _ = wallet.sign_transaction(request).unwrap();
+        let _ = wallet.sign(request).unwrap();
     }
 
     let elapsed = start.elapsed();

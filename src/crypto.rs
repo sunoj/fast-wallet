@@ -3,7 +3,7 @@
 //! This module provides optimized implementations of common crypto operations.
 //! Uses native/asm-optimized keccak when available, falling back to tiny-keccak.
 
-use alloy_primitives::{Address, B256};
+use alloy::primitives::{Address, B256};
 use tiny_keccak::{Hasher, Keccak};
 
 /// Fast Keccak256 hash function
@@ -12,9 +12,9 @@ use tiny_keccak::{Hasher, Keccak};
 /// For x86_64, this leverages CPU-optimized code paths.
 #[inline(always)]
 pub fn keccak256(data: &[u8]) -> B256 {
-    // Use alloy_primitives::keccak256 which is highly optimized
+    // Use alloy::primitives::keccak256 which is highly optimized
     // and may use native SHA3 instructions when available
-    alloy_primitives::keccak256(data)
+    alloy::primitives::keccak256(data)
 }
 
 /// Compute Keccak256 hash into existing buffer (zero-allocation)
