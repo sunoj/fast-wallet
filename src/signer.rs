@@ -13,6 +13,8 @@
 use crate::crypto::{keccak256, public_key_to_address};
 use crate::error::{WalletError, WalletResult};
 use alloy::primitives::{Address, B256};
+
+#[cfg(not(feature = "secp256k1-ffi"))]
 use k256::ecdsa::{SigningKey, VerifyingKey};
 
 #[cfg(feature = "secp256k1-ffi")]

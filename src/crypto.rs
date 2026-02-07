@@ -1,10 +1,9 @@
 //! Fast cryptographic primitives
 //!
 //! This module provides optimized implementations of common crypto operations.
-//! Uses native/asm-optimized keccak when available, falling back to tiny-keccak.
+//! Uses alloy's optimized keccak256 implementation.
 
 use alloy::primitives::{Address, B256};
-use tiny_keccak::{Hasher, Keccak};
 
 /// Fast Keccak256 hash function
 ///
@@ -22,17 +21,6 @@ pub fn keccak256(data: &[u8]) -> B256 {
 pub fn keccak256_into(data: &[u8], output: &mut [u8; 32]) {
     let hash = keccak256(data);
     output.copy_from_slice(hash.as_slice());
-}
-
-/// Alternative keccak256 using tiny-keccak (for comparison/fallback)
-#[inline(always)]
-#[allow(dead_code)]
-pub fn keccak256_tiny(data: &[u8]) -> B256 {
-    let mut hasher = Keccak::v256();
-    let mut output = [0u8; 32];
-    hasher.update(data);
-    hasher.finalize(&mut output);
-    B256::from(output)
 }
 
 /// Compute Ethereum address from uncompressed public key (64 bytes, without 0x04 prefix)
