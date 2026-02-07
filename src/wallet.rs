@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
+use tracing::info;
 
 /// Gas fetch serializer - uses double-checked locking to ensure only one RPC call
 /// is made when multiple concurrent requests need gas prices.
@@ -137,6 +138,45 @@ impl PreheatedContext {
     /// Get age of this context
     pub fn age(&self) -> Duration {
         self.preheated_at.elapsed()
+    }
+}
+
+/// Wallet status returned by `self_check()`
+#[derive(Debug, Clone)]
+pub struct WalletStatus {
+    /// Wallet address
+    pub address: Address,
+    /// Balance in wei
+    pub balance: U256,
+    /// Latest nonce from chain (pending)
+    pub nonce: u64,
+    /// Chain ID
+    pub chain_id: u64,
+}
+
+impl WalletStatus {
+    /// Get balance in ETH (as f64, for display purposes)
+    pub fn balance_eth(&self) -> f64 {
+        let wei = self.balance;
+        // Convert to f64: divide by 1e18
+        let divisor = U256::from(1_000_000_000_000_000_000u64);
+        let whole = wei / divisor;
+        let remainder = wei % divisor;
+        whole.to::<u64>() as f64 + remainder.to::<u64>() as f64 / 1e18
+    }
+}
+
+impl std::fmt::Display for WalletStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Address: {:?} | Balance: {:.6} ETH ({} wei) | Nonce: {} | Chain: {}",
+            self.address,
+            self.balance_eth(),
+            self.balance,
+            self.nonce,
+            self.chain_id,
+        )
     }
 }
 
@@ -265,6 +305,61 @@ impl FastWallet {
     /// Get config reference
     pub fn config(&self) -> &WalletConfig {
         &self.config
+    }
+
+    // ==================== Self Check / Status ====================
+
+    /// Perform startup self-check: query balance, nonce from chain and log wallet status
+    ///
+    /// This is intended to be called once after wallet creation to verify
+    /// connectivity and display the wallet's on-chain state.
+    ///
+    /// Logs address, balance (in ETH), and latest nonce via `tracing::info!`.
+    pub async fn self_check(&self) -> WalletResult<WalletStatus> {
+        let address = self.address();
+
+        // Fetch balance and nonce in parallel
+        let (balance_result, nonce_result) = tokio::join!(
+            self.rpc_client.get_balance(address),
+            self.rpc_client.get_nonce(address),
+        );
+
+        let balance = balance_result?;
+        let nonce = nonce_result?;
+
+        // Sync local nonce manager with chain state
+        self.nonce_manager.sync(nonce);
+
+        let status = WalletStatus {
+            address,
+            balance,
+            nonce,
+            chain_id: self.config.chain_id,
+        };
+
+        info!("========== Wallet Self-Check ==========");
+        info!("  Address:  {:?}", status.address);
+        info!("  Balance:  {:.6} ETH ({} wei)", status.balance_eth(), status.balance);
+        info!("  Nonce:    {}", status.nonce);
+        info!("  Chain ID: {}", status.chain_id);
+        info!("=======================================");
+
+        Ok(status)
+    }
+
+    /// Query the wallet's current on-chain balance
+    pub async fn get_balance(&self) -> WalletResult<U256> {
+        self.rpc_client.get_balance(self.address()).await
+    }
+
+    /// Query the wallet's current on-chain nonce (pending, includes mempool)
+    pub async fn get_nonce(&self) -> WalletResult<u64> {
+        self.rpc_client.get_nonce(self.address()).await
+    }
+
+    /// Query the wallet's confirmed nonce (latest block only)
+    pub async fn get_nonce_latest(&self) -> WalletResult<u64> {
+        self.rpc_client.get_nonce_latest(self.address()).await
     }
 
     // ==================== Warmup / Preheating ====================

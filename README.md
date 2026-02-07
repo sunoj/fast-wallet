@@ -56,8 +56,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .build()
     .await?;
 
-    // Warmup (recommended)
-    wallet.warmup().await?;
+    // Startup self-check: logs address, balance, nonce
+    let status = wallet.self_check().await?;
+    println!("{}", status); // Address: 0x... | Balance: 1.234 ETH | Nonce: 42 | Chain: 1
 
     // Send transaction
     let tx_hash = wallet.send(
@@ -228,6 +229,29 @@ let broadcaster = BroadcasterBuilder::new()
 | `add_regional_rpcs()` | bloXroute Virginia, UK, Singapore |
 | `add_liquidation_preset()` | MEV protection + Regional + Default public |
 | `add_minimal_rpcs()` | LlamaNodes, PublicNode, 1RPC |
+
+### Wallet Self-Check & Status Query
+
+```rust
+// Startup self-check: fetches balance + nonce in parallel, logs via tracing
+let status = wallet.self_check().await?;
+// INFO ========== Wallet Self-Check ==========
+// INFO   Address:  0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266
+// INFO   Balance:  1.500000 ETH (1500000000000000000 wei)
+// INFO   Nonce:    42
+// INFO   Chain ID: 1
+// INFO =======================================
+
+// Access status fields programmatically
+println!("Address: {:?}", status.address);
+println!("Balance: {} wei ({:.6} ETH)", status.balance, status.balance_eth());
+println!("Nonce:   {}", status.nonce);
+
+// Query balance/nonce on demand
+let balance = wallet.get_balance().await?;
+let nonce = wallet.get_nonce().await?;           // pending (includes mempool)
+let nonce_confirmed = wallet.get_nonce_latest().await?;  // confirmed only
+```
 
 ### Configuration
 
