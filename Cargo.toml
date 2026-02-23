@@ -1,6 +1,6 @@
 [package]
 name = "fast-wallet"
-version = "0.1.10"
+version = "0.1.12"
 edition = "2021"
 description = "High-performance EVM wallet optimized for liquidation bots"
 authors = ["Fast Wallet Team"]
@@ -48,8 +48,8 @@ secp256k1 = { version = "0.29", features = ["global-context", "recovery"], optio
 # Alloy primitives + RLP encoding (1.x for compatibility with liquidation-engine)
 alloy = { version = "1.0", default-features = false, features = ["std", "rlp"] }
 
-# Futures utilities
-futures = "0.3"
+# Futures utilities (only join_all, select_all, FutureExt)
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 
 # HTTP client for RPC
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }

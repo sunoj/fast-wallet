@@ -9,8 +9,8 @@
 use crate::error::{WalletError, WalletResult};
 use crate::transaction::Transaction;
 use alloy::primitives::B256;
-use futures::future::{select_all, join_all};
-use futures::FutureExt;
+use futures_util::future::{select_all, join_all};
+use futures_util::FutureExt;
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;

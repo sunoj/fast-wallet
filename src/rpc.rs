@@ -7,7 +7,7 @@
 
 use crate::error::{WalletError, WalletResult};
 use alloy::primitives::{Address, B256, U256};
-use futures::future::join_all;
+use futures_util::future::join_all;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};

@@ -13,7 +13,7 @@ use crate::rpc::{BatchRpcClient, RpcClient};
 use crate::signer::FastSigner;
 use crate::transaction::{Transaction, TransactionRequest};
 use alloy::primitives::{Address, Bytes, B256, U256};
-use futures::future::join_all;
+use futures_util::future::join_all;
 use parking_lot::RwLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
