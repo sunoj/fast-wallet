@@ -170,13 +170,14 @@ let wallet = FastWalletBuilder::new(private_key, rpc_url)
     .chain_id(1)
     .build_with_nonce(0)?;
 
-// With multiple RPC endpoints (including Blink)
+// With multiple RPC endpoints (primary is always included in broadcast)
 let wallet = FastWalletBuilder::new(private_key, primary_rpc)
     .chain_id(1)
     .add_blink_broadcast("your_blink_api_key")
-    .broadcast_rpcs(vec![rpc1, rpc2])
+    .broadcast_rpcs(vec![rpc2, rpc3])
     .build()
     .await?;
+// Broadcasts to: primary_rpc + rpc2 + rpc3 in parallel
 
 // Using built-in public RPC presets
 use fast_wallet::{BroadcasterBuilder, BroadcastStrategy};

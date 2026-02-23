@@ -246,7 +246,9 @@ impl FastWallet {
         let mut wallet = Self::new(private_key, primary_rpc, config).await?;
 
         if !broadcast_rpcs.is_empty() {
-            wallet.batch_client = Some(Arc::new(BatchRpcClient::new(broadcast_rpcs)?));
+            let mut all_rpcs = vec![primary_rpc.to_string()];
+            all_rpcs.extend(broadcast_rpcs);
+            wallet.batch_client = Some(Arc::new(BatchRpcClient::new(all_rpcs)?));
         }
 
         Ok(wallet)
@@ -1260,7 +1262,9 @@ impl FastWalletBuilder {
             )?;
 
             if !self.broadcast_rpcs.is_empty() {
-                wallet.batch_client = Some(Arc::new(BatchRpcClient::new(self.broadcast_rpcs)?));
+                let mut all_rpcs = vec![self.primary_rpc.clone()];
+                all_rpcs.extend(self.broadcast_rpcs);
+                wallet.batch_client = Some(Arc::new(BatchRpcClient::new(all_rpcs)?));
             }
 
             Ok(wallet)
@@ -1287,7 +1291,9 @@ impl FastWalletBuilder {
         )?;
 
         if !self.broadcast_rpcs.is_empty() {
-            wallet.batch_client = Some(Arc::new(BatchRpcClient::new(self.broadcast_rpcs)?));
+            let mut all_rpcs = vec![self.primary_rpc.clone()];
+            all_rpcs.extend(self.broadcast_rpcs);
+            wallet.batch_client = Some(Arc::new(BatchRpcClient::new(all_rpcs)?));
         }
 
         Ok(wallet)
