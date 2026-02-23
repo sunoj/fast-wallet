@@ -285,6 +285,29 @@ impl RpcClient {
         let hex_str = result.strip_prefix("0x").unwrap_or(&result);
         hex::decode(hex_str).map_err(|e| WalletError::RpcError(e.to_string()))
     }
+
+    /// Call a contract with state overrides (eth_call 3rd param).
+    /// `state_overrides` is a JSON object mapping addresses to their overrides.
+    pub async fn call_with_overrides(
+        &self,
+        from: Address,
+        to: Address,
+        data: &[u8],
+        state_overrides: Value,
+    ) -> WalletResult<Vec<u8>> {
+        let params = json!({
+            "from": format!("{:?}", from),
+            "to": format!("{:?}", to),
+            "data": format!("0x{}", hex::encode(data)),
+        });
+
+        let result: String = self
+            .request("eth_call", json!([params, "latest", state_overrides]))
+            .await?;
+
+        let hex_str = result.strip_prefix("0x").unwrap_or(&result);
+        hex::decode(hex_str).map_err(|e| WalletError::RpcError(e.to_string()))
+    }
 }
 
 /// Parse hex string to u64
