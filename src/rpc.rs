@@ -271,14 +271,22 @@ impl RpcClient {
 
     /// Get transaction receipt
     pub async fn get_transaction_receipt(&self, tx_hash: B256) -> WalletResult<Option<Value>> {
-        let result: Option<Value> = self
+        // Note: request::<Option<Value>>() treats JSON `null` result as "Empty
+        // response" error because serde deserializes `null` as `None` for the
+        // outer `Option` in `RpcResponse.result: Option<Option<Value>>`.
+        // For eth_getTransactionReceipt, `null` is the normal response when the
+        // TX is pending (not yet mined), so we must map it back to Ok(None).
+        match self
             .request(
                 "eth_getTransactionReceipt",
                 json!([format!("{:?}", tx_hash)]),
             )
-            .await?;
-
-        Ok(result)
+            .await
+        {
+            Ok(receipt) => Ok(Some(receipt)),
+            Err(WalletError::RpcError(ref msg)) if msg == "Empty response" => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     /// Wait for transaction receipt with timeout
