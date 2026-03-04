@@ -1068,6 +1068,32 @@ impl FastWallet {
         self.send(request).await
     }
 
+    /// Send EIP-1559 contract call with explicit fee parameters.
+    ///
+    /// Used for Priority orders on Base where maxPriorityFeePerGas is the auction bid.
+    pub async fn send_contract_call_eip1559(
+        &self,
+        to: Address,
+        data: Bytes,
+        gas_limit: u64,
+        value: Option<U256>,
+        max_fee_per_gas: U256,
+        max_priority_fee_per_gas: U256,
+    ) -> WalletResult<B256> {
+        let mut request = TransactionRequest::new()
+            .to(to)
+            .data(data)
+            .gas_limit(gas_limit)
+            .max_fee_per_gas(max_fee_per_gas)
+            .max_priority_fee_per_gas(max_priority_fee_per_gas);
+
+        if let Some(v) = value {
+            request = request.value(v);
+        }
+
+        self.send(request).await
+    }
+
     /// Send multiple transactions in parallel
     ///
     /// This is the fastest way to send multiple transactions.
