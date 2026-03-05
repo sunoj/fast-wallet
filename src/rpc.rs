@@ -7,7 +7,8 @@
 
 use crate::error::{WalletError, WalletResult};
 use alloy::primitives::{Address, B256, U256};
-use futures_util::future::join_all;
+use futures_util::future::{join_all, select_all};
+use futures_util::FutureExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -361,26 +362,39 @@ impl BatchRpcClient {
         self.clients[idx % self.clients.len()].clone()
     }
 
-    /// Send transaction to all endpoints in parallel
+    /// Send transaction to all endpoints in parallel, return on first success
     pub async fn broadcast_transaction(&self, raw_tx: &str) -> WalletResult<B256> {
-        let futures: Vec<_> = self
+        if self.clients.is_empty() {
+            return Err(WalletError::RpcError("No RPC endpoints".to_string()));
+        }
+
+        let mut pending: Vec<_> = self
             .clients
             .iter()
             .map(|client| {
                 let client = client.clone();
                 let tx = raw_tx.to_string();
-                async move { client.send_raw_transaction(&tx).await }
+                async move { client.send_raw_transaction(&tx).await }.boxed()
             })
             .collect();
 
-        let results = join_all(futures).await;
-
-        // Return first success, or last error
         let mut last_err = None;
-        for result in results {
+        while !pending.is_empty() {
+            let (result, _index, remaining) = select_all(pending).await;
             match result {
-                Ok(hash) => return Ok(hash),
-                Err(e) => last_err = Some(e),
+                Ok(hash) => {
+                    // First success — spawn remaining sends in background (fire-and-forget)
+                    if !remaining.is_empty() {
+                        tokio::spawn(async move {
+                            join_all(remaining).await;
+                        });
+                    }
+                    return Ok(hash);
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                    pending = remaining;
+                }
             }
         }
 
