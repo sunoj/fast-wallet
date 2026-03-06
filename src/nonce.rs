@@ -364,6 +364,95 @@ mod tests {
         assert_eq!(manager.pending_count(), 1);
     }
 
+    /// CAS reclamation: fail() on the most recently allocated nonce
+    /// should reclaim it (current goes back to N).
+    #[test]
+    fn test_fail_reclaims_last_nonce() {
+        let tracker = NonceTracker::new(10);
+
+        let n = tracker.get_and_increment(); // n=10, current=11
+        assert_eq!(n, 10);
+        assert_eq!(tracker.peek(), 11);
+
+        tracker.fail(10); // CAS(11, 10) should succeed
+        assert_eq!(tracker.peek(), 10); // reclaimed
+        assert!(!tracker.needs_sync()); // no sync needed
+
+        // Next allocation reuses nonce 10
+        assert_eq!(tracker.get_and_increment(), 10);
+    }
+
+    /// CAS reclamation fails when failing a non-latest nonce (gap exists).
+    /// The nonce cannot be reclaimed, so needs_sync is flagged.
+    #[test]
+    fn test_fail_non_latest_flags_sync() {
+        let tracker = NonceTracker::new(10);
+
+        let _n0 = tracker.get_and_increment(); // 10, current=11
+        let _n1 = tracker.get_and_increment(); // 11, current=12
+
+        // Fail nonce 10 (not the latest — 11 was allocated after)
+        tracker.fail(10);
+        assert_eq!(tracker.peek(), 12); // NOT reclaimed
+        assert!(tracker.needs_sync()); // sync flagged
+    }
+
+    /// sync() resets current nonce and clears needs_sync flag.
+    #[test]
+    fn test_sync_resets_nonce_and_clears_flag() {
+        let tracker = NonceTracker::new(10);
+
+        // Advance nonce and create a gap
+        let _n0 = tracker.get_and_increment(); // 10
+        let _n1 = tracker.get_and_increment(); // 11
+        tracker.fail(10); // can't reclaim, flags sync
+        assert!(tracker.needs_sync());
+
+        // Sync from chain (chain nonce is 10 — TX 10 was never sent)
+        tracker.set(10);
+        tracker.needs_sync.store(0, Ordering::Release);
+        assert_eq!(tracker.peek(), 10);
+        assert!(!tracker.needs_sync());
+    }
+
+    /// SingleAddressNonceManager: fail + sync via manager API.
+    #[test]
+    fn test_single_address_fail_and_sync() {
+        let addr = Address::ZERO;
+        let manager = SingleAddressNonceManager::new(addr, 100);
+
+        let n = manager.get_nonce(); // 100
+        assert_eq!(n, 100);
+
+        // Fail the nonce (simulates presign abort)
+        manager.fail(100);
+        assert_eq!(manager.peek(), 100); // reclaimed via CAS
+
+        // Allocate again — should get 100 back
+        assert_eq!(manager.get_nonce(), 100);
+    }
+
+    /// NonceManager: sync_nonce recovers from desync.
+    #[test]
+    fn test_nonce_manager_sync_after_fail() {
+        let manager = NonceManager::new();
+        let addr = Address::ZERO;
+
+        manager.init_nonce(addr, 10);
+        let _n0 = manager.get_nonce(addr); // 10
+        let _n1 = manager.get_nonce(addr); // 11
+
+        // Fail nonce 10 (non-latest, flags sync)
+        manager.fail_nonce(addr, 10);
+
+        // Sync from chain — chain says 10 (both TXs failed)
+        manager.sync_nonce(addr, 10);
+        assert_eq!(manager.peek_nonce(addr), 10);
+
+        // Next allocation starts from 10 again
+        assert_eq!(manager.get_nonce(addr), 10);
+    }
+
     #[test]
     fn test_concurrent_nonce_access() {
         use std::thread;
