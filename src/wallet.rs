@@ -191,6 +191,7 @@ pub struct FastWallet {
     signer: FastSigner,
     nonce_manager: SingleAddressNonceManager,
     rpc_client: Arc<RpcClient>,
+    gas_rpc_client: Option<Arc<RpcClient>>,
     batch_client: Option<Arc<BatchRpcClient>>,
     config: WalletConfig,
     /// Semaphore to limit concurrent pending transactions
@@ -226,6 +227,7 @@ impl FastWallet {
             signer,
             nonce_manager,
             rpc_client,
+            gas_rpc_client: None,
             batch_client: None,
             pending_semaphore: Semaphore::new(config.max_pending_txs),
             gas_price_cache: RwLock::new(None),
@@ -269,6 +271,7 @@ impl FastWallet {
             signer,
             nonce_manager,
             rpc_client,
+            gas_rpc_client: None,
             batch_client: None,
             pending_semaphore: Semaphore::new(config.max_pending_txs),
             gas_price_cache: RwLock::new(None),
@@ -302,6 +305,10 @@ impl FastWallet {
     /// Get RPC client reference
     pub fn rpc(&self) -> &RpcClient {
         &self.rpc_client
+    }
+
+    fn gas_rpc(&self) -> &Arc<RpcClient> {
+        self.gas_rpc_client.as_ref().unwrap_or(&self.rpc_client)
     }
 
     /// Get config reference
@@ -578,7 +585,7 @@ impl FastWallet {
         }
 
         // We're the sole fetcher - make the RPC call
-        let price = self.rpc_client.gas_price().await?;
+        let price = self.gas_rpc().gas_price().await?;
 
         // Update cache
         {
@@ -604,7 +611,7 @@ impl FastWallet {
             return Ok(fee);
         }
 
-        let fee = self.rpc_client.max_priority_fee().await?;
+        let fee = self.gas_rpc().max_priority_fee().await?;
 
         {
             let mut cache = self.priority_fee_cache.write();
@@ -1145,6 +1152,7 @@ impl std::fmt::Debug for FastWallet {
 pub struct FastWalletBuilder {
     private_key: String,
     primary_rpc: String,
+    gas_rpc_url: Option<String>,
     broadcast_rpcs: Vec<String>,
     config: WalletConfig,
     initial_nonce: Option<u64>,
@@ -1155,6 +1163,7 @@ impl FastWalletBuilder {
         Self {
             private_key: private_key.into(),
             primary_rpc: primary_rpc.into(),
+            gas_rpc_url: None,
             broadcast_rpcs: Vec::new(),
             config: WalletConfig::default(),
             initial_nonce: None,
@@ -1180,6 +1189,7 @@ impl FastWalletBuilder {
         Self {
             private_key: private_key.into(),
             primary_rpc: format!("https://eth.blinklabs.xyz/v1/{}", api_key),
+            gas_rpc_url: None,
             broadcast_rpcs: Vec::new(),
             config: WalletConfig::default(),
             initial_nonce: None,
@@ -1198,6 +1208,7 @@ impl FastWalletBuilder {
         Self {
             private_key: private_key.into(),
             primary_rpc: format!("https://{}.blinklabs.xyz/v1/{}", chain, api_key),
+            gas_rpc_url: None,
             broadcast_rpcs: Vec::new(),
             config: WalletConfig::default(),
             initial_nonce: None,
@@ -1207,6 +1218,11 @@ impl FastWalletBuilder {
     /// Add RPC endpoints for parallel broadcasting
     pub fn broadcast_rpcs(mut self, rpcs: Vec<String>) -> Self {
         self.broadcast_rpcs = rpcs;
+        self
+    }
+
+    pub fn gas_rpc_url(mut self, url: impl Into<String>) -> Self {
+        self.gas_rpc_url = Some(url.into());
         self
     }
 
@@ -1279,6 +1295,8 @@ impl FastWalletBuilder {
 
     /// Build the wallet (async - fetches nonce from chain if not provided)
     pub async fn build(self) -> WalletResult<FastWallet> {
+        let gas_rpc_url = self.gas_rpc_url;
+
         if let Some(nonce) = self.initial_nonce {
             let mut wallet = FastWallet::with_known_nonce(
                 &self.private_key,
@@ -1293,17 +1311,33 @@ impl FastWalletBuilder {
                 wallet.batch_client = Some(Arc::new(BatchRpcClient::new(all_rpcs)?));
             }
 
+            if let Some(url) = gas_rpc_url {
+                wallet.gas_rpc_client = Some(Arc::new(RpcClient::new(&url)?));
+            }
+
             Ok(wallet)
         } else if !self.broadcast_rpcs.is_empty() {
-            FastWallet::with_multiple_rpcs(
+            let mut wallet = FastWallet::with_multiple_rpcs(
                 &self.private_key,
                 &self.primary_rpc,
                 self.broadcast_rpcs,
                 self.config,
             )
-            .await
+            .await?;
+
+            if let Some(url) = gas_rpc_url {
+                wallet.gas_rpc_client = Some(Arc::new(RpcClient::new(&url)?));
+            }
+
+            Ok(wallet)
         } else {
-            FastWallet::new(&self.private_key, &self.primary_rpc, self.config).await
+            let mut wallet = FastWallet::new(&self.private_key, &self.primary_rpc, self.config).await?;
+
+            if let Some(url) = gas_rpc_url {
+                wallet.gas_rpc_client = Some(Arc::new(RpcClient::new(&url)?));
+            }
+
+            Ok(wallet)
         }
     }
 
@@ -1320,6 +1354,10 @@ impl FastWalletBuilder {
             let mut all_rpcs = vec![self.primary_rpc.clone()];
             all_rpcs.extend(self.broadcast_rpcs);
             wallet.batch_client = Some(Arc::new(BatchRpcClient::new(all_rpcs)?));
+        }
+
+        if let Some(url) = self.gas_rpc_url {
+            wallet.gas_rpc_client = Some(Arc::new(RpcClient::new(&url)?));
         }
 
         Ok(wallet)
