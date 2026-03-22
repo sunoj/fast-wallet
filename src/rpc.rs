@@ -207,6 +207,18 @@ impl RpcClient {
         self.send_raw_transaction(&hex_tx).await
     }
 
+    /// Check if a TX exists in the mempool or on-chain via eth_getTransactionByHash.
+    /// Returns true if found (mempool or mined), false if not.
+    pub async fn tx_exists(&self, tx_hash: B256) -> WalletResult<bool> {
+        let result: Option<Value> = self
+            .request(
+                "eth_getTransactionByHash",
+                json!([format!("{:?}", tx_hash)]),
+            )
+            .await?;
+        Ok(result.is_some())
+    }
+
     /// Get transaction receipt
     pub async fn get_transaction_receipt(&self, tx_hash: B256) -> WalletResult<Option<Value>> {
         let result: Option<Value> = self

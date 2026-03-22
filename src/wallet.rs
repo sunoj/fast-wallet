@@ -862,6 +862,53 @@ impl FastWallet {
         result
     }
 
+    /// Verify a broadcast TX is visible in the mempool/chain.
+    /// Polls eth_getTransactionByHash for up to `max_wait`. If not found, re-broadcasts.
+    /// Returns Ok(true) if verified in mempool, Ok(false) if re-broadcast was attempted.
+    pub async fn verify_broadcast(&self, tx: &Transaction, tx_hash: B256, max_wait: Duration) -> WalletResult<bool> {
+        let poll_interval = Duration::from_millis(500);
+        let start = Instant::now();
+
+        while start.elapsed() < max_wait {
+            if self.rpc_client.tx_exists(tx_hash).await.unwrap_or(false) {
+                return Ok(true);
+            }
+            tokio::time::sleep(poll_interval).await;
+        }
+
+        // TX not found — re-broadcast to all endpoints
+        tracing::warn!(
+            %tx_hash,
+            nonce = tx.nonce(),
+            elapsed_ms = start.elapsed().as_millis() as u64,
+            "TX not in mempool after verification window, re-broadcasting"
+        );
+        let hex_tx = tx.to_hex();
+        if let Some(batch_client) = &self.batch_client {
+            match batch_client.broadcast_transaction(&hex_tx).await {
+                Ok(_) => tracing::info!(%tx_hash, "re-broadcast succeeded"),
+                Err(e) => tracing::warn!(%tx_hash, error = %e, "re-broadcast failed"),
+            }
+        } else {
+            match self.rpc_client.send_raw_transaction(&hex_tx).await {
+                Ok(_) => tracing::info!(%tx_hash, "re-broadcast succeeded (single RPC)"),
+                Err(e) => tracing::warn!(%tx_hash, error = %e, "re-broadcast failed (single RPC)"),
+            }
+        }
+        Ok(false)
+    }
+
+    /// Compare local nonce with on-chain nonce.
+    /// Returns (local_nonce, chain_nonce, is_stalled).
+    /// Stalled = local is more than `threshold` ahead of chain for too long.
+    pub async fn nonce_health_check(&self) -> WalletResult<(u64, u64, bool)> {
+        let local = self.current_nonce();
+        let chain = self.rpc_client.get_nonce(self.address()).await?;
+        // If local is >2 ahead of chain, nonces are stuck in-flight
+        let stalled = local > chain + 2;
+        Ok((local, chain, stalled))
+    }
+
     /// Sign and send a transaction in one call
     pub async fn send(&self, request: TransactionRequest) -> WalletResult<B256> {
         let tx = self.sign(request)?;
