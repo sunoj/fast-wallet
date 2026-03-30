@@ -218,8 +218,8 @@ impl LegacyTransaction {
         self.value.encode(&mut buf);
         self.data.encode(&mut buf);
         sig.v.encode(&mut buf);
-        sig.r.encode(&mut buf);
-        sig.s.encode(&mut buf);
+        encode_signature_scalar(&sig.r, &mut buf);
+        encode_signature_scalar(&sig.s, &mut buf);
 
         buf
     }
@@ -232,8 +232,8 @@ impl LegacyTransaction {
             + self.value.length()
             + self.data.length()
             + sig.v.length()
-            + sig.r.length()
-            + sig.s.length()
+            + signature_scalar_length(&sig.r)
+            + signature_scalar_length(&sig.s)
     }
 }
 
@@ -320,14 +320,17 @@ impl Eip1559Transaction {
         self.data.encode(&mut buf);
         encode_access_list(&self.access_list, &mut buf);
         sig.v.encode(&mut buf);
-        sig.r.encode(&mut buf);
-        sig.s.encode(&mut buf);
+        encode_signature_scalar(&sig.r, &mut buf);
+        encode_signature_scalar(&sig.s, &mut buf);
 
         buf
     }
 
     fn rlp_list_len_signed(&self, sig: &RecoverableSignature) -> usize {
-        self.rlp_list_len() + sig.v.length() + sig.r.length() + sig.s.length()
+        self.rlp_list_len()
+            + sig.v.length()
+            + signature_scalar_length(&sig.r)
+            + signature_scalar_length(&sig.s)
     }
 }
 
@@ -411,14 +414,17 @@ impl Eip2930Transaction {
         self.data.encode(&mut buf);
         encode_access_list(&self.access_list, &mut buf);
         sig.v.encode(&mut buf);
-        sig.r.encode(&mut buf);
-        sig.s.encode(&mut buf);
+        encode_signature_scalar(&sig.r, &mut buf);
+        encode_signature_scalar(&sig.s, &mut buf);
 
         buf
     }
 
     fn rlp_list_len_signed(&self, sig: &RecoverableSignature) -> usize {
-        self.rlp_list_len() + sig.v.length() + sig.r.length() + sig.s.length()
+        self.rlp_list_len()
+            + sig.v.length()
+            + signature_scalar_length(&sig.r)
+            + signature_scalar_length(&sig.s)
     }
 }
 
@@ -462,6 +468,23 @@ fn encode_access_list(access_list: &[AccessListItem], buf: &mut Vec<u8>) {
 fn access_list_length(access_list: &[AccessListItem]) -> usize {
     let inner_len: usize = access_list.iter().map(|item| item.length()).sum();
     alloy::rlp::length_of_length(inner_len) + inner_len
+}
+
+#[inline]
+fn encode_signature_scalar(value: &B256, buf: &mut Vec<u8>) {
+    canonical_signature_scalar_bytes(value).encode(buf);
+}
+
+#[inline]
+fn signature_scalar_length(value: &B256) -> usize {
+    canonical_signature_scalar_bytes(value).length()
+}
+
+#[inline]
+fn canonical_signature_scalar_bytes(value: &B256) -> &[u8] {
+    let bytes = value.as_slice();
+    let first_nonzero = bytes.iter().position(|byte| *byte != 0).unwrap_or(bytes.len());
+    &bytes[first_nonzero..]
 }
 
 impl TypedTransaction {
@@ -686,6 +709,22 @@ mod tests {
     const TEST_PRIVATE_KEY: &str =
         "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
 
+    fn leading_zero_signature() -> RecoverableSignature {
+        RecoverableSignature {
+            v: 1,
+            r: B256::from([
+                0x00, 0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80, 0x90, 0xa0, 0xb0, 0xc0,
+                0xd0, 0xe0, 0xf0, 0x01, 0x12, 0x23, 0x34, 0x45, 0x56, 0x67, 0x78, 0x89, 0x9a,
+                0xab, 0xbc, 0xcd, 0xde, 0xef, 0x01,
+            ]),
+            s: B256::from([
+                0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d,
+                0x1e, 0x1f, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a,
+                0x2b, 0x2c, 0x2d, 0x2e, 0x2f, 0x30,
+            ]),
+        }
+    }
+
     #[test]
     fn test_legacy_transaction_encoding() {
         let tx = LegacyTransaction {
@@ -781,6 +820,42 @@ mod tests {
 
         // Same transaction should produce same hash
         assert_eq!(tx1.hash(), tx2.hash());
+    }
+
+    #[test]
+    fn test_signature_scalar_encoding_strips_leading_zero() {
+        let mut encoded = Vec::new();
+        let sig = leading_zero_signature();
+
+        encode_signature_scalar(&sig.r, &mut encoded);
+
+        assert_eq!(signature_scalar_length(&sig.r), 32);
+        assert_eq!(
+            hex::encode(encoded),
+            "9f102030405060708090a0b0c0d0e0f00112233445566778899aabbccddeef01"
+        );
+    }
+
+    #[test]
+    fn test_eip1559_signed_encoding_canonicalizes_signature_scalars() {
+        let tx = Eip1559Transaction {
+            chain_id: 8453,
+            nonce: 7,
+            max_priority_fee_per_gas: U256::from(259_311u64),
+            max_fee_per_gas: U256::from(1_000_000u64),
+            gas_limit: 210_000,
+            to: Some(Address::repeat_byte(0x11)),
+            value: U256::ZERO,
+            data: Bytes::new(),
+            access_list: vec![],
+        };
+
+        let encoded = tx.encode_signed(&leading_zero_signature());
+
+        assert_eq!(
+            hex::encode(encoded),
+            "02f86a822105078303f4ef830f4240830334509411111111111111111111111111111111111111118080c0019f102030405060708090a0b0c0d0e0f00112233445566778899aabbccddeef01a01112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f30"
+        );
     }
 
     #[test]
