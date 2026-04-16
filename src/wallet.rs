@@ -552,9 +552,21 @@ impl FastWallet {
 
     // ==================== Nonce Management ====================
 
-    /// Sync nonce from chain
+    /// Sync nonce from chain using the `pending` tag (includes mempool).
+    /// Use after a `"nonce too low"` error: chain has advanced past our local view.
     pub async fn sync_nonce(&self) -> WalletResult<u64> {
         let chain_nonce = self.rpc_client.get_nonce(self.address()).await?;
+        self.nonce_manager.sync(chain_nonce);
+        Ok(chain_nonce)
+    }
+
+    /// Sync nonce from chain using the `latest` tag (confirmed state only).
+    /// Use after a `"nonce too high"` error: Nitro / geth pre-check compares
+    /// the tx nonce against the state nonce, which corresponds to the `latest`
+    /// block tag. Syncing to `pending` can leave the tracker above state when
+    /// a dangling tx sits in the mempool at the gap nonce.
+    pub async fn sync_nonce_latest(&self) -> WalletResult<u64> {
+        let chain_nonce = self.rpc_client.get_nonce_latest(self.address()).await?;
         self.nonce_manager.sync(chain_nonce);
         Ok(chain_nonce)
     }
@@ -850,12 +862,20 @@ impl FastWallet {
                 // Mark nonce as failed
                 self.nonce_manager.fail(tx.nonce());
 
-                // Check for nonce drift: both "too low" (we replayed an already-mined
+                // Nonce-drift recovery. Both "too low" (we replayed an already-mined
                 // nonce) and "too high" (local counter skipped ahead of chain) indicate
-                // the local tracker has diverged from the chain. Force an RPC resync in
-                // both cases so subsequent sends use a nonce the sequencer will accept.
+                // the local tracker has diverged from the chain, so force an RPC resync.
+                //
+                // The sync target differs: Nitro / geth tx_pre_checker compares
+                // tx.nonce against stateNonce (the `latest` tag) when emitting
+                // "nonce too high", so sync from `latest` — syncing from `pending`
+                // can leave the tracker above state when a dangling mempool tx sits
+                // at the gap nonce. For "nonce too low" we want `pending` because
+                // the chain has moved ahead (mempool/just-mined txs count).
                 let err_str = e.to_string().to_lowercase();
-                if err_str.contains("nonce too low") || err_str.contains("nonce too high") {
+                if err_str.contains("nonce too high") {
+                    let _ = self.sync_nonce_latest().await;
+                } else if err_str.contains("nonce too low") {
                     let _ = self.sync_nonce().await;
                 }
             }
