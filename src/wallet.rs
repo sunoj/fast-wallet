@@ -850,10 +850,12 @@ impl FastWallet {
                 // Mark nonce as failed
                 self.nonce_manager.fail(tx.nonce());
 
-                // Check for specific errors
+                // Check for nonce drift: both "too low" (we replayed an already-mined
+                // nonce) and "too high" (local counter skipped ahead of chain) indicate
+                // the local tracker has diverged from the chain. Force an RPC resync in
+                // both cases so subsequent sends use a nonce the sequencer will accept.
                 let err_str = e.to_string().to_lowercase();
-                if err_str.contains("nonce too low") {
-                    // Need to resync nonce
+                if err_str.contains("nonce too low") || err_str.contains("nonce too high") {
                     let _ = self.sync_nonce().await;
                 }
             }
