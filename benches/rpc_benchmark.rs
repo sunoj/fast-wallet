@@ -234,7 +234,7 @@ fn bench_gas_coalescing(c: &mut Criterion) {
                         async move { w.get_gas_price().await }
                     })
                     .collect();
-                futures::future::join_all(futures).await
+                futures_util::future::join_all(futures).await
             }
         })
     });
@@ -255,7 +255,7 @@ fn bench_gas_coalescing(c: &mut Criterion) {
                         }
                     })
                     .collect();
-                futures::future::join_all(futures).await
+                futures_util::future::join_all(futures).await
             }
         })
     });

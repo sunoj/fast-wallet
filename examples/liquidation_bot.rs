@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 // Simulated liquidation contract
+#[allow(dead_code)]
 const LIQUIDATION_CONTRACT: Address = address!("1234567890123456789012345678901234567890");
 
 // Typical liquidation gas costs:
@@ -60,7 +61,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  - No simulation, no RPC calls in hot path");
     println!("  - Latency: ~47µs (sign) + network\n");
 
-    let calldata = encode_liquidation_call(
+    let _calldata = encode_liquidation_call(
         address!("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"),
         address!("1111111111111111111111111111111111111111"),
         U256::from(1_000_000_000_000_000_000u64), // 1 ETH worth

@@ -20,12 +20,12 @@ High-performance EVM wallet optimized for liquidation bots and MEV applications.
 
 ```toml
 [dependencies]
-fast-wallet = { git = "https://github.com/user/fast-wallet" }
+fast-wallet = { git = "https://github.com/sunoj/fast-wallet" }
 tokio = { version = "1.35", features = ["full"] }
 alloy = { version = "1.0", features = ["rlp"] }
 
 # For maximum performance (requires C compiler):
-# fast-wallet = { git = "https://github.com/user/fast-wallet", features = ["secp256k1-ffi"] }
+# fast-wallet = { git = "https://github.com/sunoj/fast-wallet", features = ["secp256k1-ffi"] }
 ```
 
 ### Signing Backend Comparison

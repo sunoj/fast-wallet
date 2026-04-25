@@ -1,9 +1,16 @@
 [package]
 name = "fast-wallet"
-version = "0.1.18"
+version = "0.1.19"
 edition = "2021"
-description = "High-performance EVM wallet optimized for liquidation bots"
-authors = ["Fast Wallet Team"]
+description = "High-performance EVM wallet optimized for liquidation bots and MEV"
+authors = ["Ming <ming@xinxiao.tech>"]
+license = "MIT"
+repository = "https://github.com/sunoj/fast-wallet"
+homepage = "https://github.com/sunoj/fast-wallet"
+documentation = "https://docs.rs/fast-wallet"
+readme = "README.md"
+keywords = ["evm", "wallet", "ethereum", "mev", "liquidation"]
+categories = ["cryptography::cryptocurrencies", "web-programming"]
 
 [lib]
 name = "fast_wallet"

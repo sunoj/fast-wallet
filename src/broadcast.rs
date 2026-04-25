@@ -592,9 +592,6 @@ impl TransactionBroadcaster {
 
                 match result {
                     (url, Ok(hash)) => {
-                        // Also send to public endpoints in background (don't wait)
-                        let _ = self.broadcast_to_subset(&public, raw_tx);
-
                         return BroadcastResult {
                             tx_hash: Some(hash),
                             success_count: 1,
