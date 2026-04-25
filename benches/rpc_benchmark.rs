@@ -13,9 +13,9 @@
 //! - Preheat performance
 //! - Gas coalescing effectiveness
 
+use alloy::primitives::{Address, U256};
 use criterion::{criterion_group, criterion_main, Criterion};
 use fast_wallet::{FastWalletBuilder, TransactionRequest};
-use alloy::primitives::{Address, U256};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::runtime::Runtime;
@@ -111,28 +111,22 @@ fn bench_gas_price(c: &mut Criterion) {
         // Warm up cache
         rt.block_on(wallet.get_gas_price()).unwrap();
 
-        b.to_async(&rt).iter(|| async {
-            wallet.get_gas_price().await.unwrap()
-        })
+        b.to_async(&rt)
+            .iter(|| async { wallet.get_gas_price().await.unwrap() })
     });
 
     // Priority fee
     group.bench_function("priority_fee_cached", |b| {
         rt.block_on(wallet.get_priority_fee()).ok();
 
-        b.to_async(&rt).iter(|| async {
-            wallet.get_priority_fee().await.ok()
-        })
+        b.to_async(&rt)
+            .iter(|| async { wallet.get_priority_fee().await.ok() })
     });
 
     // Both in parallel
     group.bench_function("gas_prices_parallel", |b| {
-        b.to_async(&rt).iter(|| async {
-            tokio::join!(
-                wallet.get_gas_price(),
-                wallet.get_priority_fee()
-            )
-        })
+        b.to_async(&rt)
+            .iter(|| async { tokio::join!(wallet.get_gas_price(), wallet.get_priority_fee()) })
     });
 
     group.finish();
@@ -377,7 +371,7 @@ fn bench_connection_warmup_impact(c: &mut Criterion) {
         b.to_async(&rt).iter(|| async {
             // Create a new HTTP client (no connection pooling reuse)
             let client = reqwest::Client::builder()
-                .pool_max_idle_per_host(0)  // Disable connection reuse
+                .pool_max_idle_per_host(0) // Disable connection reuse
                 .build()
                 .unwrap();
 
@@ -465,7 +459,7 @@ fn bench_liquidation_flow(c: &mut Criterion) {
                 // Simulate cold start: new wallet, no warmup
                 let wallet = FastWalletBuilder::new(ANVIL_PRIVATE_KEY, ANVIL_RPC_URL)
                     .chain_id(31337)
-                    .build_with_nonce(0)  // Skip nonce fetch for fair comparison
+                    .build_with_nonce(0) // Skip nonce fetch for fair comparison
                     .unwrap();
 
                 let start = std::time::Instant::now();
@@ -601,9 +595,8 @@ fn bench_nonce_sync(c: &mut Criterion) {
     group.sample_size(30);
 
     group.bench_function("sync_nonce", |b| {
-        b.to_async(&rt).iter(|| async {
-            wallet.sync_nonce().await.unwrap()
-        })
+        b.to_async(&rt)
+            .iter(|| async { wallet.sync_nonce().await.unwrap() })
     });
 
     group.finish();

@@ -210,11 +210,7 @@ impl FastWallet {
     /// Create a new wallet with a single RPC endpoint
     ///
     /// This will fetch the initial nonce from the chain.
-    pub async fn new(
-        private_key: &str,
-        rpc_url: &str,
-        config: WalletConfig,
-    ) -> WalletResult<Self> {
+    pub async fn new(private_key: &str, rpc_url: &str, config: WalletConfig) -> WalletResult<Self> {
         let signer = FastSigner::from_hex(private_key)?;
         let rpc_client = Arc::new(RpcClient::new(rpc_url)?);
 
@@ -348,7 +344,11 @@ impl FastWallet {
 
         info!("========== Wallet Self-Check ==========");
         info!("  Address:  {:?}", status.address);
-        info!("  Balance:  {:.6} ETH ({} wei)", status.balance_eth(), status.balance);
+        info!(
+            "  Balance:  {:.6} ETH ({} wei)",
+            status.balance_eth(),
+            status.balance
+        );
         info!("  Nonce:    {}", status.nonce);
         info!("  Chain ID: {}", status.chain_id);
         info!("=======================================");
@@ -416,10 +416,7 @@ impl FastWallet {
             loop {
                 ticker.tick().await;
                 // Refresh gas prices - ignore errors
-                let _ = tokio::join!(
-                    wallet.get_gas_price(),
-                    wallet.get_priority_fee()
-                );
+                let _ = tokio::join!(wallet.get_gas_price(), wallet.get_priority_fee());
             }
         }))
     }
@@ -464,7 +461,11 @@ impl FastWallet {
     /// Preheat multiple transactions at once
     ///
     /// Useful when you know you'll send N transactions and want to reserve nonces.
-    pub async fn preheat_batch(&self, count: usize, fetch_gas: bool) -> WalletResult<Vec<PreheatedContext>> {
+    pub async fn preheat_batch(
+        &self,
+        count: usize,
+        fetch_gas: bool,
+    ) -> WalletResult<Vec<PreheatedContext>> {
         let mut contexts = Vec::with_capacity(count);
 
         // Allocate all nonces first (lock-free, very fast)
@@ -543,10 +544,7 @@ impl FastWallet {
     /// Call this ~100-500ms before you expect to send a transaction.
     pub async fn preheat_full(&self) -> WalletResult<PreheatedContext> {
         // Warm connections and fetch gas in parallel
-        let (_, ctx) = tokio::join!(
-            self.warmup_connections(),
-            self.preheat(true)
-        );
+        let (_, ctx) = tokio::join!(self.warmup_connections(), self.preheat(true));
         ctx
     }
 
@@ -650,8 +648,10 @@ impl FastWallet {
 
     /// Force refresh gas prices
     pub async fn refresh_gas_prices(&self) -> WalletResult<(U256, Option<U256>)> {
-        let (gas_price, priority_fee) =
-            tokio::join!(self.rpc_client.gas_price(), self.rpc_client.max_priority_fee());
+        let (gas_price, priority_fee) = tokio::join!(
+            self.rpc_client.gas_price(),
+            self.rpc_client.max_priority_fee()
+        );
 
         let gas_price = gas_price?;
 
@@ -696,7 +696,11 @@ impl FastWallet {
     ///
     /// WARNING: Using this incorrectly can result in nonce conflicts.
     #[inline]
-    pub fn sign_with_nonce(&self, mut request: TransactionRequest, nonce: u64) -> WalletResult<Transaction> {
+    pub fn sign_with_nonce(
+        &self,
+        mut request: TransactionRequest,
+        nonce: u64,
+    ) -> WalletResult<Transaction> {
         request.nonce = nonce;
         request.chain_id = self.config.chain_id;
 
@@ -714,7 +718,10 @@ impl FastWallet {
     ///
     /// Returns transactions signed with the CURRENT nonce (without incrementing).
     #[inline]
-    pub fn sign_alternatives(&self, requests: Vec<TransactionRequest>) -> Vec<WalletResult<Transaction>> {
+    pub fn sign_alternatives(
+        &self,
+        requests: Vec<TransactionRequest>,
+    ) -> Vec<WalletResult<Transaction>> {
         let nonce = self.nonce_manager.peek();
         requests
             .into_iter()
@@ -887,7 +894,12 @@ impl FastWallet {
     /// Verify a broadcast TX is visible in the mempool/chain.
     /// Polls eth_getTransactionByHash for up to `max_wait`. If not found, re-broadcasts.
     /// Returns Ok(true) if verified in mempool, Ok(false) if re-broadcast was attempted.
-    pub async fn verify_broadcast(&self, tx: &Transaction, tx_hash: B256, max_wait: Duration) -> WalletResult<bool> {
+    pub async fn verify_broadcast(
+        &self,
+        tx: &Transaction,
+        tx_hash: B256,
+        max_wait: Duration,
+    ) -> WalletResult<bool> {
         let poll_interval = Duration::from_millis(500);
         let start = Instant::now();
 
@@ -1049,12 +1061,10 @@ impl FastWallet {
     /// - Uses default gas limit from config
     /// - No simulation, no RPC calls
     #[inline]
-    pub async fn send_quick_liquidation(
-        &self,
-        to: Address,
-        data: Bytes,
-    ) -> WalletResult<B256> {
-        let gas_price = self.gas_price_cache.read()
+    pub async fn send_quick_liquidation(&self, to: Address, data: Bytes) -> WalletResult<B256> {
+        let gas_price = self
+            .gas_price_cache
+            .read()
             .as_ref()
             .and_then(|(price, ts)| {
                 if ts.elapsed() < self.config.max_gas_cache_age {
@@ -1400,7 +1410,8 @@ impl FastWalletBuilder {
 
             Ok(wallet)
         } else {
-            let mut wallet = FastWallet::new(&self.private_key, &self.primary_rpc, self.config).await?;
+            let mut wallet =
+                FastWallet::new(&self.private_key, &self.primary_rpc, self.config).await?;
 
             if let Some(url) = gas_rpc_url {
                 wallet.gas_rpc_client = Some(Arc::new(RpcClient::new(&url)?));
@@ -1412,12 +1423,8 @@ impl FastWalletBuilder {
 
     /// Build with known nonce (synchronous - no RPC call)
     pub fn build_with_nonce(self, nonce: u64) -> WalletResult<FastWallet> {
-        let mut wallet = FastWallet::with_known_nonce(
-            &self.private_key,
-            &self.primary_rpc,
-            nonce,
-            self.config,
-        )?;
+        let mut wallet =
+            FastWallet::with_known_nonce(&self.private_key, &self.primary_rpc, nonce, self.config)?;
 
         if !self.broadcast_rpcs.is_empty() {
             let mut all_rpcs = vec![self.primary_rpc.clone()];

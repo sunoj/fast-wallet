@@ -160,7 +160,10 @@ impl RpcClient {
     /// Get the balance of an address
     pub async fn get_balance(&self, address: Address) -> WalletResult<U256> {
         let result: String = self
-            .request("eth_getBalance", json!([format!("{:?}", address), "latest"]))
+            .request(
+                "eth_getBalance",
+                json!([format!("{:?}", address), "latest"]),
+            )
             .await?;
 
         parse_u256_hex(&result)
@@ -273,7 +276,10 @@ impl RpcClient {
         }
 
         if let Some(data) = data {
-            params.insert("data".to_string(), json!(format!("0x{}", hex::encode(data))));
+            params.insert(
+                "data".to_string(),
+                json!(format!("0x{}", hex::encode(data))),
+            );
         }
 
         let result: String = self.request("eth_estimateGas", json!([params])).await?;

@@ -3,20 +3,19 @@
 //! These tests verify the complete flow from signing to encoding.
 //! Network tests are skipped by default (use --ignored to run them).
 
+use alloy::primitives::{Address, Bytes, B256, U256};
 use fast_wallet::{
     crypto::keccak256,
     nonce::{NonceManager, NonceTracker, SingleAddressNonceManager},
     signer::FastSigner,
     transaction::TransactionRequest,
     wallet::FastWalletBuilder,
-    BroadcasterBuilder, BroadcastStrategy, RpcEndpoint,
+    BroadcastStrategy, BroadcasterBuilder, RpcEndpoint,
 };
-use alloy::primitives::{Address, Bytes, B256, U256};
 use std::sync::Arc;
 use std::thread;
 
-const TEST_PRIVATE_KEY: &str =
-    "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+const TEST_PRIVATE_KEY: &str = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
 const TEST_ADDRESS: &str = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
 
 // ============ Signer Tests ============

@@ -171,7 +171,11 @@ impl FastSigner {
     }
 
     /// Sign with Ethereum signed message prefix
-    pub fn sign_message(&self, message: &[u8], chain_id: u64) -> WalletResult<RecoverableSignature> {
+    pub fn sign_message(
+        &self,
+        message: &[u8],
+        chain_id: u64,
+    ) -> WalletResult<RecoverableSignature> {
         let prefixed = format!("\x19Ethereum Signed Message:\n{}", message.len());
         let mut data = prefixed.into_bytes();
         data.extend_from_slice(message);
@@ -249,7 +253,10 @@ impl FastSigner {
 
         // EIP-155: v = recovery_id + 35 + chain_id * 2
         let rec_id = recovery_id.to_i32();
-        debug_assert!((0..=1).contains(&rec_id), "unexpected recovery_id: {rec_id}");
+        debug_assert!(
+            (0..=1).contains(&rec_id),
+            "unexpected recovery_id: {rec_id}"
+        );
         let v = rec_id as u64 + 35 + chain_id * 2;
 
         Ok(RecoverableSignature { r, s, v })
@@ -270,7 +277,10 @@ impl FastSigner {
         let r = B256::from_slice(&sig_bytes[..32]);
         let s = B256::from_slice(&sig_bytes[32..]);
         let rec_id = recovery_id.to_i32();
-        debug_assert!((0..=1).contains(&rec_id), "unexpected recovery_id: {rec_id}");
+        debug_assert!(
+            (0..=1).contains(&rec_id),
+            "unexpected recovery_id: {rec_id}"
+        );
         let v = rec_id as u64;
 
         Ok(RecoverableSignature { r, s, v })
@@ -284,7 +294,11 @@ impl FastSigner {
     }
 
     /// Sign with Ethereum signed message prefix
-    pub fn sign_message(&self, message: &[u8], chain_id: u64) -> WalletResult<RecoverableSignature> {
+    pub fn sign_message(
+        &self,
+        message: &[u8],
+        chain_id: u64,
+    ) -> WalletResult<RecoverableSignature> {
         let prefixed = format!("\x19Ethereum Signed Message:\n{}", message.len());
         let mut data = prefixed.into_bytes();
         data.extend_from_slice(message);
@@ -328,7 +342,8 @@ mod tests {
     use super::*;
 
     // Test private key (DO NOT USE IN PRODUCTION)
-    const TEST_PRIVATE_KEY: &str = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+    const TEST_PRIVATE_KEY: &str =
+        "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
     const TEST_ADDRESS: &str = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
 
     #[test]

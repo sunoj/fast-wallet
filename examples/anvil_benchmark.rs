@@ -12,12 +12,13 @@
 //! For mainnet fork testing:
 //! anvil --fork-url https://eth.llamarpc.com --block-time 1
 
-use fast_wallet::{FastWalletBuilder, TransactionRequest};
 use alloy::primitives::{Address, U256};
+use fast_wallet::{FastWalletBuilder, TransactionRequest};
 use std::time::{Duration, Instant};
 
 // Anvil default private keys (DO NOT USE IN PRODUCTION)
-const ANVIL_PRIVATE_KEY: &str = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+const ANVIL_PRIVATE_KEY: &str =
+    "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
 const ANVIL_RPC_URL: &str = "http://127.0.0.1:8545";
 
 #[tokio::main]
@@ -142,7 +143,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .to(Address::repeat_byte(1))
             .value(U256::from(1_000_000_000_000_000u64)) // 0.001 ETH
             .gas_limit(21000)
-            .max_fee_per_gas(U256::from(50_000_000_000u64))      // 50 gwei
+            .max_fee_per_gas(U256::from(50_000_000_000u64)) // 50 gwei
             .max_priority_fee_per_gas(U256::from(2_000_000_000u64)); // 2 gwei
 
         let _ = wallet.sign(request)?;

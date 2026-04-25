@@ -8,6 +8,7 @@
 //! - RLP encoding speed
 //! - Hash computation speed
 
+use alloy::primitives::{Address, Bytes, B256, U256};
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use fast_wallet::{
     crypto::keccak256,
@@ -16,10 +17,8 @@ use fast_wallet::{
     transaction::{Eip1559Transaction, LegacyTransaction, Transaction, TransactionRequest},
     wallet::FastWalletBuilder,
 };
-use alloy::primitives::{Address, Bytes, B256, U256};
 
-const TEST_PRIVATE_KEY: &str =
-    "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+const TEST_PRIVATE_KEY: &str = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
 
 /// Benchmark keccak256 hash computation
 fn bench_keccak256(c: &mut Criterion) {

@@ -1,3 +1,8 @@
+# Standalone workspace boundary so parent workspaces that include this
+# crate as a path dependency don't recurse into it for `cargo fmt --all`,
+# `cargo check --workspace`, etc.
+[workspace]
+
 [package]
 name = "fast-wallet"
 version = "0.1.19"

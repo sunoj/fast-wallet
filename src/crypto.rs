@@ -26,7 +26,10 @@ pub fn keccak256_into(data: &[u8], output: &mut [u8; 32]) {
 /// Compute Ethereum address from uncompressed public key (64 bytes, without 0x04 prefix)
 #[inline]
 pub fn public_key_to_address(pubkey: &[u8]) -> Address {
-    debug_assert!(pubkey.len() == 64, "Public key must be 64 bytes (uncompressed without prefix)");
+    debug_assert!(
+        pubkey.len() == 64,
+        "Public key must be 64 bytes (uncompressed without prefix)"
+    );
     let hash = keccak256(pubkey);
     Address::from_slice(&hash[12..])
 }

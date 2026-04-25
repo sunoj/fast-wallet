@@ -9,7 +9,7 @@
 use crate::error::{WalletError, WalletResult};
 use crate::transaction::Transaction;
 use alloy::primitives::B256;
-use futures_util::future::{select_all, join_all};
+use futures_util::future::{join_all, select_all};
 use futures_util::FutureExt;
 use reqwest::Client;
 use serde::Deserialize;
@@ -373,11 +373,7 @@ impl TransactionBroadcaster {
     }
 
     /// Send transaction to a single endpoint
-    async fn send_to_endpoint(
-        &self,
-        endpoint: &RpcEndpoint,
-        raw_tx: &str,
-    ) -> WalletResult<B256> {
+    async fn send_to_endpoint(&self, endpoint: &RpcEndpoint, raw_tx: &str) -> WalletResult<B256> {
         let request_body = json!({
             "jsonrpc": "2.0",
             "method": "eth_sendRawTransaction",
@@ -446,7 +442,10 @@ impl TransactionBroadcaster {
                 tx_hash: None,
                 success_count: 0,
                 failure_count: 0,
-                errors: vec![("none".to_string(), WalletError::RpcError("No endpoints configured".to_string()))],
+                errors: vec![(
+                    "none".to_string(),
+                    WalletError::RpcError("No endpoints configured".to_string()),
+                )],
                 first_success: None,
             };
         }
@@ -568,8 +567,7 @@ impl TransactionBroadcaster {
 
     /// Send to private relays first, then public endpoints
     async fn broadcast_private_first(&self, raw_tx: &str) -> BroadcastResult {
-        let (private, public): (Vec<_>, Vec<_>) =
-            self.endpoints.iter().partition(|e| e.is_private);
+        let (private, public): (Vec<_>, Vec<_>) = self.endpoints.iter().partition(|e| e.is_private);
 
         // Try private relays first (in parallel)
         if !private.is_empty() {
@@ -612,7 +610,11 @@ impl TransactionBroadcaster {
     }
 
     /// Broadcast to a subset of endpoints
-    async fn broadcast_to_subset(&self, endpoints: &[&RpcEndpoint], raw_tx: &str) -> BroadcastResult {
+    async fn broadcast_to_subset(
+        &self,
+        endpoints: &[&RpcEndpoint],
+        raw_tx: &str,
+    ) -> BroadcastResult {
         if endpoints.is_empty() {
             return BroadcastResult {
                 tx_hash: None,
@@ -738,7 +740,8 @@ impl BroadcasterBuilder {
 
     /// Add a Blink Labs RPC endpoint for a specific chain
     pub fn add_blink_chain(mut self, chain: &str, api_key: impl Into<String>) -> Self {
-        self.endpoints.push(RpcEndpoint::blink_chain(chain, api_key));
+        self.endpoints
+            .push(RpcEndpoint::blink_chain(chain, api_key));
         self
     }
 
