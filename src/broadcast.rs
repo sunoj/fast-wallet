@@ -15,8 +15,11 @@ use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::time::timeout;
+use tracing::{debug, info, warn};
+
+const SLOW_WARMUP_MS: u128 = 100;
 
 /// RPC endpoint configuration
 #[derive(Debug, Clone)]
@@ -329,7 +332,41 @@ impl TransactionBroadcaster {
         let futures: Vec<_> = self
             .endpoints
             .iter()
-            .map(|endpoint| self.warmup_endpoint(endpoint))
+            .enumerate()
+            .map(|(index, endpoint)| async move {
+                let start = Instant::now();
+                let result = self.warmup_endpoint(endpoint).await;
+                let elapsed_ms = start.elapsed().as_millis();
+                let endpoint_host = Self::endpoint_host(endpoint);
+                match &result {
+                    Ok(_) if elapsed_ms >= SLOW_WARMUP_MS => {
+                        info!(
+                            index,
+                            endpoint = %endpoint_host,
+                            elapsed_ms,
+                            "batch rpc warmup endpoint slow"
+                        );
+                    }
+                    Ok(_) => {
+                        debug!(
+                            index,
+                            endpoint = %endpoint_host,
+                            elapsed_ms,
+                            "batch rpc warmup endpoint ready"
+                        );
+                    }
+                    Err(error) => {
+                        warn!(
+                            index,
+                            endpoint = %endpoint_host,
+                            elapsed_ms,
+                            error_kind = Self::wallet_error_kind(error),
+                            "batch rpc warmup endpoint failed"
+                        );
+                    }
+                }
+                result
+            })
             .collect();
 
         let results = join_all(futures).await;
@@ -370,6 +407,24 @@ impl TransactionBroadcaster {
     /// Get next request ID
     fn next_id(&self) -> u64 {
         self.request_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn endpoint_host(endpoint: &RpcEndpoint) -> String {
+        reqwest::Url::parse(&endpoint.url)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_owned))
+            .unwrap_or_else(|| "invalid-url".to_string())
+    }
+
+    fn wallet_error_kind(error: &WalletError) -> &'static str {
+        match error {
+            WalletError::Timeout => "timeout",
+            WalletError::NetworkError(_) => "network",
+            WalletError::RpcError(_) => "rpc",
+            WalletError::HttpError(_) => "http",
+            WalletError::JsonError(_) => "json",
+            _ => "other",
+        }
     }
 
     /// Send transaction to a single endpoint
