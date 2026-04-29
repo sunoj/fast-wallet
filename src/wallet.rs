@@ -437,13 +437,28 @@ impl FastWallet {
     /// The allocated nonce will be "wasted" if you don't use it. Only call this
     /// when you're fairly confident a transaction will be sent.
     pub async fn preheat(&self, fetch_gas: bool) -> WalletResult<PreheatedContext> {
+        let total_start = Instant::now();
+        let nonce_start = Instant::now();
         let nonce = self.nonce_manager.get_nonce();
+        let nonce_ms = nonce_start.elapsed().as_millis();
         let mut ctx = PreheatedContext::new(nonce);
 
         if fetch_gas {
+            let gas_cached = self.read_gas_cache(&self.gas_price_cache).is_some();
+            let priority_cached = self.read_gas_cache(&self.priority_fee_cache).is_some();
+            let gas = async {
+                let start = Instant::now();
+                let result = self.get_gas_price().await;
+                (start.elapsed().as_millis(), result)
+            };
+            let priority = async {
+                let start = Instant::now();
+                let result = self.get_priority_fee().await;
+                (start.elapsed().as_millis(), result)
+            };
             // Fetch gas prices in parallel
-            let (gas_price, priority_fee) =
-                tokio::join!(self.get_gas_price(), self.get_priority_fee());
+            let ((gas_ms, gas_price), (priority_fee_ms, priority_fee)) =
+                tokio::join!(gas, priority);
 
             ctx.gas_price = gas_price.ok();
             ctx.priority_fee = priority_fee.ok();
@@ -453,6 +468,25 @@ impl FastWallet {
                 // max_fee = base_fee * 2 + priority_fee (common strategy)
                 ctx.max_fee = Some(base + base + priority);
             }
+            info!(
+                nonce,
+                nonce_ms,
+                gas_cached,
+                priority_cached,
+                gas_ms,
+                priority_fee_ms,
+                total_ms = total_start.elapsed().as_millis(),
+                gas_ready = ctx.gas_price.is_some(),
+                priority_fee_ready = ctx.priority_fee.is_some(),
+                "fast-wallet preheat gas ready"
+            );
+        } else {
+            info!(
+                nonce,
+                nonce_ms,
+                total_ms = total_start.elapsed().as_millis(),
+                "fast-wallet preheat nonce ready"
+            );
         }
 
         Ok(ctx)
@@ -521,16 +555,30 @@ impl FastWallet {
     /// Returns (primary_ok, batch_count) where batch_count is the number
     /// of successfully warmed batch endpoints.
     pub async fn warmup_connections(&self) -> (bool, usize) {
+        let total_start = Instant::now();
+
         // Warm up primary RPC
+        let primary_start = Instant::now();
         let primary_ok = self.rpc_client.warmup().await.is_ok();
+        let primary_ms = primary_start.elapsed().as_millis();
 
         // Warm up batch RPC endpoints
+        let batch_start = Instant::now();
         let batch_count = if let Some(batch_client) = &self.batch_client {
             batch_client.warmup().await
         } else {
             0
         };
+        let batch_ms = batch_start.elapsed().as_millis();
 
+        info!(
+            primary_ok,
+            primary_ms,
+            batch_count,
+            batch_ms,
+            total_ms = total_start.elapsed().as_millis(),
+            "fast-wallet connection warmup complete"
+        );
         (primary_ok, batch_count)
     }
 
@@ -543,9 +591,34 @@ impl FastWallet {
     ///
     /// Call this ~100-500ms before you expect to send a transaction.
     pub async fn preheat_full(&self) -> WalletResult<PreheatedContext> {
-        // Warm connections and fetch gas in parallel
-        let (_, ctx) = tokio::join!(self.warmup_connections(), self.preheat(true));
-        ctx
+        let total_start = Instant::now();
+        let warmup = async {
+            let start = Instant::now();
+            let result = self.warmup_connections().await;
+            (start.elapsed().as_millis(), result)
+        };
+        let context = async {
+            let start = Instant::now();
+            let result = self.preheat(true).await;
+            (start.elapsed().as_millis(), result)
+        };
+
+        // Warm connections and fetch gas in parallel.
+        let ((warmup_ms, (primary_ok, batch_count)), (context_ms, ctx)) =
+            tokio::join!(warmup, context);
+        let ctx = ctx?;
+        info!(
+            total_ms = total_start.elapsed().as_millis(),
+            warmup_ms,
+            context_ms,
+            primary_ok,
+            batch_count,
+            nonce = ctx.nonce,
+            gas_ready = ctx.gas_price.is_some(),
+            priority_fee_ready = ctx.priority_fee.is_some(),
+            "fast-wallet full preheat complete"
+        );
+        Ok(ctx)
     }
 
     // ==================== Nonce Management ====================
