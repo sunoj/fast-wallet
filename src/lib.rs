@@ -52,6 +52,7 @@ pub mod wallet;
 pub use broadcast::{BroadcastStrategy, BroadcasterBuilder, RpcEndpoint, TransactionBroadcaster};
 pub use error::{WalletError, WalletResult};
 pub use nonce::NonceManager;
+pub use rpc::SendResult;
 pub use signer::FastSigner;
 pub use transaction::{Transaction, TransactionRequest, TypedTransaction};
 pub use wallet::{FastWallet, FastWalletBuilder, PreheatedContext, WalletConfig, WalletStatus};

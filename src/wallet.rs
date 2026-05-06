@@ -9,7 +9,7 @@
 
 use crate::error::{WalletError, WalletResult};
 use crate::nonce::SingleAddressNonceManager;
-use crate::rpc::{BatchRpcClient, RpcClient};
+use crate::rpc::{BatchRpcClient, RpcClient, SendResult};
 use crate::signer::FastSigner;
 use crate::transaction::{Transaction, TransactionRequest};
 use alloy::primitives::{Address, Bytes, B256, U256};
@@ -964,6 +964,48 @@ impl FastWallet {
         result
     }
 
+    /// Send a pre-signed transaction and return broadcast timing details.
+    pub async fn send_signed_detailed(
+        &self,
+        tx: &Transaction,
+        sign_ms: f64,
+    ) -> WalletResult<SendResult> {
+        let _permit = tokio::time::timeout(
+            self.config.pending_acquire_timeout,
+            self.pending_semaphore.acquire(),
+        )
+        .await
+        .map_err(|_| WalletError::Timeout)?
+        .map_err(|_| WalletError::RpcError("Semaphore closed".to_string()))?;
+
+        let hex_tx = tx.to_hex();
+
+        let result = if let Some(batch_client) = &self.batch_client {
+            batch_client.broadcast_transaction_detailed(&hex_tx).await
+        } else {
+            self.rpc_client.send_raw_transaction_detailed(&hex_tx).await
+        };
+
+        match &result {
+            Ok(_) => {}
+            Err(e) => {
+                self.nonce_manager.fail(tx.nonce());
+
+                let err_str = e.to_string().to_lowercase();
+                if err_str.contains("nonce too high") {
+                    let _ = self.sync_nonce_latest().await;
+                } else if err_str.contains("nonce too low") {
+                    let _ = self.sync_nonce().await;
+                }
+            }
+        }
+
+        result.map(|mut send_result| {
+            send_result.sign_ms = sign_ms;
+            send_result
+        })
+    }
+
     /// Verify a broadcast TX is visible in the mempool/chain.
     /// Polls eth_getTransactionByHash for up to `max_wait`. If not found, re-broadcasts.
     /// Returns Ok(true) if verified in mempool, Ok(false) if re-broadcast was attempted.
@@ -1030,6 +1072,18 @@ impl FastWallet {
     ) -> WalletResult<B256> {
         let tx = self.sign_with_preheat(ctx, request)?;
         self.send_signed(&tx).await
+    }
+
+    /// Sign and send using preheated context with timing details.
+    pub async fn send_with_preheat_detailed(
+        &self,
+        ctx: &PreheatedContext,
+        request: TransactionRequest,
+    ) -> WalletResult<SendResult> {
+        let sign_start = Instant::now();
+        let tx = self.sign_with_preheat(ctx, request)?;
+        let sign_ms = sign_start.elapsed().as_secs_f64() * 1000.0;
+        self.send_signed_detailed(&tx, sign_ms).await
     }
 
     // ========================================================================
