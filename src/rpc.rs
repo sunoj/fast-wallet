@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// JSON-RPC request
 #[derive(Debug, Serialize)]
@@ -77,6 +77,11 @@ impl RpcClient {
             url: url.into(),
             request_id: AtomicU64::new(1),
         }
+    }
+
+    /// RPC endpoint URL.
+    pub fn url(&self) -> &str {
+        &self.url
     }
 
     /// Warm up the HTTP connection pool by sending a lightweight request
@@ -202,6 +207,22 @@ impl RpcClient {
             .await?;
 
         parse_b256_hex(&result)
+    }
+
+    /// Send a raw transaction and return endpoint timing.
+    pub async fn send_raw_transaction_detailed(&self, raw_tx: &str) -> WalletResult<SendResult> {
+        let started = Instant::now();
+        let tx_hash = self.send_raw_transaction(raw_tx).await?;
+        let endpoint_ms = started.elapsed().as_millis() as u64;
+        Ok(SendResult {
+            tx_hash: format!("{tx_hash:?}"),
+            sign_ms: 0.0,
+            fastest_endpoint_ms: endpoint_ms,
+            fastest_endpoint_url: self.url.clone(),
+            slowest_endpoint_ms: endpoint_ms,
+            failed_endpoints: 0,
+            per_endpoint_ms: vec![(self.url.clone(), Ok(endpoint_ms))],
+        })
     }
 
     /// Send raw transaction bytes (convenience method)
@@ -360,6 +381,18 @@ pub struct BatchRpcClient {
     current: AtomicU64,
 }
 
+/// Result of a transaction broadcast with signing and endpoint timing.
+#[derive(Debug, Clone)]
+pub struct SendResult {
+    pub tx_hash: String,
+    pub sign_ms: f64,
+    pub fastest_endpoint_ms: u64,
+    pub fastest_endpoint_url: String,
+    pub slowest_endpoint_ms: u64,
+    pub failed_endpoints: usize,
+    pub per_endpoint_ms: Vec<(String, Result<u64, String>)>,
+}
+
 impl BatchRpcClient {
     /// Create a new batch client with multiple RPC endpoints
     pub fn new(urls: Vec<String>) -> WalletResult<Self> {
@@ -410,6 +443,66 @@ impl BatchRpcClient {
                     return Ok(hash);
                 }
                 Err(e) => {
+                    last_err = Some(e);
+                    pending = remaining;
+                }
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| WalletError::RpcError("No RPC endpoints".to_string())))
+    }
+
+    /// Send transaction to all endpoints in parallel with first-success timing.
+    pub async fn broadcast_transaction_detailed(&self, raw_tx: &str) -> WalletResult<SendResult> {
+        if self.clients.is_empty() {
+            return Err(WalletError::RpcError("No RPC endpoints".to_string()));
+        }
+
+        let mut pending: Vec<_> = self
+            .clients
+            .iter()
+            .map(|client| {
+                let client = client.clone();
+                let url = client.url().to_string();
+                let tx = raw_tx.to_string();
+                async move {
+                    let started = Instant::now();
+                    let result = client.send_raw_transaction(&tx).await;
+                    (url, result, started.elapsed().as_millis() as u64)
+                }
+                .boxed()
+            })
+            .collect();
+
+        let mut last_err = None;
+        let mut per_endpoint_ms = Vec::new();
+        let mut failed_endpoints = 0usize;
+        let mut slowest_endpoint_ms = 0u64;
+
+        while !pending.is_empty() {
+            let ((url, result, endpoint_ms), _index, remaining) = select_all(pending).await;
+            slowest_endpoint_ms = slowest_endpoint_ms.max(endpoint_ms);
+            match result {
+                Ok(hash) => {
+                    per_endpoint_ms.push((url.clone(), Ok(endpoint_ms)));
+                    if !remaining.is_empty() {
+                        tokio::spawn(async move {
+                            join_all(remaining).await;
+                        });
+                    }
+                    return Ok(SendResult {
+                        tx_hash: format!("{hash:?}"),
+                        sign_ms: 0.0,
+                        fastest_endpoint_ms: endpoint_ms,
+                        fastest_endpoint_url: url,
+                        slowest_endpoint_ms,
+                        failed_endpoints,
+                        per_endpoint_ms,
+                    });
+                }
+                Err(e) => {
+                    failed_endpoints += 1;
+                    per_endpoint_ms.push((url, Err(e.to_string())));
                     last_err = Some(e);
                     pending = remaining;
                 }
