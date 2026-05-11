@@ -57,9 +57,13 @@ impl RpcClient {
     pub fn new(url: impl Into<String>) -> WalletResult<Self> {
         let client = Client::builder()
             .pool_max_idle_per_host(10)
-            .pool_idle_timeout(Duration::from_secs(30))
+            .pool_idle_timeout(Duration::from_secs(300))
             .timeout(Duration::from_secs(30))
             .tcp_nodelay(true)
+            .tcp_keepalive(Duration::from_secs(15))
+            .http2_keep_alive_interval(Duration::from_secs(10))
+            .http2_keep_alive_timeout(Duration::from_secs(20))
+            .http2_keep_alive_while_idle(true)
             .build()
             .map_err(|e| WalletError::NetworkError(e.to_string()))?;
 
