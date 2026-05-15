@@ -463,10 +463,22 @@ impl TransactionBroadcaster {
             return Err(WalletError::RpcError(format_rpc_error(&error)));
         }
 
-        rpc_response
-            .result
-            .ok_or_else(|| WalletError::RpcError("Empty response".to_string()))
-            .and_then(|s| parse_b256_hex(&s))
+        match rpc_response.result {
+            Some(s) => parse_b256_hex(&s),
+            None => {
+                // RPC accepted the TX but returned null result — compute hash locally
+                let hex_str = raw_tx.strip_prefix("0x").unwrap_or(raw_tx);
+                let tx_bytes = hex::decode(hex_str)
+                    .map_err(|e| WalletError::RpcError(format!("Failed to decode raw tx: {e}")))?;
+                let hash = alloy::primitives::keccak256(&tx_bytes);
+                tracing::warn!(
+                    tx_hash = %hash,
+                    endpoint = %endpoint.url,
+                    "RPC returned null result for eth_sendRawTransaction — TX likely accepted"
+                );
+                Ok(hash)
+            }
+        }
     }
 
     /// Broadcast transaction using configured strategy

@@ -213,13 +213,26 @@ impl RpcClient {
 
     /// Send a raw transaction
     ///
-    /// Returns the transaction hash
+    /// Returns the transaction hash.
+    /// Some RPC nodes return `null` result (no error) for accepted transactions.
+    /// In that case we compute the tx hash from the raw transaction bytes.
     pub async fn send_raw_transaction(&self, raw_tx: &str) -> WalletResult<B256> {
-        let result: String = self
-            .request("eth_sendRawTransaction", json!([raw_tx]))
-            .await?;
-
-        parse_b256_hex(&result)
+        match self.request::<String>("eth_sendRawTransaction", json!([raw_tx])).await {
+            Ok(result) => parse_b256_hex(&result),
+            Err(WalletError::RpcError(msg)) if msg == "Empty response" => {
+                // RPC accepted the TX but returned null result — compute hash locally
+                let hex_str = raw_tx.strip_prefix("0x").unwrap_or(raw_tx);
+                let tx_bytes = hex::decode(hex_str)
+                    .map_err(|e| WalletError::RpcError(format!("Failed to decode raw tx: {e}")))?;
+                let hash = alloy::primitives::keccak256(&tx_bytes);
+                tracing::warn!(
+                    tx_hash = %hash,
+                    "RPC returned null result for eth_sendRawTransaction — TX likely accepted"
+                );
+                Ok(hash)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Send a raw transaction and return endpoint timing.
@@ -258,14 +271,22 @@ impl RpcClient {
 
     /// Get transaction receipt
     pub async fn get_transaction_receipt(&self, tx_hash: B256) -> WalletResult<Option<Value>> {
-        let result: Option<Value> = self
+        // Note: request::<Option<Value>>() treats JSON `null` result as "Empty
+        // response" error because serde deserializes `null` as `None` for the
+        // outer `Option` in `RpcResponse.result: Option<Option<Value>>`.
+        // For eth_getTransactionReceipt, `null` is the normal response when the
+        // TX is pending (not yet mined), so we must map it back to Ok(None).
+        match self
             .request(
                 "eth_getTransactionReceipt",
                 json!([format!("{:?}", tx_hash)]),
             )
-            .await?;
-
-        Ok(result)
+            .await
+        {
+            Ok(receipt) => Ok(Some(receipt)),
+            Err(WalletError::RpcError(ref msg)) if msg == "Empty response" => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     /// Wait for transaction receipt with timeout

@@ -1469,6 +1469,12 @@ impl FastWalletBuilder {
         self
     }
 
+    /// Set receipt polling interval
+    pub fn poll_interval(mut self, interval: Duration) -> Self {
+        self.config.poll_interval = interval;
+        self
+    }
+
     /// Set gas cache duration
     pub fn gas_cache_duration(mut self, duration: Duration) -> Self {
         self.config.gas_cache_duration = duration;
