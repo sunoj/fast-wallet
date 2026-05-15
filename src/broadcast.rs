@@ -13,7 +13,7 @@ use futures_util::future::{join_all, select_all};
 use futures_util::FutureExt;
 use reqwest::Client;
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{json, Value};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::time::timeout;
@@ -460,10 +460,7 @@ impl TransactionBroadcaster {
             .map_err(|e| WalletError::RpcError(e.to_string()))?;
 
         if let Some(error) = rpc_response.error {
-            return Err(WalletError::RpcError(format!(
-                "{}: {}",
-                error.code, error.message
-            )));
+            return Err(WalletError::RpcError(format_rpc_error(&error)));
         }
 
         rpc_response
@@ -741,6 +738,19 @@ struct RpcResponse {
 struct RpcError {
     code: i64,
     message: String,
+    data: Option<Value>,
+}
+
+fn format_rpc_error(error: &RpcError) -> String {
+    let mut msg = format!("{}: {}", error.code, error.message);
+    if let Some(data) = &error.data {
+        let data_str = data
+            .as_str()
+            .map(String::from)
+            .unwrap_or_else(|| data.to_string());
+        msg.push_str(&format!(" data={data_str}"));
+    }
+    msg
 }
 
 fn parse_b256_hex(s: &str) -> WalletResult<B256> {

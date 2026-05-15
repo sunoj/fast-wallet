@@ -41,8 +41,20 @@ struct RpcResponse<T> {
 struct RpcError {
     code: i64,
     message: String,
-    #[allow(dead_code)]
     data: Option<Value>,
+}
+
+/// Extracted for unit-testing the data-preservation behavior.
+fn format_rpc_error(error: &RpcError) -> String {
+    let mut msg = format!("RPC error {}: {}", error.code, error.message);
+    if let Some(data) = &error.data {
+        let data_str = data
+            .as_str()
+            .map(String::from)
+            .unwrap_or_else(|| data.to_string());
+        msg.push_str(&format!(" data={data_str}"));
+    }
+    msg
 }
 
 /// High-performance RPC client
@@ -131,10 +143,7 @@ impl RpcClient {
             .map_err(|e| WalletError::RpcError(e.to_string()))?;
 
         if let Some(error) = rpc_response.error {
-            return Err(WalletError::RpcError(format!(
-                "RPC error {}: {}",
-                error.code, error.message
-            )));
+            return Err(WalletError::RpcError(format_rpc_error(&error)));
         }
 
         rpc_response
@@ -562,5 +571,24 @@ mod tests {
     fn test_rpc_client_creation() {
         let client = RpcClient::new("http://localhost:8545").unwrap();
         assert_eq!(client.url, "http://localhost:8545");
+    }
+
+    #[test]
+    fn test_rpc_error_preserves_data_selector() {
+        let rpc_response: RpcResponse<String> = serde_json::from_value(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "error": {
+                "code": 3,
+                "message": "execution reverted",
+                "data": "0xddeb79ba"
+            }
+        }))
+        .unwrap();
+
+        let error = rpc_response.error.as_ref().unwrap();
+        let msg = format_rpc_error(error);
+
+        assert!(msg.contains("data=0xddeb79ba"));
     }
 }
