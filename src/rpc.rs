@@ -573,9 +573,14 @@ mod tests {
         assert_eq!(client.url, "http://localhost:8545");
     }
 
+    fn rpc_error_from_value(v: serde_json::Value) -> RpcError {
+        let resp: RpcResponse<String> = serde_json::from_value(v).unwrap();
+        resp.error.unwrap()
+    }
+
     #[test]
     fn test_rpc_error_preserves_data_selector() {
-        let rpc_response: RpcResponse<String> = serde_json::from_value(serde_json::json!({
+        let error = rpc_error_from_value(serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,
             "error": {
@@ -583,12 +588,47 @@ mod tests {
                 "message": "execution reverted",
                 "data": "0xddeb79ba"
             }
-        }))
-        .unwrap();
+        }));
+        let msg = format_rpc_error(&error);
+        assert!(msg.contains("data=0xddeb79ba"), "got: {msg}");
+    }
 
-        let error = rpc_response.error.as_ref().unwrap();
-        let msg = format_rpc_error(error);
+    #[test]
+    fn test_rpc_error_omits_data_tail_when_missing() {
+        let error = rpc_error_from_value(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "error": { "code": 3, "message": "execution reverted" }
+        }));
+        let msg = format_rpc_error(&error);
+        assert_eq!(msg, "RPC error 3: execution reverted");
+        assert!(!msg.contains("data="), "got: {msg}");
+    }
 
-        assert!(msg.contains("data=0xddeb79ba"));
+    #[test]
+    fn test_rpc_error_omits_data_tail_when_null() {
+        let error = rpc_error_from_value(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "error": { "code": 3, "message": "execution reverted", "data": null }
+        }));
+        let msg = format_rpc_error(&error);
+        assert_eq!(msg, "RPC error 3: execution reverted");
+    }
+
+    #[test]
+    fn test_rpc_error_preserves_object_data() {
+        let error = rpc_error_from_value(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "error": {
+                "code": -32000,
+                "message": "execution reverted",
+                "data": { "reason": "NotLiquidatable", "selector": "0xddeb79ba" }
+            }
+        }));
+        let msg = format_rpc_error(&error);
+        assert!(msg.contains("data="), "got: {msg}");
+        assert!(msg.contains("\"selector\":\"0xddeb79ba\""), "got: {msg}");
     }
 }

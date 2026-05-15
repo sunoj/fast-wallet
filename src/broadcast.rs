@@ -932,6 +932,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_broadcast_format_rpc_error_preserves_data() {
+        let error = RpcError {
+            code: 3,
+            message: "execution reverted".into(),
+            data: Some(serde_json::Value::String("0xddeb79ba".into())),
+        };
+        let msg = format_rpc_error(&error);
+        assert!(msg.contains("data=0xddeb79ba"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_broadcast_format_rpc_error_omits_tail_when_missing() {
+        let error = RpcError {
+            code: 3,
+            message: "execution reverted".into(),
+            data: None,
+        };
+        let msg = format_rpc_error(&error);
+        assert_eq!(msg, "3: execution reverted");
+        assert!(!msg.contains("data="), "got: {msg}");
+    }
+
+    #[test]
     fn test_rpc_endpoint_creation() {
         let public = RpcEndpoint::public("https://eth.example.com");
         assert!(!public.is_private);
