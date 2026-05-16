@@ -217,7 +217,10 @@ impl RpcClient {
     /// Some RPC nodes return `null` result (no error) for accepted transactions.
     /// In that case we compute the tx hash from the raw transaction bytes.
     pub async fn send_raw_transaction(&self, raw_tx: &str) -> WalletResult<B256> {
-        match self.request::<String>("eth_sendRawTransaction", json!([raw_tx])).await {
+        match self
+            .request::<String>("eth_sendRawTransaction", json!([raw_tx]))
+            .await
+        {
             Ok(result) => parse_b256_hex(&result),
             Err(WalletError::RpcError(msg)) if msg == "Empty response" => {
                 // RPC accepted the TX but returned null result — compute hash locally
