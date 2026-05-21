@@ -347,13 +347,30 @@ impl RpcClient {
         }
     }
 
-    /// Estimate gas for a transaction
+    /// Estimate gas for a transaction (uses the RPC's default block — usually `latest`).
     pub async fn estimate_gas(
         &self,
         from: Address,
         to: Option<Address>,
         value: Option<U256>,
         data: Option<&[u8]>,
+    ) -> WalletResult<u64> {
+        self.estimate_gas_at_block(from, to, value, data, None)
+            .await
+    }
+
+    /// Estimate gas against a specific block tag.
+    ///
+    /// On Base flashblock-enabled RPCs, passing `Some("pending")` returns gas
+    /// for the latest flashblock state, which captures intra-block oracle
+    /// updates that `latest` would miss.
+    pub async fn estimate_gas_at_block(
+        &self,
+        from: Address,
+        to: Option<Address>,
+        value: Option<U256>,
+        data: Option<&[u8]>,
+        block_tag: Option<&str>,
     ) -> WalletResult<u64> {
         let mut params = serde_json::Map::new();
         params.insert("from".to_string(), json!(format!("{:?}", from)));
@@ -373,7 +390,11 @@ impl RpcClient {
             );
         }
 
-        let result: String = self.request("eth_estimateGas", json!([params])).await?;
+        let rpc_params = match block_tag {
+            Some(tag) => json!([params, tag]),
+            None => json!([params]),
+        };
+        let result: String = self.request("eth_estimateGas", rpc_params).await?;
         parse_u64_hex(&result)
     }
 
