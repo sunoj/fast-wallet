@@ -280,7 +280,7 @@ impl RpcClient {
             fastest_endpoint_ms: endpoint_ms,
             fastest_endpoint_url: self.url.clone(),
             slowest_endpoint_ms: endpoint_ms,
-            first_success_endpoint: 0,
+            first_success_endpoint_index: 0,
             failed_endpoints: 0,
             connection_reused,
             per_endpoint_ms: vec![(self.url.clone(), Ok(endpoint_ms))],
@@ -461,7 +461,7 @@ pub struct SendResult {
     pub fastest_endpoint_ms: u64,
     pub fastest_endpoint_url: String,
     pub slowest_endpoint_ms: u64,
-    pub first_success_endpoint: usize,
+    pub first_success_endpoint_index: usize,
     pub failed_endpoints: usize,
     pub connection_reused: bool,
     pub per_endpoint_ms: Vec<(String, Result<u64, String>)>,
@@ -580,7 +580,7 @@ impl BatchRpcClient {
                         fastest_endpoint_ms: endpoint_ms,
                         fastest_endpoint_url: url,
                         slowest_endpoint_ms,
-                        first_success_endpoint: endpoint_index,
+                        first_success_endpoint_index: endpoint_index,
                         failed_endpoints,
                         connection_reused,
                         per_endpoint_ms,
@@ -745,7 +745,7 @@ mod tests {
             .await
             .expect("broadcast should succeed");
 
-        assert_eq!(result.first_success_endpoint, 1);
+        assert_eq!(result.first_success_endpoint_index, 1);
         assert_eq!(result.fastest_endpoint_url, fast);
         assert_eq!(
             result.tx_hash,
