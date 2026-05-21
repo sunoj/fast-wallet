@@ -12,7 +12,7 @@ use futures_util::FutureExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -62,6 +62,7 @@ pub struct RpcClient {
     client: Client,
     url: String,
     request_id: AtomicU64,
+    request_seen: AtomicBool,
 }
 
 impl RpcClient {
@@ -83,6 +84,7 @@ impl RpcClient {
             client,
             url: url.into(),
             request_id: AtomicU64::new(1),
+            request_seen: AtomicBool::new(false),
         })
     }
 
@@ -92,6 +94,7 @@ impl RpcClient {
             client,
             url: url.into(),
             request_id: AtomicU64::new(1),
+            request_seen: AtomicBool::new(false),
         }
     }
 
@@ -116,12 +119,23 @@ impl RpcClient {
         self.request_id.fetch_add(1, Ordering::Relaxed)
     }
 
+    #[inline]
+    fn mark_request_started(&self) {
+        self.request_seen.store(true, Ordering::Relaxed);
+    }
+
+    #[inline]
+    fn connection_reuse_hint(&self) -> bool {
+        self.request_seen.swap(true, Ordering::Relaxed)
+    }
+
     /// Execute a raw JSON-RPC request
     async fn request<T: for<'de> Deserialize<'de>>(
         &self,
         method: &str,
         params: Value,
     ) -> WalletResult<T> {
+        self.mark_request_started();
         let req = RpcRequest {
             jsonrpc: "2.0",
             method,
@@ -217,11 +231,25 @@ impl RpcClient {
     /// Some RPC nodes return `null` result (no error) for accepted transactions.
     /// In that case we compute the tx hash from the raw transaction bytes.
     pub async fn send_raw_transaction(&self, raw_tx: &str) -> WalletResult<B256> {
+        self.send_raw_transaction_with_connection_hint(raw_tx)
+            .await
+            .map(|(hash, _)| hash)
+    }
+
+    async fn send_raw_transaction_with_connection_hint(
+        &self,
+        raw_tx: &str,
+    ) -> WalletResult<(B256, bool)> {
+        // reqwest/hyper does not expose the exact connection-reused bit. This
+        // is a passive pool hint: any prior request on this RpcClient means a
+        // pooled connection was available for reuse, though hyper may still open
+        // a fresh connection if the pool entry was closed.
+        let connection_reused = self.connection_reuse_hint();
         match self
             .request::<String>("eth_sendRawTransaction", json!([raw_tx]))
             .await
         {
-            Ok(result) => parse_b256_hex(&result),
+            Ok(result) => parse_b256_hex(&result).map(|hash| (hash, connection_reused)),
             Err(WalletError::RpcError(msg)) if msg == "Empty response" => {
                 // RPC accepted the TX but returned null result — compute hash locally
                 let hex_str = raw_tx.strip_prefix("0x").unwrap_or(raw_tx);
@@ -232,7 +260,7 @@ impl RpcClient {
                     tx_hash = %hash,
                     "RPC returned null result for eth_sendRawTransaction — TX likely accepted"
                 );
-                Ok(hash)
+                Ok((hash, connection_reused))
             }
             Err(e) => Err(e),
         }
@@ -241,15 +269,20 @@ impl RpcClient {
     /// Send a raw transaction and return endpoint timing.
     pub async fn send_raw_transaction_detailed(&self, raw_tx: &str) -> WalletResult<SendResult> {
         let started = Instant::now();
-        let tx_hash = self.send_raw_transaction(raw_tx).await?;
+        let (tx_hash, connection_reused) =
+            self.send_raw_transaction_with_connection_hint(raw_tx).await?;
         let endpoint_ms = started.elapsed().as_millis() as u64;
         Ok(SendResult {
             tx_hash: format!("{tx_hash:?}"),
             sign_ms: 0.0,
+            semaphore_wait_ms: 0,
+            broadcast_fanout_ms: endpoint_ms,
             fastest_endpoint_ms: endpoint_ms,
             fastest_endpoint_url: self.url.clone(),
             slowest_endpoint_ms: endpoint_ms,
+            first_success_endpoint_index: 0,
             failed_endpoints: 0,
+            connection_reused,
             per_endpoint_ms: vec![(self.url.clone(), Ok(endpoint_ms))],
         })
     }
@@ -444,10 +477,14 @@ pub struct BatchRpcClient {
 pub struct SendResult {
     pub tx_hash: String,
     pub sign_ms: f64,
+    pub semaphore_wait_ms: u64,
+    pub broadcast_fanout_ms: u64,
     pub fastest_endpoint_ms: u64,
     pub fastest_endpoint_url: String,
     pub slowest_endpoint_ms: u64,
+    pub first_success_endpoint_index: usize,
     pub failed_endpoints: usize,
+    pub connection_reused: bool,
     pub per_endpoint_ms: Vec<(String, Result<u64, String>)>,
 }
 
@@ -516,17 +553,24 @@ impl BatchRpcClient {
             return Err(WalletError::RpcError("No RPC endpoints".to_string()));
         }
 
+        let fanout_started = Instant::now();
         let mut pending: Vec<_> = self
             .clients
             .iter()
-            .map(|client| {
+            .enumerate()
+            .map(|(endpoint_index, client)| {
                 let client = client.clone();
                 let url = client.url().to_string();
                 let tx = raw_tx.to_string();
                 async move {
                     let started = Instant::now();
-                    let result = client.send_raw_transaction(&tx).await;
-                    (url, result, started.elapsed().as_millis() as u64)
+                    let result = client.send_raw_transaction_with_connection_hint(&tx).await;
+                    (
+                        endpoint_index,
+                        url,
+                        result,
+                        started.elapsed().as_millis() as u64,
+                    )
                 }
                 .boxed()
             })
@@ -538,10 +582,11 @@ impl BatchRpcClient {
         let mut slowest_endpoint_ms = 0u64;
 
         while !pending.is_empty() {
-            let ((url, result, endpoint_ms), _index, remaining) = select_all(pending).await;
+            let ((endpoint_index, url, result, endpoint_ms), _select_index, remaining) =
+                select_all(pending).await;
             slowest_endpoint_ms = slowest_endpoint_ms.max(endpoint_ms);
             match result {
-                Ok(hash) => {
+                Ok((hash, connection_reused)) => {
                     per_endpoint_ms.push((url.clone(), Ok(endpoint_ms)));
                     if !remaining.is_empty() {
                         tokio::spawn(async move {
@@ -551,10 +596,14 @@ impl BatchRpcClient {
                     return Ok(SendResult {
                         tx_hash: format!("{hash:?}"),
                         sign_ms: 0.0,
+                        semaphore_wait_ms: 0,
+                        broadcast_fanout_ms: fanout_started.elapsed().as_millis() as u64,
                         fastest_endpoint_ms: endpoint_ms,
                         fastest_endpoint_url: url,
                         slowest_endpoint_ms,
+                        first_success_endpoint_index: endpoint_index,
                         failed_endpoints,
+                        connection_reused,
                         per_endpoint_ms,
                     });
                 }
@@ -589,6 +638,8 @@ impl BatchRpcClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     #[test]
     fn test_parse_u64_hex() {
@@ -675,5 +726,51 @@ mod tests {
         let msg = format_rpc_error(&error);
         assert!(msg.contains("data="), "got: {msg}");
         assert!(msg.contains("\"selector\":\"0xddeb79ba\""), "got: {msg}");
+    }
+
+    async fn tx_rpc_server(delay_ms: u64, hash: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 2048];
+            let _ = stream.read(&mut buf).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            let body = format!(r#"{{"jsonrpc":"2.0","id":1,"result":"{hash}"}}"#);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn broadcast_transaction_detailed_returns_winning_endpoint_index() {
+        let slow = tx_rpc_server(
+            80,
+            "0x1111111111111111111111111111111111111111111111111111111111111111",
+        )
+        .await;
+        let fast = tx_rpc_server(
+            5,
+            "0x2222222222222222222222222222222222222222222222222222222222222222",
+        )
+        .await;
+        let client = BatchRpcClient::new(vec![slow, fast.clone()]).unwrap();
+
+        let result = client
+            .broadcast_transaction_detailed("0x01")
+            .await
+            .expect("broadcast should succeed");
+
+        assert_eq!(result.first_success_endpoint_index, 1);
+        assert_eq!(result.fastest_endpoint_url, fast);
+        assert_eq!(
+            result.tx_hash,
+            "0x2222222222222222222222222222222222222222222222222222222222222222"
+        );
     }
 }

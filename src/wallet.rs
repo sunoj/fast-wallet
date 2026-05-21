@@ -970,6 +970,7 @@ impl FastWallet {
         tx: &Transaction,
         sign_ms: f64,
     ) -> WalletResult<SendResult> {
+        let semaphore_started = Instant::now();
         let _permit = tokio::time::timeout(
             self.config.pending_acquire_timeout,
             self.pending_semaphore.acquire(),
@@ -977,6 +978,7 @@ impl FastWallet {
         .await
         .map_err(|_| WalletError::Timeout)?
         .map_err(|_| WalletError::RpcError("Semaphore closed".to_string()))?;
+        let semaphore_wait_ms = semaphore_started.elapsed().as_millis() as u64;
 
         let hex_tx = tx.to_hex();
 
@@ -1002,6 +1004,7 @@ impl FastWallet {
 
         result.map(|mut send_result| {
             send_result.sign_ms = sign_ms;
+            send_result.semaphore_wait_ms = semaphore_wait_ms;
             send_result
         })
     }
