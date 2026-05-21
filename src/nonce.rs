@@ -274,10 +274,23 @@ impl SingleAddressNonceManager {
         self.tracker.fail(nonce);
     }
 
-    /// Sync with chain nonce
+    /// Sync with chain nonce.
+    ///
+    /// Only advances the local tracker forward. Never rewinds — even though
+    /// `tracker.set()` is unconditional, this wrapper guards against
+    /// rewinding past in-flight pre-signed transactions (whose nonces were
+    /// allocated locally but are not yet visible on chain). Mirrors the
+    /// safety check in `NonceManager::sync_nonce` (line 196-201).
+    ///
+    /// Rewinding the tracker would cause subsequent `get_nonce()` calls to
+    /// re-issue nonces that are already baked into pre-signed transactions
+    /// sitting in the executor's preheated context, leading to collisions.
     #[inline]
     pub fn sync(&self, chain_nonce: u64) {
-        self.tracker.set(chain_nonce);
+        let current = self.tracker.peek();
+        if chain_nonce > current || self.tracker.needs_sync() {
+            self.tracker.set(chain_nonce);
+        }
     }
 
     /// Check if sync needed
@@ -413,6 +426,36 @@ mod tests {
         tracker.needs_sync.store(0, Ordering::Release);
         assert_eq!(tracker.peek(), 10);
         assert!(!tracker.needs_sync());
+    }
+
+    /// SingleAddressNonceManager: sync never rewinds past in-flight nonces.
+    ///
+    /// Regression for shared-key contention (uniswapx-filler#544): when an
+    /// external tx advances on-chain nonce, sync() should advance the local
+    /// tracker. When the local tracker is ahead (we have pre-signed tx not
+    /// yet visible on chain), sync() must NOT rewind — that would re-issue
+    /// nonces baked into in-flight signed transactions.
+    #[test]
+    fn test_single_address_sync_no_rewind() {
+        let addr = Address::ZERO;
+        let manager = SingleAddressNonceManager::new(addr, 100);
+
+        // Allocate two pre-signed nonces (100, 101) — current is now 102
+        assert_eq!(manager.get_nonce(), 100);
+        assert_eq!(manager.get_nonce(), 101);
+        assert_eq!(manager.peek(), 102);
+
+        // Chain says nonce is still 100 (our 100, 101 not yet visible).
+        // sync() must not rewind to 100 — that would re-issue 100 next.
+        manager.sync(100);
+        assert_eq!(manager.peek(), 102); // unchanged
+
+        // Chain advances to 103 (external tx consumed 100/101/102). Sync
+        // MUST advance the tracker, otherwise next get_nonce returns 102
+        // which is already stale on-chain.
+        manager.sync(103);
+        assert_eq!(manager.peek(), 103);
+        assert_eq!(manager.get_nonce(), 103);
     }
 
     /// SingleAddressNonceManager: fail + sync via manager API.
