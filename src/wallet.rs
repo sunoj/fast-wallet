@@ -421,6 +421,28 @@ impl FastWallet {
         }))
     }
 
+    /// Start background nonce refresh
+    ///
+    /// This spawns a background task that periodically syncs the local nonce
+    /// tracker from the latest confirmed chain state.
+    ///
+    /// Returns a handle that can be used to stop the background task.
+    pub fn start_background_nonce_refresh(
+        self: &Arc<Self>,
+        interval: Duration,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        let wallet = Arc::clone(self);
+
+        Some(tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            loop {
+                ticker.tick().await;
+                // Refresh nonce from latest chain state - ignore errors
+                let _ = wallet.sync_nonce_latest().await;
+            }
+        }))
+    }
+
     /// Preheat a transaction - allocate nonce and optionally fetch gas prices
     ///
     /// Use this when you detect a potential opportunity but are still calculating
@@ -438,22 +460,9 @@ impl FastWallet {
     /// when you're fairly confident a transaction will be sent.
     pub async fn preheat(&self, fetch_gas: bool) -> WalletResult<PreheatedContext> {
         let total_start = Instant::now();
-        // Sync local nonce from chain before allocating. Without this, any
-        // external transaction signed with the same key (operator scripts,
-        // shared-key services, manual `forge --broadcast` runs) advances the
-        // on-chain nonce without our knowledge. Our pre-signed tx then carries
-        // a stale nonce that the sequencer silently drops — the broadcaster
-        // returns Ok (signed bytes accepted) but the tx never lands.
-        //
-        // `SingleAddressNonceManager::sync` only advances forward (does not
-        // rewind past in-flight pre-signed tx), so this is safe to call on
-        // the hot path. Errors are ignored: a transient RPC failure should
-        // not abort the preheat — the worst case falls back to the prior
-        // behavior of using the cached local nonce.
-        //
-        // See uniswapx-filler issue #544 and
-        // `uniswapx-filler-rs/docs/investigation-nonce-drift-2026-05-21.md`.
-        let _ = self.sync_nonce_latest().await;
+        if self.nonce_manager.needs_sync() {
+            let _ = self.sync_nonce_latest().await;
+        }
 
         let nonce_start = Instant::now();
         let nonce = self.nonce_manager.get_nonce();

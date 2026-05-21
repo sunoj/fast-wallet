@@ -310,6 +310,31 @@ impl SingleAddressNonceManager {
 mod tests {
     use super::*;
 
+    struct MockNonceRpc {
+        next_nonce: AtomicU64,
+    }
+
+    impl MockNonceRpc {
+        fn new(initial_nonce: u64) -> Self {
+            Self {
+                next_nonce: AtomicU64::new(initial_nonce),
+            }
+        }
+
+        async fn get_nonce_latest(&self, _address: Address) -> u64 {
+            self.next_nonce.fetch_add(1, Ordering::AcqRel)
+        }
+    }
+
+    async fn sync_nonce_latest_once(
+        manager: &SingleAddressNonceManager,
+        rpc: &MockNonceRpc,
+    ) -> u64 {
+        let chain_nonce = rpc.get_nonce_latest(manager.address()).await;
+        manager.sync(chain_nonce);
+        chain_nonce
+    }
+
     #[test]
     fn test_nonce_tracker_increment() {
         let tracker = NonceTracker::new(0);
@@ -456,6 +481,19 @@ mod tests {
         manager.sync(103);
         assert_eq!(manager.peek(), 103);
         assert_eq!(manager.get_nonce(), 103);
+    }
+
+    #[tokio::test]
+    async fn test_background_nonce_refresh_advances_local_tracker() {
+        let addr = Address::ZERO;
+        let manager = SingleAddressNonceManager::new(addr, 100);
+        let rpc = MockNonceRpc::new(101);
+
+        assert_eq!(sync_nonce_latest_once(&manager, &rpc).await, 101);
+        assert_eq!(manager.peek(), 101);
+
+        assert_eq!(sync_nonce_latest_once(&manager, &rpc).await, 102);
+        assert_eq!(manager.peek(), 102);
     }
 
     /// SingleAddressNonceManager: fail + sync via manager API.
