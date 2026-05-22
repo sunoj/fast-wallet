@@ -269,8 +269,9 @@ impl RpcClient {
     /// Send a raw transaction and return endpoint timing.
     pub async fn send_raw_transaction_detailed(&self, raw_tx: &str) -> WalletResult<SendResult> {
         let started = Instant::now();
-        let (tx_hash, connection_reused) =
-            self.send_raw_transaction_with_connection_hint(raw_tx).await?;
+        let (tx_hash, connection_reused) = self
+            .send_raw_transaction_with_connection_hint(raw_tx)
+            .await?;
         let endpoint_ms = started.elapsed().as_millis() as u64;
         Ok(SendResult {
             tx_hash: format!("{tx_hash:?}"),
