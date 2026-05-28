@@ -8,6 +8,7 @@
 //! - Gas request coalescing for reduced RPC calls
 
 use crate::error::{WalletError, WalletResult};
+use crate::gas_provider::GasPriceProvider;
 use crate::nonce::SingleAddressNonceManager;
 use crate::rpc::{BatchRpcClient, RpcClient, SendResult};
 use crate::signer::FastSigner;
@@ -40,7 +41,7 @@ impl GasFetchSerializer {
 }
 
 /// Configuration for FastWallet
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct WalletConfig {
     /// Chain ID
     pub chain_id: u64,
@@ -79,6 +80,42 @@ pub struct WalletConfig {
     /// Timeout for acquiring pending transaction permit
     /// Default: 100ms (fail fast for liquidation bots)
     pub pending_acquire_timeout: Duration,
+    /// External chain-level gas provider.
+    ///
+    /// When `Some`, the wallet's own gas cache and `start_background_gas_refresh`
+    /// task are bypassed entirely — the provider becomes the sole source for
+    /// `get_gas_price()`, `get_priority_fee()`, `refresh_gas_prices()`, and
+    /// the gas values populated into `PreheatedContext` by `preheat(true)`.
+    pub gas_provider: Option<Arc<dyn GasPriceProvider>>,
+}
+
+impl std::fmt::Debug for WalletConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WalletConfig")
+            .field("chain_id", &self.chain_id)
+            .field("default_gas_limit", &self.default_gas_limit)
+            .field("max_pending_txs", &self.max_pending_txs)
+            .field("confirmation_timeout", &self.confirmation_timeout)
+            .field("poll_interval", &self.poll_interval)
+            .field("use_eip1559", &self.use_eip1559)
+            .field("gas_cache_duration", &self.gas_cache_duration)
+            .field("background_gas_refresh", &self.background_gas_refresh)
+            .field(
+                "optimistic_default_gas_price",
+                &self.optimistic_default_gas_price,
+            )
+            .field(
+                "optimistic_default_gas_limit",
+                &self.optimistic_default_gas_limit,
+            )
+            .field("max_gas_cache_age", &self.max_gas_cache_age)
+            .field("pending_acquire_timeout", &self.pending_acquire_timeout)
+            .field(
+                "gas_provider",
+                &self.gas_provider.as_ref().map(|_| "<dyn GasPriceProvider>"),
+            )
+            .finish()
+    }
 }
 
 /// Fallback gas cache TTL when neither `gas_cache_duration` nor
@@ -116,6 +153,7 @@ impl Default for WalletConfig {
             optimistic_default_gas_limit: 150_000, // Typical liquidation gas
             max_gas_cache_age: Duration::from_secs(30),
             pending_acquire_timeout: Duration::from_millis(100),
+            gas_provider: None,
         }
     }
 }
@@ -429,13 +467,19 @@ impl FastWallet {
         self.warmed_up.load(Ordering::Acquire)
     }
 
-    /// Start background gas price refresh
+    /// Start background gas price refresh.
     ///
-    /// This spawns a background task that periodically fetches gas prices,
-    /// ensuring they're always fresh when `preheat()` is called.
+    /// Spawns a background task that periodically fetches gas prices so the
+    /// internal cache is fresh when `preheat()` is called.
     ///
-    /// Returns a handle that can be used to stop the background task.
+    /// **No-op when a `gas_provider` is configured** — the external provider
+    /// owns refresh, and running both would just duplicate RPC traffic.
+    /// Returns `None` in that case.
     pub fn start_background_gas_refresh(self: &Arc<Self>) -> Option<tokio::task::JoinHandle<()>> {
+        // External provider owns refresh — bypass the internal task entirely.
+        if self.config.gas_provider.is_some() {
+            return None;
+        }
         let interval = self.config.background_gas_refresh?;
         let wallet = Arc::clone(self);
 
@@ -707,11 +751,18 @@ impl FastWallet {
 
     // ==================== Gas Price ====================
 
-    /// Get cached or fresh gas price (with double-checked locking for coalescing)
+    /// Get gas price.
     ///
-    /// Uses a tokio::sync::Mutex to serialize RPC calls: multiple concurrent callers
-    /// will share a single fetch result. This is correct even if the fetch fails.
+    /// When an external `gas_provider` is configured the call is delegated
+    /// to it (the internal cache is bypassed). Otherwise: lock-free read
+    /// from the local cache, then double-checked-locking fetch via the
+    /// gas RPC client.
     pub async fn get_gas_price(&self) -> WalletResult<U256> {
+        // External provider owns the cache — delegate without touching ours.
+        if let Some(provider) = &self.config.gas_provider {
+            return provider.gas_price().await;
+        }
+
         // Fast path: check cache (lock-free read)
         if let Some(price) = self.read_gas_cache(&self.gas_price_cache) {
             return Ok(price);
@@ -737,8 +788,17 @@ impl FastWallet {
         Ok(price)
     }
 
-    /// Get cached or fresh priority fee (with double-checked locking for coalescing)
+    /// Get priority fee.
+    ///
+    /// When an external `gas_provider` is configured the call is delegated
+    /// to it (the internal cache is bypassed). Otherwise: lock-free read
+    /// from the local cache, then double-checked-locking fetch.
     pub async fn get_priority_fee(&self) -> WalletResult<U256> {
+        // External provider owns the cache — delegate without touching ours.
+        if let Some(provider) = &self.config.gas_provider {
+            return provider.priority_fee().await;
+        }
+
         // Fast path: check cache (lock-free read)
         if let Some(fee) = self.read_gas_cache(&self.priority_fee_cache) {
             return Ok(fee);
@@ -779,8 +839,18 @@ impl FastWallet {
         })
     }
 
-    /// Force refresh gas prices
+    /// Force refresh gas prices.
+    ///
+    /// When an external `gas_provider` is configured this delegates to it
+    /// without touching the (bypassed) internal cache. Otherwise it does a
+    /// direct RPC fetch and writes both internal caches.
     pub async fn refresh_gas_prices(&self) -> WalletResult<(U256, Option<U256>)> {
+        if let Some(provider) = &self.config.gas_provider {
+            let (gas_price, priority_fee) =
+                tokio::join!(provider.gas_price(), provider.priority_fee());
+            return Ok((gas_price?, priority_fee.ok()));
+        }
+
         let (gas_price, priority_fee) = tokio::join!(
             self.rpc_client.gas_price(),
             self.rpc_client.max_priority_fee()
@@ -1555,6 +1625,21 @@ impl FastWalletBuilder {
         self
     }
 
+    /// Inject an external chain-level gas-price provider.
+    ///
+    /// While a provider is configured, this wallet's internal gas cache and
+    /// background refresh task are bypassed entirely — the provider becomes
+    /// the source of truth for `get_gas_price`, `get_priority_fee`,
+    /// `refresh_gas_prices`, and the gas values inside `PreheatedContext`.
+    ///
+    /// Use this when a single process holds multiple wallets on the same
+    /// chain (e.g. several lanes per chain) and you want them to share one
+    /// cache + one background refresh task.
+    pub fn gas_provider(mut self, provider: Arc<dyn GasPriceProvider>) -> Self {
+        self.config.gas_provider = Some(provider);
+        self
+    }
+
     /// Set default gas price for optimistic sends
     pub fn optimistic_default_gas_price(mut self, price: U256) -> Self {
         self.config.optimistic_default_gas_price = price;
@@ -1849,5 +1934,146 @@ mod tests {
 
         // Legacy transactions don't have a type prefix (starts with RLP list header)
         assert!(tx.encoded()[0] >= 0xc0); // RLP list
+    }
+
+    // ==================== GasPriceProvider injection tests (#15) ====================
+
+    use crate::gas_provider::GasPriceProvider;
+    use async_trait::async_trait;
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+    /// Fixed-value provider that also counts how many times each method was called,
+    /// so tests can assert delegation actually happened.
+    struct FixedProvider {
+        gas_price_wei: U256,
+        priority_fee_wei: U256,
+        gas_calls: AtomicU64,
+        priority_calls: AtomicU64,
+    }
+
+    impl FixedProvider {
+        fn new(gas_price_wei: u64, priority_fee_wei: u64) -> Arc<Self> {
+            Arc::new(Self {
+                gas_price_wei: U256::from(gas_price_wei),
+                priority_fee_wei: U256::from(priority_fee_wei),
+                gas_calls: AtomicU64::new(0),
+                priority_calls: AtomicU64::new(0),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl GasPriceProvider for FixedProvider {
+        async fn gas_price(&self) -> WalletResult<U256> {
+            self.gas_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(self.gas_price_wei)
+        }
+        async fn priority_fee(&self) -> WalletResult<U256> {
+            self.priority_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(self.priority_fee_wei)
+        }
+    }
+
+    #[tokio::test]
+    async fn gas_provider_delegates_get_gas_price_and_skips_local_cache() {
+        // Contract #1: get_gas_price()/get_priority_fee() must delegate to the
+        // provider and must NOT consult or populate the internal cache.
+        let provider = FixedProvider::new(42_000_000_000, 3_000_000_000); // 42 / 3 gwei
+        let wallet = FastWalletBuilder::new(TEST_PRIVATE_KEY, "http://localhost:8545")
+            .chain_id(1)
+            .gas_provider(provider.clone())
+            .build_with_nonce(0)
+            .unwrap();
+
+        let gas = wallet.get_gas_price().await.unwrap();
+        let prio = wallet.get_priority_fee().await.unwrap();
+        assert_eq!(gas, U256::from(42_000_000_000u64));
+        assert_eq!(prio, U256::from(3_000_000_000u64));
+        assert_eq!(provider.gas_calls.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(provider.priority_calls.load(AtomicOrdering::SeqCst), 1);
+
+        // Internal caches must remain empty — they are bypassed when a
+        // provider is set.
+        assert!(wallet.gas_price_cache.read().is_none());
+        assert!(wallet.priority_fee_cache.read().is_none());
+    }
+
+    #[tokio::test]
+    async fn gas_provider_disables_background_refresh() {
+        // Contract #2: start_background_gas_refresh() is a no-op (returns None)
+        // when a provider is set, even if background_gas_refresh interval is
+        // configured.
+        let provider = FixedProvider::new(1, 1);
+        let wallet = Arc::new(
+            FastWalletBuilder::new(TEST_PRIVATE_KEY, "http://localhost:8545")
+                .chain_id(1)
+                .background_gas_refresh(Duration::from_millis(50))
+                .gas_provider(provider)
+                .build_with_nonce(0)
+                .unwrap(),
+        );
+
+        let handle = wallet.start_background_gas_refresh();
+        assert!(
+            handle.is_none(),
+            "provider must suppress background refresh"
+        );
+    }
+
+    #[tokio::test]
+    async fn preheat_populates_context_from_gas_provider() {
+        // Contract #4: preheat(true) populates ctx.gas_price / priority_fee
+        // from the provider; existing call-site code that reads ctx.gas_price
+        // is unchanged.
+        let provider = FixedProvider::new(7_000_000_000, 1_000_000_000);
+        let wallet = FastWalletBuilder::new(TEST_PRIVATE_KEY, "http://localhost:8545")
+            .chain_id(1)
+            .gas_provider(provider.clone())
+            .build_with_nonce(99)
+            .unwrap();
+
+        let ctx = wallet.preheat(true).await.unwrap();
+        assert_eq!(ctx.gas_price, Some(U256::from(7_000_000_000u64)));
+        assert_eq!(ctx.priority_fee, Some(U256::from(1_000_000_000u64)));
+        // max_fee = base*2 + priority
+        assert_eq!(
+            ctx.max_fee,
+            Some(U256::from(7_000_000_000u64 * 2 + 1_000_000_000u64))
+        );
+        assert_eq!(provider.gas_calls.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(provider.priority_calls.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn refresh_gas_prices_delegates_to_provider_and_skips_cache() {
+        // refresh_gas_prices() should also delegate when a provider is set.
+        let provider = FixedProvider::new(9_000_000_000, 2_000_000_000);
+        let wallet = FastWalletBuilder::new(TEST_PRIVATE_KEY, "http://localhost:8545")
+            .chain_id(1)
+            .gas_provider(provider.clone())
+            .build_with_nonce(0)
+            .unwrap();
+
+        let (gas, prio) = wallet.refresh_gas_prices().await.unwrap();
+        assert_eq!(gas, U256::from(9_000_000_000u64));
+        assert_eq!(prio, Some(U256::from(2_000_000_000u64)));
+        // Internal caches must remain untouched.
+        assert!(wallet.gas_price_cache.read().is_none());
+        assert!(wallet.priority_fee_cache.read().is_none());
+    }
+
+    #[test]
+    fn gas_provider_default_is_none_for_backwards_compat() {
+        // Contract: when gas_provider is unset, behavior is identical to
+        // pre-#15 — the existing test suite already covers that path. Here
+        // we just pin the default so a future change can't silently flip it.
+        let cfg = WalletConfig::default();
+        assert!(cfg.gas_provider.is_none());
+
+        let wallet = FastWalletBuilder::new(TEST_PRIVATE_KEY, "http://localhost:8545")
+            .chain_id(1)
+            .build_with_nonce(0)
+            .unwrap();
+        assert!(wallet.config.gas_provider.is_none());
     }
 }

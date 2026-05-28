@@ -86,6 +86,9 @@ parking_lot = "0.12"
 # Dashmap for concurrent hashmap
 dashmap = "6.0"
 
+# async fn in traits — required for the dyn-compatible GasPriceProvider trait
+async-trait = "0.1"
+
 [dev-dependencies]
 # Benchmarking
 criterion = { version = "0.5", features = ["async_tokio"] }
