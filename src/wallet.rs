@@ -1739,6 +1739,25 @@ mod tests {
             wallet.config.effective_gas_cache_duration(),
             Duration::from_secs(10)
         );
+
+        // Explicit override longer than max_gas_cache_age is *still capped*
+        // by the upper bound at read time — exercise read_gas_cache directly.
+        let wallet = FastWalletBuilder::new(TEST_PRIVATE_KEY, "http://localhost:8545")
+            .chain_id(1)
+            .gas_cache_duration(Duration::from_secs(120))
+            .build_with_nonce(0)
+            .unwrap();
+        assert_eq!(wallet.config.max_gas_cache_age, Duration::from_secs(30));
+        // Seed cache with an old entry: stale relative to max_gas_cache_age (30s)
+        // but fresh relative to gas_cache_duration override (120s).
+        *wallet.gas_price_cache.write() = Some((
+            U256::from(1_000_000_000u64),
+            Instant::now() - Duration::from_secs(45),
+        ));
+        assert!(
+            wallet.read_gas_cache(&wallet.gas_price_cache).is_none(),
+            "max_gas_cache_age must cap freshness even when gas_cache_duration is larger"
+        );
     }
 
     #[test]

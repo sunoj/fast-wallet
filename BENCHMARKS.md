@@ -46,7 +46,7 @@ Enable with: `features = ["secp256k1-ffi"]`
 
 **HTTP Connection Warmup:**
 - `warmup()` / `warmup_connections()` - Pre-establish TCP/TLS connections
-- `preheat_full()` - Full preheat (connections + nonce + gas)
+- `preheat_full(fetch_gas)` - Full preheat (connections + nonce + optional gas)
 - **Latency savings**: 5-20ms per endpoint on first request
 
 **Benchmark Results (k256):**
