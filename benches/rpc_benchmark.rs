@@ -567,7 +567,7 @@ fn bench_warmup_connections(c: &mut Criterion) {
         });
 
         b.to_async(&rt).iter(|| async {
-            let ctx = wallet.preheat_full().await.unwrap();
+            let ctx = wallet.preheat_full(true).await.unwrap();
             wallet.cancel_preheat(ctx);
         })
     });

@@ -54,8 +54,16 @@ pub struct WalletConfig {
     pub poll_interval: Duration,
     /// Whether to use EIP-1559 transactions by default
     pub use_eip1559: bool,
-    /// Gas price cache duration
-    pub gas_cache_duration: Duration,
+    /// Explicit gas price cache TTL override.
+    ///
+    /// `None` (default) auto-infers the effective TTL:
+    /// - if `background_gas_refresh` is set, the cache stays fresh for that
+    ///   interval (so each refreshed value is valid until the next tick);
+    /// - otherwise, falls back to `DEFAULT_GAS_CACHE_FALLBACK` (500ms).
+    ///
+    /// `max_gas_cache_age` is always also enforced as an upper bound.
+    /// Set `Some(_)` to opt in to a stricter freshness window.
+    pub gas_cache_duration: Option<Duration>,
     /// Background gas refresh interval (None = disabled)
     pub background_gas_refresh: Option<Duration>,
     /// Default gas price for optimistic sends when cache is empty (in wei)
@@ -73,6 +81,26 @@ pub struct WalletConfig {
     pub pending_acquire_timeout: Duration,
 }
 
+/// Fallback gas cache TTL when neither `gas_cache_duration` nor
+/// `background_gas_refresh` is configured.
+const DEFAULT_GAS_CACHE_FALLBACK: Duration = Duration::from_millis(500);
+
+impl WalletConfig {
+    /// Resolve the effective gas-cache TTL based on the current config.
+    ///
+    /// Resolution order:
+    /// 1. explicit `gas_cache_duration`
+    /// 2. `background_gas_refresh` interval (so a refreshed value stays
+    ///    valid until the next refresh tick)
+    /// 3. `DEFAULT_GAS_CACHE_FALLBACK` (500ms)
+    #[inline]
+    pub fn effective_gas_cache_duration(&self) -> Duration {
+        self.gas_cache_duration
+            .or(self.background_gas_refresh)
+            .unwrap_or(DEFAULT_GAS_CACHE_FALLBACK)
+    }
+}
+
 impl Default for WalletConfig {
     fn default() -> Self {
         Self {
@@ -82,7 +110,7 @@ impl Default for WalletConfig {
             confirmation_timeout: Duration::from_secs(120),
             poll_interval: Duration::from_millis(500),
             use_eip1559: true,
-            gas_cache_duration: Duration::from_millis(500),
+            gas_cache_duration: None,
             background_gas_refresh: None, // Disabled by default
             optimistic_default_gas_price: U256::from(1_000_000_000u64), // 1 gwei
             optimistic_default_gas_limit: 150_000, // Typical liquidation gas
@@ -608,15 +636,18 @@ impl FastWallet {
         (primary_ok, batch_count)
     }
 
-    /// Full preheat: warm connections + allocate nonce + fetch gas
+    /// Full preheat: warm connections + allocate nonce + (optionally) fetch gas.
     ///
-    /// This is the most comprehensive preheat, ideal for liquidation bots:
-    /// 1. Warms up HTTP connections (TCP/TLS handshakes)
-    /// 2. Allocates a nonce
-    /// 3. Fetches current gas prices
+    /// Runs `warmup_connections` and `preheat(fetch_gas)` in parallel and
+    /// emits a single structured `fast-wallet full preheat complete` log
+    /// with timing breakdowns.
+    ///
+    /// Pass `fetch_gas = false` when the caller supplies explicit gas prices
+    /// (e.g. via `sign_with_preheat` + `priority_fee_override`) so gas RPC
+    /// latency cannot block the broadcast hot path.
     ///
     /// Call this ~100-500ms before you expect to send a transaction.
-    pub async fn preheat_full(&self) -> WalletResult<PreheatedContext> {
+    pub async fn preheat_full(&self, fetch_gas: bool) -> WalletResult<PreheatedContext> {
         let total_start = Instant::now();
         let warmup = async {
             let start = Instant::now();
@@ -625,11 +656,11 @@ impl FastWallet {
         };
         let context = async {
             let start = Instant::now();
-            let result = self.preheat(true).await;
+            let result = self.preheat(fetch_gas).await;
             (start.elapsed().as_millis(), result)
         };
 
-        // Warm connections and fetch gas in parallel.
+        // Warm connections and (optionally) fetch gas in parallel.
         let ((warmup_ms, (primary_ok, batch_count)), (context_ms, ctx)) =
             tokio::join!(warmup, context);
         let ctx = ctx?;
@@ -639,6 +670,7 @@ impl FastWallet {
             context_ms,
             primary_ok,
             batch_count,
+            fetch_gas,
             nonce = ctx.nonce,
             gas_ready = ctx.gas_price.is_some(),
             priority_fee_ready = ctx.priority_fee.is_some(),
@@ -737,7 +769,9 @@ impl FastWallet {
         let guard = cache.read();
         guard.as_ref().and_then(|(price, timestamp)| {
             let age = timestamp.elapsed();
-            if age < self.config.gas_cache_duration && age < self.config.max_gas_cache_age {
+            if age < self.config.effective_gas_cache_duration()
+                && age < self.config.max_gas_cache_age
+            {
                 Some(*price)
             } else {
                 None
@@ -1504,9 +1538,14 @@ impl FastWalletBuilder {
         self
     }
 
-    /// Set gas cache duration
+    /// Set an explicit gas cache TTL.
+    ///
+    /// Most callers should leave this unset and rely on
+    /// `background_gas_refresh` — the cache then stays fresh for one full
+    /// refresh interval. Call this only to opt in to a stricter freshness
+    /// window than the background refresh provides.
     pub fn gas_cache_duration(mut self, duration: Duration) -> Self {
-        self.config.gas_cache_duration = duration;
+        self.config.gas_cache_duration = Some(duration);
         self
     }
 
@@ -1661,6 +1700,45 @@ mod tests {
         assert_eq!(tx2.nonce(), 11);
         assert_eq!(tx3.nonce(), 12);
         assert_eq!(wallet.current_nonce(), 13);
+    }
+
+    #[test]
+    fn test_effective_gas_cache_duration_inference() {
+        // Default: no override, no background refresh → 500ms fallback
+        let cfg = WalletConfig::default();
+        assert_eq!(
+            cfg.effective_gas_cache_duration(),
+            DEFAULT_GAS_CACHE_FALLBACK
+        );
+
+        // Background refresh enabled, no explicit override → inferred to interval
+        let cfg = WalletConfig {
+            background_gas_refresh: Some(Duration::from_secs(30)),
+            ..Default::default()
+        };
+        assert_eq!(cfg.effective_gas_cache_duration(), Duration::from_secs(30));
+
+        // Explicit override always wins, even with background refresh
+        let cfg = WalletConfig {
+            gas_cache_duration: Some(Duration::from_millis(100)),
+            background_gas_refresh: Some(Duration::from_secs(30)),
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.effective_gas_cache_duration(),
+            Duration::from_millis(100)
+        );
+
+        // Builder sets the explicit override
+        let wallet = FastWalletBuilder::new(TEST_PRIVATE_KEY, "http://localhost:8545")
+            .chain_id(1)
+            .background_gas_refresh(Duration::from_secs(10))
+            .build_with_nonce(0)
+            .unwrap();
+        assert_eq!(
+            wallet.config.effective_gas_cache_duration(),
+            Duration::from_secs(10)
+        );
     }
 
     #[test]

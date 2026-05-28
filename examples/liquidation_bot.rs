@@ -28,7 +28,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Configure for liquidation bot use case
     let config = WalletConfig {
         chain_id: 1,
-        gas_cache_duration: Duration::from_millis(100), // Aggressive cache refresh
+        gas_cache_duration: Some(Duration::from_millis(100)), // Aggressive freshness opt-in
         background_gas_refresh: Some(Duration::from_millis(500)), // Auto-refresh every 500ms
         optimistic_default_gas_limit: LIQUIDATION_GAS_LIMIT,
         optimistic_default_gas_price: U256::from(2_000_000_000u64), // 2 gwei fallback

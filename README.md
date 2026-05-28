@@ -109,7 +109,11 @@ Preestablish TCP/TLS connections before time-critical operations:
 wallet.warmup().await?;
 
 // Full preheat: connections + nonce + gas prices
-let ctx = wallet.preheat_full().await?;
+let ctx = wallet.preheat_full(true).await?;
+
+// Same parallel warmup but skip gas RPC — for callers that supply
+// explicit gas prices to sign_with_preheat.
+let ctx = wallet.preheat_full(false).await?;
 ```
 
 ### Preheated Optimistic (Lowest Latency)
