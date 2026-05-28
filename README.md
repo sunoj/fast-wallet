@@ -116,6 +116,30 @@ let ctx = wallet.preheat_full(true).await?;
 let ctx = wallet.preheat_full(false).await?;
 ```
 
+### Sharing one gas cache across multiple wallets
+
+When a process holds several `FastWallet` instances on the same chain
+(e.g. multiple lanes per chain), inject a shared `GasPriceProvider` so all
+wallets see one cache and one background refresh:
+
+```rust
+use fast_wallet::GasPriceProvider;
+use std::sync::Arc;
+
+let provider: Arc<dyn GasPriceProvider> = Arc::new(my_chain_cache);
+// the provider owns its own refresh task
+
+let aggressive = FastWalletBuilder::new(/* ... */)
+    .gas_provider(provider.clone())
+    .build().await?;
+let anchor = FastWalletBuilder::new(/* ... */)
+    .gas_provider(provider.clone())
+    .build().await?;
+```
+
+While `gas_provider` is set, the wallet's internal gas cache is bypassed
+and `start_background_gas_refresh()` is a no-op.
+
 ### Preheated Optimistic (Lowest Latency)
 
 ```rust

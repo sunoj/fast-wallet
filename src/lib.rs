@@ -43,6 +43,7 @@
 pub mod broadcast;
 pub mod crypto;
 pub mod error;
+pub mod gas_provider;
 pub mod nonce;
 pub mod rpc;
 pub mod signer;
@@ -51,6 +52,7 @@ pub mod wallet;
 
 pub use broadcast::{BroadcastStrategy, BroadcasterBuilder, RpcEndpoint, TransactionBroadcaster};
 pub use error::{WalletError, WalletResult};
+pub use gas_provider::GasPriceProvider;
 pub use nonce::NonceManager;
 pub use rpc::SendResult;
 pub use signer::FastSigner;
