@@ -9,6 +9,8 @@
 
 use alloy::primitives::Address;
 use dashmap::DashMap;
+use parking_lot::Mutex;
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::Notify;
@@ -24,8 +26,14 @@ pub struct NonceTracker {
     pending_count: AtomicU64,
     /// Last synced nonce from the chain
     synced_nonce: AtomicU64,
-    /// Flag indicating if we need to resync
-    needs_sync: AtomicU64, // 0 = no, 1 = yes (using u64 for AtomicU64)
+    /// Released middle nonces available for reuse.
+    ///
+    /// The hot path checks `gap_count` before taking this lock. The lock is only
+    /// acquired when a gap exists, a nonce is released, or a chain sync prunes
+    /// stale gaps.
+    gaps: Mutex<BTreeSet<u64>>,
+    /// Fast check that lets normal allocation avoid locking `gaps`.
+    gap_count: AtomicU64,
 }
 
 impl NonceTracker {
@@ -35,7 +43,8 @@ impl NonceTracker {
             current: AtomicU64::new(initial_nonce),
             pending_count: AtomicU64::new(0),
             synced_nonce: AtomicU64::new(initial_nonce),
-            needs_sync: AtomicU64::new(0),
+            gaps: Mutex::new(BTreeSet::new()),
+            gap_count: AtomicU64::new(0),
         }
     }
 
@@ -47,7 +56,15 @@ impl NonceTracker {
     #[inline(always)]
     pub fn get_and_increment(&self) -> u64 {
         self.pending_count.fetch_add(1, Ordering::Relaxed);
-        self.current.fetch_add(1, Ordering::AcqRel)
+        self.reserve_next_nonce()
+    }
+
+    /// Reserve a nonce with an RAII guard.
+    #[inline(always)]
+    pub fn reserve(self: &Arc<Self>) -> ReservedNonce {
+        self.pending_count.fetch_add(1, Ordering::Relaxed);
+        let nonce = self.reserve_next_nonce();
+        ReservedNonce::new(Arc::clone(self), nonce)
     }
 
     /// Get the current nonce without incrementing
@@ -65,44 +82,20 @@ impl NonceTracker {
     /// Mark a nonce as confirmed (transaction included in block)
     #[inline]
     pub fn confirm(&self) {
-        self.pending_count.fetch_sub(1, Ordering::Relaxed);
+        self.decrement_pending();
     }
 
-    /// Mark a nonce as failed and attempt to reclaim it.
-    ///
-    /// If the failed nonce is the most recently allocated one (current - 1),
-    /// it is reclaimed via CAS to avoid nonce gaps. Otherwise, a resync
-    /// is flagged because there is a gap that only the chain can resolve.
+    /// Release a nonce and make it available for reuse.
     #[inline]
-    pub fn fail(&self, used_nonce: u64) {
-        self.pending_count.fetch_sub(1, Ordering::Relaxed);
-
-        // Try to reclaim: if used_nonce == current - 1, CAS current back
-        // This handles the common case of cancelling the most recent preheat.
-        let expected = used_nonce + 1;
-        if self
-            .current
-            .compare_exchange(expected, used_nonce, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            // Successfully reclaimed the nonce
-            return;
-        }
-
-        // Could not reclaim (other nonces allocated after this one) - flag for resync
-        let current = self.current.load(Ordering::Acquire);
-        if used_nonce < current {
-            self.needs_sync.store(1, Ordering::Release);
-        }
+    pub fn release(&self, used_nonce: u64) {
+        self.decrement_pending();
+        self.recycle_nonce(used_nonce);
     }
 
-    /// Force set the nonce (used during sync)
+    /// Set the nonce from an external source without rewinding local state.
     #[inline]
     pub fn set(&self, nonce: u64) {
-        // Use Release ordering to ensure all previous writes are visible
-        self.current.store(nonce, Ordering::Release);
-        self.synced_nonce.store(nonce, Ordering::Release);
-        self.needs_sync.store(0, Ordering::Release);
+        self.sync_forward(nonce);
     }
 
     /// Reset pending count (used during sync when all pending are cleared)
@@ -111,16 +104,208 @@ impl NonceTracker {
         self.pending_count.store(0, Ordering::Relaxed);
     }
 
-    /// Check if resync is needed
-    #[inline]
-    pub fn needs_sync(&self) -> bool {
-        self.needs_sync.load(Ordering::Acquire) != 0
-    }
-
     /// Get the last synced nonce
     #[inline]
     pub fn synced_nonce(&self) -> u64 {
         self.synced_nonce.load(Ordering::Acquire)
+    }
+
+    /// Get the number of recycled gaps waiting to be reused.
+    #[inline]
+    pub fn gap_count(&self) -> u64 {
+        self.gap_count.load(Ordering::Relaxed)
+    }
+
+    /// Sync from chain without rewinding over locally reserved nonces.
+    pub fn sync_forward(&self, chain_nonce: u64) -> bool {
+        let mut gaps = self.gaps.lock();
+        gaps.retain(|nonce| *nonce >= chain_nonce);
+        self.gap_count.store(gaps.len() as u64, Ordering::Release);
+        self.synced_nonce.fetch_max(chain_nonce, Ordering::AcqRel);
+
+        loop {
+            let current = self.current.load(Ordering::Acquire);
+            if chain_nonce <= current {
+                return false;
+            }
+            if self
+                .current
+                .compare_exchange(current, chain_nonce, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return true;
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn reserve_next_nonce(&self) -> u64 {
+        if self.gap_count.load(Ordering::Relaxed) > 0 {
+            let mut gaps = self.gaps.lock();
+            if let Some(nonce) = gaps.first().copied() {
+                gaps.remove(&nonce);
+                self.gap_count.fetch_sub(1, Ordering::AcqRel);
+                return nonce;
+            }
+        }
+        self.current.fetch_add(1, Ordering::AcqRel)
+    }
+
+    fn recycle_nonce(&self, used_nonce: u64) {
+        let mut gaps = self.gaps.lock();
+        let synced = self.synced_nonce.load(Ordering::Acquire);
+        if used_nonce < synced {
+            return;
+        }
+
+        if let Some(expected) = used_nonce.checked_add(1) {
+            if self
+                .current
+                .compare_exchange(expected, used_nonce, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                self.collapse_top_gaps(&mut gaps);
+                return;
+            }
+        }
+
+        let current = self.current.load(Ordering::Acquire);
+        if used_nonce < current {
+            if used_nonce >= synced && used_nonce < current && gaps.insert(used_nonce) {
+                self.gap_count.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+    }
+
+    fn collapse_top_gaps(&self, gaps: &mut BTreeSet<u64>) {
+        loop {
+            let current = self.current.load(Ordering::Acquire);
+            let Some(previous) = current.checked_sub(1) else {
+                return;
+            };
+            if previous < self.synced_nonce.load(Ordering::Acquire) {
+                return;
+            }
+            if !gaps.remove(&previous) {
+                return;
+            }
+            if self
+                .current
+                .compare_exchange(current, previous, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                self.gap_count.fetch_sub(1, Ordering::AcqRel);
+            } else {
+                gaps.insert(previous);
+                return;
+            }
+        }
+    }
+
+    fn decrement_pending(&self) {
+        let _ = self.pending_count.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |pending| pending.checked_sub(1),
+        );
+    }
+}
+
+/// State for an RAII nonce reservation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReservedNonceState {
+    Held,
+    Broadcasting,
+    Committed,
+    Released,
+}
+
+/// RAII guard for a reserved nonce.
+///
+/// Dropping a held reservation releases the nonce back to the tracker. Once a
+/// transaction is broadcasting, drop no longer releases because the signed
+/// transaction may already be in an RPC or mempool.
+pub struct ReservedNonce {
+    tracker: Arc<NonceTracker>,
+    nonce: u64,
+    state: ReservedNonceState,
+}
+
+impl std::fmt::Debug for ReservedNonce {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReservedNonce")
+            .field("nonce", &self.nonce)
+            .field("state", &self.state)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ReservedNonce {
+    fn new(tracker: Arc<NonceTracker>, nonce: u64) -> Self {
+        Self {
+            tracker,
+            nonce,
+            state: ReservedNonceState::Held,
+        }
+    }
+
+    /// Get the reserved nonce.
+    #[inline]
+    pub fn nonce(&self) -> u64 {
+        self.nonce
+    }
+
+    /// Mark the reservation as having a signed transaction entering broadcast.
+    pub fn mark_broadcasting(&mut self) -> bool {
+        if self.state != ReservedNonceState::Held {
+            return false;
+        }
+        self.state = ReservedNonceState::Broadcasting;
+        true
+    }
+
+    /// Mark a held or broadcasting nonce as accepted by an RPC endpoint.
+    pub fn commit(&mut self) -> bool {
+        if self.state != ReservedNonceState::Held && self.state != ReservedNonceState::Broadcasting
+        {
+            return false;
+        }
+        self.tracker.confirm();
+        self.state = ReservedNonceState::Committed;
+        true
+    }
+
+    /// Release a held or broadcasting nonce back to the tracker.
+    pub fn release(&mut self) -> bool {
+        if self.state != ReservedNonceState::Held && self.state != ReservedNonceState::Broadcasting
+        {
+            return false;
+        }
+        self.tracker.release(self.nonce);
+        self.state = ReservedNonceState::Released;
+        true
+    }
+}
+
+impl Drop for ReservedNonce {
+    fn drop(&mut self) {
+        match self.state {
+            ReservedNonceState::Held => {
+                self.tracker.release(self.nonce);
+                self.state = ReservedNonceState::Released;
+                tracing::warn!(
+                    nonce = self.nonce,
+                    "ReservedNonce dropped without commit/release; auto-released"
+                );
+            }
+            ReservedNonceState::Broadcasting => {
+                tracing::warn!(
+                    nonce = self.nonce,
+                    "ReservedNonce dropped during broadcast; left for chain sync"
+                );
+            }
+            ReservedNonceState::Committed | ReservedNonceState::Released => {}
+        }
     }
 }
 
@@ -166,6 +351,12 @@ impl NonceManager {
         self.get_tracker(address).get_and_increment()
     }
 
+    /// Reserve next nonce for an address with RAII release on drop.
+    #[inline]
+    pub fn reserve_nonce(&self, address: Address) -> ReservedNonce {
+        self.get_tracker(address).reserve()
+    }
+
     /// Peek current nonce without incrementing
     #[inline]
     pub fn peek_nonce(&self, address: Address) -> u64 {
@@ -180,23 +371,18 @@ impl NonceManager {
         }
     }
 
-    /// Mark a transaction as failed
+    /// Release a transaction nonce back to the recycling pool
     #[inline]
-    pub fn fail_nonce(&self, address: Address, nonce: u64) {
+    pub fn release_nonce(&self, address: Address, nonce: u64) {
         if let Some(tracker) = self.trackers.get(&address) {
-            tracker.fail(nonce);
+            tracker.release(nonce);
         }
     }
 
     /// Update nonce from chain (call after fetching from RPC)
     pub fn sync_nonce(&self, address: Address, chain_nonce: u64) {
         let tracker = self.get_tracker(address);
-        let current = tracker.peek();
-
-        // Only update if chain nonce is higher (transactions confirmed)
-        // or if we need a resync due to failures
-        if chain_nonce > current || tracker.needs_sync() {
-            tracker.set(chain_nonce);
+        if tracker.sync_forward(chain_nonce) {
             self.sync_notify.notify_waiters();
         }
     }
@@ -231,7 +417,7 @@ impl Default for NonceManager {
 /// When you only need to manage one address, this provides slightly
 /// better performance by avoiding the hashmap lookup.
 pub struct SingleAddressNonceManager {
-    tracker: NonceTracker,
+    tracker: Arc<NonceTracker>,
     address: Address,
 }
 
@@ -239,7 +425,7 @@ impl SingleAddressNonceManager {
     /// Create a new single-address nonce manager
     pub fn new(address: Address, initial_nonce: u64) -> Self {
         Self {
-            tracker: NonceTracker::new(initial_nonce),
+            tracker: Arc::new(NonceTracker::new(initial_nonce)),
             address,
         }
     }
@@ -256,6 +442,12 @@ impl SingleAddressNonceManager {
         self.tracker.get_and_increment()
     }
 
+    /// Reserve next nonce with RAII release on drop.
+    #[inline]
+    pub fn reserve(&self) -> ReservedNonce {
+        self.tracker.reserve()
+    }
+
     /// Peek current nonce
     #[inline]
     pub fn peek(&self) -> u64 {
@@ -268,41 +460,32 @@ impl SingleAddressNonceManager {
         self.tracker.confirm();
     }
 
-    /// Fail transaction
+    /// Release transaction nonce
     #[inline]
-    pub fn fail(&self, nonce: u64) {
-        self.tracker.fail(nonce);
+    pub fn release(&self, nonce: u64) {
+        self.tracker.release(nonce);
     }
 
     /// Sync with chain nonce.
     ///
-    /// Only advances the local tracker forward. Never rewinds — even though
-    /// `tracker.set()` is unconditional, this wrapper guards against
-    /// rewinding past in-flight pre-signed transactions (whose nonces were
-    /// allocated locally but are not yet visible on chain). Mirrors the
-    /// safety check in `NonceManager::sync_nonce` (line 196-201).
-    ///
-    /// Rewinding the tracker would cause subsequent `get_nonce()` calls to
-    /// re-issue nonces that are already baked into pre-signed transactions
-    /// sitting in the executor's preheated context, leading to collisions.
+    /// Only advances the local tracker forward and prunes recycled gaps that
+    /// the chain has already consumed. It never rewinds past in-flight
+    /// pre-signed transactions whose nonces are not yet visible on chain.
     #[inline]
     pub fn sync(&self, chain_nonce: u64) {
-        let current = self.tracker.peek();
-        if chain_nonce > current || self.tracker.needs_sync() {
-            self.tracker.set(chain_nonce);
-        }
-    }
-
-    /// Check if sync needed
-    #[inline]
-    pub fn needs_sync(&self) -> bool {
-        self.tracker.needs_sync()
+        self.tracker.sync_forward(chain_nonce);
     }
 
     /// Get pending count
     #[inline]
     pub fn pending_count(&self) -> u64 {
         self.tracker.pending_count()
+    }
+
+    /// Get number of released middle nonces available for reuse.
+    #[inline]
+    pub fn gap_count(&self) -> u64 {
+        self.tracker.gap_count()
     }
 }
 
@@ -356,7 +539,7 @@ mod tests {
         tracker.confirm();
         assert_eq!(tracker.pending_count(), 1);
 
-        tracker.fail(0);
+        tracker.release(0);
         assert_eq!(tracker.pending_count(), 0);
     }
 
@@ -402,55 +585,107 @@ mod tests {
         assert_eq!(manager.pending_count(), 1);
     }
 
-    /// CAS reclamation: fail() on the most recently allocated nonce
-    /// should reclaim it (current goes back to N).
+    /// Release of the most recently allocated nonce rewinds the top nonce.
     #[test]
-    fn test_fail_reclaims_last_nonce() {
+    fn test_release_reclaims_last_nonce() {
         let tracker = NonceTracker::new(10);
 
         let n = tracker.get_and_increment(); // n=10, current=11
         assert_eq!(n, 10);
         assert_eq!(tracker.peek(), 11);
 
-        tracker.fail(10); // CAS(11, 10) should succeed
+        tracker.release(10);
         assert_eq!(tracker.peek(), 10); // reclaimed
-        assert!(!tracker.needs_sync()); // no sync needed
+        assert_eq!(tracker.gap_count(), 0);
 
         // Next allocation reuses nonce 10
         assert_eq!(tracker.get_and_increment(), 10);
     }
 
-    /// CAS reclamation fails when failing a non-latest nonce (gap exists).
-    /// The nonce cannot be reclaimed, so needs_sync is flagged.
+    /// Middle nonce release is recycled by the next reservation.
     #[test]
-    fn test_fail_non_latest_flags_sync() {
+    fn test_middle_nonce_release_reused_by_next_reserve() {
         let tracker = NonceTracker::new(10);
 
         let _n0 = tracker.get_and_increment(); // 10, current=11
         let _n1 = tracker.get_and_increment(); // 11, current=12
 
-        // Fail nonce 10 (not the latest — 11 was allocated after)
-        tracker.fail(10);
-        assert_eq!(tracker.peek(), 12); // NOT reclaimed
-        assert!(tracker.needs_sync()); // sync flagged
+        tracker.release(10);
+        assert_eq!(tracker.peek(), 12);
+        assert_eq!(tracker.gap_count(), 1);
+        assert_eq!(tracker.get_and_increment(), 10);
+        assert_eq!(tracker.gap_count(), 0);
     }
 
-    /// sync() resets current nonce and clears needs_sync flag.
     #[test]
-    fn test_sync_resets_nonce_and_clears_flag() {
+    fn test_drop_without_commit_releases_nonce() {
+        let tracker = Arc::new(NonceTracker::new(10));
+        {
+            let reservation = tracker.reserve();
+            assert_eq!(reservation.nonce(), 10);
+            assert_eq!(tracker.peek(), 11);
+        }
+        assert_eq!(tracker.peek(), 10);
+        assert_eq!(tracker.reserve().nonce(), 10);
+    }
+
+    #[test]
+    fn test_drop_during_broadcasting_does_not_release() {
+        let tracker = Arc::new(NonceTracker::new(10));
+        {
+            let mut reservation = tracker.reserve();
+            assert_eq!(reservation.nonce(), 10);
+            assert!(reservation.mark_broadcasting());
+        }
+        assert_eq!(tracker.peek(), 11);
+        assert_eq!(tracker.get_and_increment(), 11);
+        assert_eq!(tracker.pending_count(), 2);
+    }
+
+    #[test]
+    fn test_forward_sync_prunes_gaps() {
         let tracker = NonceTracker::new(10);
 
-        // Advance nonce and create a gap
         let _n0 = tracker.get_and_increment(); // 10
         let _n1 = tracker.get_and_increment(); // 11
-        tracker.fail(10); // can't reclaim, flags sync
-        assert!(tracker.needs_sync());
+        tracker.release(10);
+        assert_eq!(tracker.gap_count(), 1);
 
-        // Sync from chain (chain nonce is 10 — TX 10 was never sent)
-        tracker.set(10);
-        tracker.needs_sync.store(0, Ordering::Release);
-        assert_eq!(tracker.peek(), 10);
-        assert!(!tracker.needs_sync());
+        assert!(!tracker.sync_forward(11));
+        assert_eq!(tracker.peek(), 12);
+        assert_eq!(tracker.gap_count(), 0);
+        assert_eq!(tracker.get_and_increment(), 12);
+    }
+
+    #[test]
+    fn test_concurrent_release_sync_never_rewinds_below_synced() {
+        use std::sync::Barrier;
+        use std::thread;
+
+        for _ in 0..1000 {
+            let tracker = Arc::new(NonceTracker::new(10));
+            assert_eq!(tracker.get_and_increment(), 10);
+            let barrier = Arc::new(Barrier::new(2));
+
+            let release_tracker = Arc::clone(&tracker);
+            let release_barrier = Arc::clone(&barrier);
+            let release = thread::spawn(move || {
+                release_barrier.wait();
+                release_tracker.release(10);
+            });
+
+            let sync_tracker = Arc::clone(&tracker);
+            let sync = thread::spawn(move || {
+                barrier.wait();
+                sync_tracker.sync_forward(11);
+            });
+
+            release.join().expect("release thread should finish");
+            sync.join().expect("sync thread should finish");
+
+            assert!(tracker.peek() >= tracker.synced_nonce());
+            assert_eq!(tracker.get_and_increment(), 11);
+        }
     }
 
     /// SingleAddressNonceManager: sync never rewinds past in-flight nonces.
@@ -496,26 +731,25 @@ mod tests {
         assert_eq!(manager.peek(), 102);
     }
 
-    /// SingleAddressNonceManager: fail + sync via manager API.
+    /// SingleAddressNonceManager: release via manager API.
     #[test]
-    fn test_single_address_fail_and_sync() {
+    fn test_single_address_release_and_reuse() {
         let addr = Address::ZERO;
         let manager = SingleAddressNonceManager::new(addr, 100);
 
         let n = manager.get_nonce(); // 100
         assert_eq!(n, 100);
 
-        // Fail the nonce (simulates presign abort)
-        manager.fail(100);
-        assert_eq!(manager.peek(), 100); // reclaimed via CAS
+        manager.release(100);
+        assert_eq!(manager.peek(), 100);
 
         // Allocate again — should get 100 back
         assert_eq!(manager.get_nonce(), 100);
     }
 
-    /// NonceManager: sync_nonce recovers from desync.
+    /// NonceManager: release_nonce recycles middle gaps.
     #[test]
-    fn test_nonce_manager_sync_after_fail() {
+    fn test_nonce_manager_release_recycles_middle_gap() {
         let manager = NonceManager::new();
         let addr = Address::ZERO;
 
@@ -523,15 +757,64 @@ mod tests {
         let _n0 = manager.get_nonce(addr); // 10
         let _n1 = manager.get_nonce(addr); // 11
 
-        // Fail nonce 10 (non-latest, flags sync)
-        manager.fail_nonce(addr, 10);
+        manager.release_nonce(addr, 10);
 
-        // Sync from chain — chain says 10 (both TXs failed)
-        manager.sync_nonce(addr, 10);
-        assert_eq!(manager.peek_nonce(addr), 10);
-
-        // Next allocation starts from 10 again
+        assert_eq!(manager.peek_nonce(addr), 12);
         assert_eq!(manager.get_nonce(addr), 10);
+    }
+
+    #[test]
+    fn test_init_nonce_does_not_rewind_existing_tracker() {
+        let manager = NonceManager::new();
+        let addr = Address::ZERO;
+
+        manager.init_nonce(addr, 10);
+        assert_eq!(manager.get_nonce(addr), 10);
+        manager.init_nonce(addr, 5);
+
+        assert_eq!(manager.peek_nonce(addr), 11);
+        assert_eq!(manager.get_nonce(addr), 11);
+    }
+
+    #[test]
+    fn test_concurrent_multi_lane_release_reuses_all_gaps() {
+        use std::collections::BTreeSet;
+        use std::sync::Mutex as StdMutex;
+        use std::thread;
+
+        let tracker = Arc::new(NonceTracker::new(0));
+        let released = Arc::new(StdMutex::new(BTreeSet::new()));
+        let mut handles = Vec::new();
+
+        for _ in 0..100 {
+            let tracker = Arc::clone(&tracker);
+            let released = Arc::clone(&released);
+            handles.push(thread::spawn(move || {
+                let mut reservation = tracker.reserve();
+                let nonce = reservation.nonce();
+                if nonce % 2 == 0 {
+                    reservation.commit();
+                } else {
+                    reservation.release();
+                    released.lock().expect("released set lock").insert(nonce);
+                }
+            }));
+        }
+
+        for handle in handles {
+            handle.join().expect("lane thread should finish");
+        }
+
+        let expected = released.lock().expect("released set lock").clone();
+        let mut reused = BTreeSet::new();
+        for _ in 0..expected.len() {
+            let mut reservation = tracker.reserve();
+            reused.insert(reservation.nonce());
+            reservation.commit();
+        }
+
+        assert_eq!(reused, expected);
+        assert_eq!(tracker.gap_count(), 0);
     }
 
     #[test]

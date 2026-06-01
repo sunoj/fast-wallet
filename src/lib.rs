@@ -53,7 +53,7 @@ pub mod wallet;
 pub use broadcast::{BroadcastStrategy, BroadcasterBuilder, RpcEndpoint, TransactionBroadcaster};
 pub use error::{WalletError, WalletResult};
 pub use gas_provider::GasPriceProvider;
-pub use nonce::NonceManager;
+pub use nonce::{NonceManager, ReservedNonce};
 pub use rpc::SendResult;
 pub use signer::FastSigner;
 pub use transaction::{Transaction, TransactionRequest, TypedTransaction};
