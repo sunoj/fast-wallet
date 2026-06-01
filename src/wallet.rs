@@ -691,6 +691,19 @@ impl FastWallet {
         ctx.release_reservation();
     }
 
+    /// Mark a preheated context as entering broadcast (Held -> Broadcasting)
+    /// for sign-now-broadcast-later flows where the context is dropped before
+    /// the send completes. A `Broadcasting` reservation's `Drop` is a no-op
+    /// (left for chain sync), so dropping the context will NOT release a nonce
+    /// that is bound to a signed, soon-to-be-broadcast transaction — while a
+    /// caller that later abandons the lane still reclaims it explicitly via
+    /// `release_nonce`. This preserves the pre-v0.1.31 (no-RAII) lifecycle for
+    /// callers that own nonce reclaim themselves. Returns Err if the
+    /// reservation was already finalized.
+    pub fn mark_preheat_broadcasting(&self, ctx: &PreheatedContext) -> WalletResult<()> {
+        ctx.mark_broadcasting()
+    }
+
     /// Commit a preheated context after an externally managed broadcast succeeds.
     pub fn commit_preheat(&self, ctx: &PreheatedContext) {
         ctx.commit_reservation();
