@@ -73,6 +73,16 @@ impl NonceTracker {
         self.current.load(Ordering::Acquire)
     }
 
+    /// Get the next nonce that would be reserved, including recycled gaps.
+    #[inline]
+    pub fn effective_next_nonce(&self) -> u64 {
+        self.gaps
+            .lock()
+            .first()
+            .copied()
+            .unwrap_or_else(|| self.current.load(Ordering::Acquire))
+    }
+
     /// Get the number of pending transactions
     #[inline]
     pub fn pending_count(&self) -> u64 {
@@ -363,6 +373,12 @@ impl NonceManager {
         self.get_tracker(address).peek()
     }
 
+    /// Get the next nonce that would be reserved for an address.
+    #[inline]
+    pub fn effective_next_nonce(&self, address: Address) -> u64 {
+        self.get_tracker(address).effective_next_nonce()
+    }
+
     /// Confirm a transaction was included
     #[inline]
     pub fn confirm_nonce(&self, address: Address) {
@@ -452,6 +468,12 @@ impl SingleAddressNonceManager {
     #[inline]
     pub fn peek(&self) -> u64 {
         self.tracker.peek()
+    }
+
+    /// Get the next nonce that would be reserved, including recycled gaps.
+    #[inline]
+    pub fn effective_next_nonce(&self) -> u64 {
+        self.tracker.effective_next_nonce()
     }
 
     /// Confirm transaction
@@ -615,6 +637,34 @@ mod tests {
         assert_eq!(tracker.gap_count(), 1);
         assert_eq!(tracker.get_and_increment(), 10);
         assert_eq!(tracker.gap_count(), 0);
+    }
+
+    #[test]
+    fn test_effective_next_nonce_prefers_recycled_gap() {
+        let tracker = NonceTracker::new(26);
+
+        assert_eq!(tracker.get_and_increment(), 26);
+        assert_eq!(tracker.get_and_increment(), 27);
+        assert_eq!(tracker.get_and_increment(), 28);
+
+        tracker.release(26);
+        tracker.release(27);
+
+        assert_eq!(tracker.peek(), 29);
+        assert_eq!(tracker.gap_count(), 2);
+        assert_eq!(tracker.effective_next_nonce(), 26);
+    }
+
+    #[test]
+    fn test_effective_next_nonce_uses_current_without_gaps() {
+        let tracker = NonceTracker::new(26);
+
+        assert_eq!(tracker.get_and_increment(), 26);
+        assert_eq!(tracker.get_and_increment(), 27);
+
+        assert_eq!(tracker.gap_count(), 0);
+        assert_eq!(tracker.effective_next_nonce(), tracker.peek());
+        assert_eq!(tracker.effective_next_nonce(), 28);
     }
 
     #[test]
