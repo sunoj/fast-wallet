@@ -1866,14 +1866,14 @@ mod tests {
     }
 
     async fn rpc_error_server() -> String {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             let mut buf = [0u8; 4096];
-            let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await.unwrap();
+            let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf)
+                .await
+                .unwrap();
             let body = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"rebroadcast rejected"}}"#;
             let response = format!(
                 "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
@@ -2077,7 +2077,9 @@ mod tests {
         let nonce = wallet.nonce_manager.get_nonce();
         let result = wallet.release_on_sign_error(
             nonce,
-            Err(WalletError::SigningError("forced signing error".to_string())),
+            Err(WalletError::SigningError(
+                "forced signing error".to_string(),
+            )),
         );
 
         assert!(result.is_err());

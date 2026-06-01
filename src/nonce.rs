@@ -213,11 +213,11 @@ impl NonceTracker {
     }
 
     fn decrement_pending(&self) {
-        let _ = self.pending_count.fetch_update(
-            Ordering::AcqRel,
-            Ordering::Acquire,
-            |pending| pending.checked_sub(1),
-        );
+        let _ = self
+            .pending_count
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
+                pending.checked_sub(1)
+            });
     }
 }
 
