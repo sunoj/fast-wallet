@@ -9,7 +9,7 @@
 
 use crate::error::{WalletError, WalletResult};
 use crate::gas_provider::GasPriceProvider;
-use crate::nonce::SingleAddressNonceManager;
+use crate::nonce::{ReservedNonce, SingleAddressNonceManager};
 use crate::rpc::{BatchRpcClient, RpcClient, SendResult};
 use crate::signer::FastSigner;
 use crate::transaction::{Transaction, TransactionRequest};
@@ -175,10 +175,13 @@ pub struct PreheatedContext {
     pub preheated_at: Instant,
     /// Whether this context has been used
     used: AtomicBool,
+    /// RAII nonce reservation backing this preheat.
+    reservation: parking_lot::Mutex<Option<ReservedNonce>>,
 }
 
 impl PreheatedContext {
-    fn new(nonce: u64) -> Self {
+    fn new(reservation: ReservedNonce) -> Self {
+        let nonce = reservation.nonce();
         Self {
             nonce,
             gas_price: None,
@@ -186,6 +189,7 @@ impl PreheatedContext {
             max_fee: None,
             preheated_at: Instant::now(),
             used: AtomicBool::new(false),
+            reservation: parking_lot::Mutex::new(Some(reservation)),
         }
     }
 
@@ -204,6 +208,38 @@ impl PreheatedContext {
     /// Get age of this context
     pub fn age(&self) -> Duration {
         self.preheated_at.elapsed()
+    }
+
+    fn mark_broadcasting(&self) -> WalletResult<()> {
+        let mut reservation = self.reservation.lock();
+        let Some(reservation) = reservation.as_mut() else {
+            return Err(WalletError::NonceError(
+                "PreheatedContext reservation already finalized".to_string(),
+            ));
+        };
+        if reservation.mark_broadcasting() {
+            Ok(())
+        } else {
+            Err(WalletError::NonceError(
+                "PreheatedContext reservation already finalized".to_string(),
+            ))
+        }
+    }
+
+    fn commit_reservation(&self) {
+        self.used.store(true, Ordering::Release);
+        let mut reservation = self.reservation.lock();
+        if let Some(mut reservation) = reservation.take() {
+            reservation.commit();
+        }
+    }
+
+    fn release_reservation(&self) {
+        self.used.store(true, Ordering::Release);
+        let mut reservation = self.reservation.lock();
+        if let Some(mut reservation) = reservation.take() {
+            reservation.release();
+        }
     }
 }
 
@@ -528,18 +564,16 @@ impl FastWallet {
     /// A `PreheatedContext` that can be used to sign a transaction later.
     ///
     /// # Warning
-    /// The allocated nonce will be "wasted" if you don't use it. Only call this
-    /// when you're fairly confident a transaction will be sent.
+    /// Dropping an unused context releases its nonce. After signing, callers
+    /// must commit or release the context based on broadcast acceptance.
     pub async fn preheat(&self, fetch_gas: bool) -> WalletResult<PreheatedContext> {
         let total_start = Instant::now();
-        if self.nonce_manager.needs_sync() {
-            let _ = self.sync_nonce_latest().await;
-        }
 
         let nonce_start = Instant::now();
-        let nonce = self.nonce_manager.get_nonce();
+        let reservation = self.nonce_manager.reserve();
+        let nonce = reservation.nonce();
         let nonce_ms = nonce_start.elapsed().as_millis();
-        let mut ctx = PreheatedContext::new(nonce);
+        let mut ctx = PreheatedContext::new(reservation);
 
         if fetch_gas {
             let gas_cached = self.read_gas_cache(&self.gas_price_cache).is_some();
@@ -602,8 +636,8 @@ impl FastWallet {
 
         // Allocate all nonces first (lock-free, very fast)
         for _ in 0..count {
-            let nonce = self.nonce_manager.get_nonce();
-            contexts.push(PreheatedContext::new(nonce));
+            let reservation = self.nonce_manager.reserve();
+            contexts.push(PreheatedContext::new(reservation));
         }
 
         // Fetch gas once if needed
@@ -633,10 +667,17 @@ impl FastWallet {
     ///
     /// Call this if you preheated but decided not to send the transaction.
     pub fn cancel_preheat(&self, ctx: PreheatedContext) {
-        if ctx.mark_used() {
-            // Mark the nonce as failed so it can be reused
-            self.nonce_manager.fail(ctx.nonce);
-        }
+        ctx.release_reservation();
+    }
+
+    /// Commit a preheated context after an externally managed broadcast succeeds.
+    pub fn commit_preheat(&self, ctx: &PreheatedContext) {
+        ctx.commit_reservation();
+    }
+
+    /// Release a preheated context after signing but before broadcast acceptance.
+    pub fn release_preheat(&self, ctx: &PreheatedContext) {
+        ctx.release_reservation();
     }
 
     // ==================== Connection Warmup ====================
@@ -882,14 +923,15 @@ impl FastWallet {
     #[inline]
     pub fn sign(&self, mut request: TransactionRequest) -> WalletResult<Transaction> {
         // Auto-assign nonce
-        request.nonce = self.nonce_manager.get_nonce();
+        let nonce = self.nonce_manager.get_nonce();
+        request.nonce = nonce;
         request.chain_id = self.config.chain_id;
 
         if request.gas_limit == 0 {
             request.gas_limit = self.config.default_gas_limit;
         }
 
-        request.build_and_sign(&self.signer)
+        self.release_on_sign_error(nonce, request.build_and_sign(&self.signer))
     }
 
     /// Sign a transaction with explicit nonce (does NOT increment internal counter)
@@ -932,21 +974,21 @@ impl FastWallet {
             .collect()
     }
 
-    /// Reserve a nonce for later use
+    /// Reserve a nonce for later use with RAII release on drop.
     ///
-    /// Increments the internal counter and returns the nonce.
+    /// Increments the internal counter and returns a guard.
     /// Use with `sign_with_nonce()` to sign a transaction later.
     #[inline]
-    pub fn reserve_nonce(&self) -> u64 {
-        self.nonce_manager.get_nonce()
+    pub fn reserve_nonce(&self) -> ReservedNonce {
+        self.nonce_manager.reserve()
     }
 
-    /// Release a reserved nonce (mark as failed)
+    /// Release a reserved nonce number back to the recycling pool.
     ///
     /// Call this if you reserved a nonce but decided not to use it.
     #[inline]
     pub fn release_nonce(&self, nonce: u64) {
-        self.nonce_manager.fail(nonce);
+        self.nonce_manager.release(nonce);
     }
 
     // ==================== Transaction Signing ====================
@@ -991,7 +1033,11 @@ impl FastWallet {
             request.gas_limit = self.config.default_gas_limit;
         }
 
-        request.build_and_sign(&self.signer)
+        let result = request.build_and_sign(&self.signer);
+        if result.is_err() {
+            ctx.release_reservation();
+        }
+        result
     }
 
     /// Sign an EIP-1559 transaction
@@ -1005,6 +1051,7 @@ impl FastWallet {
         max_fee_per_gas: U256,
         max_priority_fee_per_gas: U256,
     ) -> WalletResult<Transaction> {
+        let nonce = self.nonce_manager.get_nonce();
         let request = TransactionRequest::new()
             .to(to)
             .value(value)
@@ -1012,10 +1059,10 @@ impl FastWallet {
             .gas_limit(gas_limit)
             .max_fee_per_gas(max_fee_per_gas)
             .max_priority_fee_per_gas(max_priority_fee_per_gas)
-            .nonce(self.nonce_manager.get_nonce())
+            .nonce(nonce)
             .chain_id(self.config.chain_id);
 
-        request.build_and_sign(&self.signer)
+        self.release_on_sign_error(nonce, request.build_and_sign(&self.signer))
     }
 
     /// Sign a legacy transaction
@@ -1028,25 +1075,33 @@ impl FastWallet {
         gas_limit: u64,
         gas_price: U256,
     ) -> WalletResult<Transaction> {
+        let nonce = self.nonce_manager.get_nonce();
         let request = TransactionRequest::new()
             .to(to)
             .value(value)
             .data(data)
             .gas_limit(gas_limit)
             .gas_price(gas_price)
-            .nonce(self.nonce_manager.get_nonce())
+            .nonce(nonce)
             .chain_id(self.config.chain_id);
 
-        request.build_and_sign(&self.signer)
+        self.release_on_sign_error(nonce, request.build_and_sign(&self.signer))
     }
 
     // ==================== Transaction Sending ====================
 
-    /// Send a pre-signed transaction
-    ///
-    /// Uses a timeout when acquiring the pending transaction permit to avoid
-    /// blocking indefinitely when many transactions are in-flight.
-    pub async fn send_signed(&self, tx: &Transaction) -> WalletResult<B256> {
+    fn release_on_sign_error(
+        &self,
+        nonce: u64,
+        result: WalletResult<Transaction>,
+    ) -> WalletResult<Transaction> {
+        if result.is_err() {
+            self.nonce_manager.release(nonce);
+        }
+        result
+    }
+
+    async fn broadcast_signed_hash(&self, tx: &Transaction) -> WalletResult<B256> {
         let _permit = tokio::time::timeout(
             self.config.pending_acquire_timeout,
             self.pending_semaphore.acquire(),
@@ -1056,46 +1111,14 @@ impl FastWallet {
         .map_err(|_| WalletError::RpcError("Semaphore closed".to_string()))?;
 
         let hex_tx = tx.to_hex();
-
-        // If we have multiple RPC endpoints, broadcast to all
-        let result = if let Some(batch_client) = &self.batch_client {
+        if let Some(batch_client) = &self.batch_client {
             batch_client.broadcast_transaction(&hex_tx).await
         } else {
             self.rpc_client.send_raw_transaction(&hex_tx).await
-        };
-
-        match &result {
-            Ok(_) => {
-                // Transaction accepted
-            }
-            Err(e) => {
-                // Mark nonce as failed
-                self.nonce_manager.fail(tx.nonce());
-
-                // Nonce-drift recovery. Both "too low" (we replayed an already-mined
-                // nonce) and "too high" (local counter skipped ahead of chain) indicate
-                // the local tracker has diverged from the chain, so force an RPC resync.
-                //
-                // The sync target differs: Nitro / geth tx_pre_checker compares
-                // tx.nonce against stateNonce (the `latest` tag) when emitting
-                // "nonce too high", so sync from `latest` — syncing from `pending`
-                // can leave the tracker above state when a dangling mempool tx sits
-                // at the gap nonce. For "nonce too low" we want `pending` because
-                // the chain has moved ahead (mempool/just-mined txs count).
-                let err_str = e.to_string().to_lowercase();
-                if err_str.contains("nonce too high") {
-                    let _ = self.sync_nonce_latest().await;
-                } else if err_str.contains("nonce too low") {
-                    let _ = self.sync_nonce().await;
-                }
-            }
         }
-
-        result
     }
 
-    /// Send a pre-signed transaction and return broadcast timing details.
-    pub async fn send_signed_detailed(
+    async fn broadcast_signed_result(
         &self,
         tx: &Transaction,
         sign_ms: f64,
@@ -1111,26 +1134,11 @@ impl FastWallet {
         let semaphore_wait_ms = semaphore_started.elapsed().as_millis() as u64;
 
         let hex_tx = tx.to_hex();
-
         let result = if let Some(batch_client) = &self.batch_client {
             batch_client.broadcast_transaction_detailed(&hex_tx).await
         } else {
             self.rpc_client.send_raw_transaction_detailed(&hex_tx).await
         };
-
-        match &result {
-            Ok(_) => {}
-            Err(e) => {
-                self.nonce_manager.fail(tx.nonce());
-
-                let err_str = e.to_string().to_lowercase();
-                if err_str.contains("nonce too high") {
-                    let _ = self.sync_nonce_latest().await;
-                } else if err_str.contains("nonce too low") {
-                    let _ = self.sync_nonce().await;
-                }
-            }
-        }
 
         result.map(|mut send_result| {
             send_result.sign_ms = sign_ms;
@@ -1139,9 +1147,70 @@ impl FastWallet {
         })
     }
 
+    async fn recover_nonce_error(&self, error: &WalletError) {
+        let err_str = error.to_string().to_lowercase();
+        if err_str.contains("nonce too high") {
+            let _ = self.sync_nonce_latest().await;
+        } else if err_str.contains("nonce too low") {
+            let _ = self.sync_nonce().await;
+        }
+    }
+
+    /// Send a pre-signed transaction
+    ///
+    /// Uses a timeout when acquiring the pending transaction permit to avoid
+    /// blocking indefinitely when many transactions are in-flight.
+    pub async fn send_signed(&self, tx: &Transaction) -> WalletResult<B256> {
+        let result = self.broadcast_signed_hash(tx).await;
+
+        match &result {
+            Ok(_) => {
+                // Transaction accepted
+            }
+            Err(e) => {
+                // Release nonce for reuse
+                self.nonce_manager.release(tx.nonce());
+
+                // Nonce-drift recovery. Both "too low" (we replayed an already-mined
+                // nonce) and "too high" (local counter skipped ahead of chain) indicate
+                // the local tracker has diverged from the chain, so force an RPC resync.
+                //
+                // The sync target differs: Nitro / geth tx_pre_checker compares
+                // tx.nonce against stateNonce (the `latest` tag) when emitting
+                // "nonce too high", so sync from `latest` — syncing from `pending`
+                // can leave the tracker above state when a dangling mempool tx sits
+                // at the gap nonce. For "nonce too low" we want `pending` because
+                // the chain has moved ahead (mempool/just-mined txs count).
+                self.recover_nonce_error(e).await;
+            }
+        }
+
+        result
+    }
+
+    /// Send a pre-signed transaction and return broadcast timing details.
+    pub async fn send_signed_detailed(
+        &self,
+        tx: &Transaction,
+        sign_ms: f64,
+    ) -> WalletResult<SendResult> {
+        let result = self.broadcast_signed_result(tx, sign_ms).await;
+
+        match &result {
+            Ok(_) => {}
+            Err(e) => {
+                self.nonce_manager.release(tx.nonce());
+                self.recover_nonce_error(e).await;
+            }
+        }
+
+        result
+    }
+
     /// Verify a broadcast TX is visible in the mempool/chain.
     /// Polls eth_getTransactionByHash for up to `max_wait`. If not found, re-broadcasts.
-    /// Returns Ok(true) if verified in mempool, Ok(false) if re-broadcast was attempted.
+    /// Returns Ok(true) if verified in mempool, Ok(false) if re-broadcast was accepted.
+    /// Releases the nonce and returns the rebroadcast error if the TX cannot be found or resent.
     pub async fn verify_broadcast(
         &self,
         tx: &Transaction,
@@ -1166,17 +1235,18 @@ impl FastWallet {
             "TX not in mempool after verification window, re-broadcasting"
         );
         let hex_tx = tx.to_hex();
-        if let Some(batch_client) = &self.batch_client {
-            match batch_client.broadcast_transaction(&hex_tx).await {
-                Ok(_) => tracing::info!(%tx_hash, "re-broadcast succeeded"),
-                Err(e) => tracing::warn!(%tx_hash, error = %e, "re-broadcast failed"),
-            }
+        let result = if let Some(batch_client) = &self.batch_client {
+            batch_client.broadcast_transaction(&hex_tx).await
         } else {
-            match self.rpc_client.send_raw_transaction(&hex_tx).await {
-                Ok(_) => tracing::info!(%tx_hash, "re-broadcast succeeded (single RPC)"),
-                Err(e) => tracing::warn!(%tx_hash, error = %e, "re-broadcast failed (single RPC)"),
-            }
-        }
+            self.rpc_client.send_raw_transaction(&hex_tx).await
+        };
+
+        if let Err(error) = result {
+            tracing::warn!(%tx_hash, error = %error, "re-broadcast failed; releasing nonce");
+            self.nonce_manager.release(tx.nonce());
+            return Err(error);
+        };
+        tracing::info!(%tx_hash, "re-broadcast succeeded");
         Ok(false)
     }
 
@@ -1204,7 +1274,16 @@ impl FastWallet {
         request: TransactionRequest,
     ) -> WalletResult<B256> {
         let tx = self.sign_with_preheat(ctx, request)?;
-        self.send_signed(&tx).await
+        ctx.mark_broadcasting()?;
+        let result = self.broadcast_signed_hash(&tx).await;
+        match &result {
+            Ok(_) => ctx.commit_reservation(),
+            Err(error) => {
+                ctx.release_reservation();
+                self.recover_nonce_error(error).await;
+            }
+        }
+        result
     }
 
     /// Sign and send using preheated context with timing details.
@@ -1216,7 +1295,16 @@ impl FastWallet {
         let sign_start = Instant::now();
         let tx = self.sign_with_preheat(ctx, request)?;
         let sign_ms = sign_start.elapsed().as_secs_f64() * 1000.0;
-        self.send_signed_detailed(&tx, sign_ms).await
+        ctx.mark_broadcasting()?;
+        let result = self.broadcast_signed_result(&tx, sign_ms).await;
+        match &result {
+            Ok(_) => ctx.commit_reservation(),
+            Err(error) => {
+                ctx.release_reservation();
+                self.recover_nonce_error(error).await;
+            }
+        }
+        result
     }
 
     // ========================================================================
@@ -1311,7 +1399,16 @@ impl FastWallet {
             .gas_price(gas_price);
 
         let tx = self.sign_with_preheat(ctx, request)?;
-        self.send_signed(&tx).await
+        ctx.mark_broadcasting()?;
+        let result = self.broadcast_signed_hash(&tx).await;
+        match &result {
+            Ok(_) => ctx.commit_reservation(),
+            Err(error) => {
+                ctx.release_reservation();
+                self.recover_nonce_error(error).await;
+            }
+        }
+        result
     }
 
     /// Quick liquidation with minimal parameters (uses config defaults)
@@ -1733,6 +1830,36 @@ mod tests {
     const TEST_PRIVATE_KEY: &str =
         "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
 
+    fn test_request() -> TransactionRequest {
+        TransactionRequest::new()
+            .to(Address::repeat_byte(1))
+            .value(U256::from(1_000_000_000_000_000_000u64))
+            .gas_limit(21000)
+            .gas_price(U256::from(20_000_000_000u64))
+    }
+
+    async fn rpc_error_server() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await.unwrap();
+            let body = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"rebroadcast rejected"}}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes())
+                .await
+                .unwrap();
+        });
+        format!("http://{addr}")
+    }
+
     #[test]
     fn test_wallet_builder_sync() {
         let wallet = FastWalletBuilder::new(TEST_PRIVATE_KEY, "http://localhost:8545")
@@ -1853,7 +1980,7 @@ mod tests {
             .unwrap();
 
         // Create preheated context (without gas fetch since no RPC)
-        let ctx = PreheatedContext::new(wallet.nonce_manager.get_nonce());
+        let ctx = PreheatedContext::new(wallet.nonce_manager.reserve());
         assert_eq!(ctx.nonce, 100);
         assert!(ctx.is_valid(Duration::from_secs(60)));
 
@@ -1866,6 +1993,7 @@ mod tests {
 
         let tx = wallet.sign_with_preheat(&ctx, request).unwrap();
         assert_eq!(tx.nonce(), 100);
+        wallet.commit_preheat(&ctx);
 
         // Context should be marked as used
         assert!(!ctx.is_valid(Duration::from_secs(60)));
@@ -1878,7 +2006,7 @@ mod tests {
             .build_with_nonce(50)
             .unwrap();
 
-        let ctx = PreheatedContext::new(wallet.nonce_manager.get_nonce());
+        let ctx = PreheatedContext::new(wallet.nonce_manager.reserve());
 
         let request = TransactionRequest::new()
             .to(Address::repeat_byte(1))
@@ -1887,10 +2015,65 @@ mod tests {
 
         // First use should succeed
         let _ = wallet.sign_with_preheat(&ctx, request.clone()).unwrap();
+        wallet.commit_preheat(&ctx);
 
         // Second use should fail
         let result = wallet.sign_with_preheat(&ctx, request);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_signed_but_never_broadcast_preheat_releases_on_drop() {
+        let wallet = FastWalletBuilder::new(TEST_PRIVATE_KEY, "http://localhost:8545")
+            .chain_id(1)
+            .build_with_nonce(100)
+            .unwrap();
+
+        {
+            let ctx = PreheatedContext::new(wallet.nonce_manager.reserve());
+            let tx = wallet.sign_with_preheat(&ctx, test_request()).unwrap();
+            assert_eq!(tx.nonce(), 100);
+            assert_eq!(wallet.current_nonce(), 101);
+        }
+
+        assert_eq!(wallet.current_nonce(), 100);
+        assert_eq!(wallet.sign(test_request()).unwrap().nonce(), 100);
+    }
+
+    #[test]
+    fn test_auto_sign_error_releases_allocated_nonce() {
+        let wallet = FastWalletBuilder::new(TEST_PRIVATE_KEY, "http://localhost:8545")
+            .chain_id(1)
+            .build_with_nonce(0)
+            .unwrap();
+
+        let nonce = wallet.nonce_manager.get_nonce();
+        let result = wallet.release_on_sign_error(
+            nonce,
+            Err(WalletError::SigningError("forced signing error".to_string())),
+        );
+
+        assert!(result.is_err());
+        assert_eq!(wallet.sign(test_request()).unwrap().nonce(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_verify_broadcast_rebroadcast_failure_releases_nonce() {
+        let url = rpc_error_server().await;
+        let wallet = FastWalletBuilder::new(TEST_PRIVATE_KEY, &url)
+            .chain_id(1)
+            .build_with_nonce(0)
+            .unwrap();
+        let ctx = PreheatedContext::new(wallet.nonce_manager.reserve());
+        let tx = wallet.sign_with_preheat(&ctx, test_request()).unwrap();
+        wallet.commit_preheat(&ctx);
+
+        let result = wallet
+            .verify_broadcast(&tx, tx.hash(), Duration::ZERO)
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(wallet.sign(test_request()).unwrap().nonce(), 0);
     }
 
     #[test]

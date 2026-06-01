@@ -1,1 +1,6 @@
 /target
+
+# aid work artifacts
+.aid-lock
+.aid-verify-deps-state
+.aid-*
