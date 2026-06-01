@@ -282,6 +282,21 @@ impl std::fmt::Display for WalletStatus {
     }
 }
 
+/// Nonce health state returned by `nonce_health_check()`
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NonceHealth {
+    /// Local high-water nonce.
+    pub current: u64,
+    /// Next nonce that would be reserved, including recycled gaps.
+    pub effective_next: u64,
+    /// Next nonce reported by the chain.
+    pub chain_next: u64,
+    /// Number of recycled gaps available for reuse.
+    pub gap_count: u64,
+    /// Whether effective next nonce is far ahead of chain.
+    pub stalled: bool,
+}
+
 /// High-performance EVM wallet optimized for liquidation bots
 ///
 /// # Features
@@ -392,6 +407,12 @@ impl FastWallet {
     #[inline]
     pub fn current_nonce(&self) -> u64 {
         self.nonce_manager.peek()
+    }
+
+    /// Get the next nonce that would be reserved, including recycled gaps
+    #[inline]
+    pub fn effective_next_nonce(&self) -> u64 {
+        self.nonce_manager.effective_next_nonce()
     }
 
     /// Get pending transaction count
@@ -1250,15 +1271,21 @@ impl FastWallet {
         Ok(false)
     }
 
-    /// Compare local nonce with on-chain nonce.
-    /// Returns (local_nonce, chain_nonce, is_stalled).
-    /// Stalled = local is more than `threshold` ahead of chain for too long.
-    pub async fn nonce_health_check(&self) -> WalletResult<(u64, u64, bool)> {
-        let local = self.current_nonce();
-        let chain = self.rpc_client.get_nonce(self.address()).await?;
+    /// Compare local effective next nonce with on-chain nonce.
+    pub async fn nonce_health_check(&self) -> WalletResult<NonceHealth> {
+        let current = self.current_nonce();
+        let effective_next = self.effective_next_nonce();
+        let chain_next = self.rpc_client.get_nonce(self.address()).await?;
+        let gap_count = self.nonce_manager.gap_count();
         // If local is >2 ahead of chain, nonces are stuck in-flight
-        let stalled = local > chain + 2;
-        Ok((local, chain, stalled))
+        let stalled = effective_next > chain_next + 2;
+        Ok(NonceHealth {
+            current,
+            effective_next,
+            chain_next,
+            gap_count,
+            stalled,
+        })
     }
 
     /// Sign and send a transaction in one call
