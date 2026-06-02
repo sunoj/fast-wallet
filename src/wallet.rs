@@ -421,6 +421,20 @@ impl FastWallet {
         self.nonce_manager.pending_count()
     }
 
+    /// Recover a stranded-nonce stall by rewinding the local nonce to
+    /// `chain_nonce`, but only when nothing is in flight (`pending_count == 0`)
+    /// and the chain is behind local. See [`NonceTracker::recover_stalled`].
+    /// Returns true if it rewound.
+    ///
+    /// Intended for a health-check task that has observed a sustained stall
+    /// (`nonce_health_check().stalled` with `pending_count() == 0` across
+    /// several checks). The `pending_count == 0` gate makes it safe to call;
+    /// the sustained-stall precondition avoids clobbering a slow-to-mine tx.
+    #[inline]
+    pub fn recover_stalled(&self, chain_nonce: u64) -> bool {
+        self.nonce_manager.recover_stalled(chain_nonce)
+    }
+
     /// Get RPC client reference
     pub fn rpc(&self) -> &RpcClient {
         &self.rpc_client

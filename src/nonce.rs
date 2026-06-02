@@ -148,6 +148,42 @@ impl NonceTracker {
         }
     }
 
+    /// Force-rewind `current` back to `chain_nonce` and drop recycled gaps to
+    /// recover from a stranded-nonce stall. Returns true if it rewound (only
+    /// when `chain_nonce < current`).
+    ///
+    /// This is the escape hatch `sync_forward` cannot provide. A reservation
+    /// whose tx never mined and was never recycled leaves `current` ahead of
+    /// chain; because `sync_forward` is forward-only, every later reservation
+    /// then hands out a future nonce the sequencer drops — a permanent stall
+    /// only a restart used to clear.
+    ///
+    /// SAFETY — this is a deliberate rewind and is NOT gated on `pending_count`
+    /// (which is unreliable under callers that use the
+    /// `reserve` + `mark_broadcasting` + manual-release idiom). The CALLER is
+    /// responsible for proving no signed tx is genuinely in flight before
+    /// calling — the canonical proof is an on-chain `eth_getTransactionCount`
+    /// where `pending == latest` for this wallet, observed across K consecutive
+    /// checks. The CAS aborts if a concurrent `reserve()` advances `current`.
+    pub fn recover_stalled(&self, chain_nonce: u64) -> bool {
+        let mut gaps = self.gaps.lock();
+        let current = self.current.load(Ordering::Acquire);
+        if chain_nonce >= current {
+            return false;
+        }
+        if self
+            .current
+            .compare_exchange(current, chain_nonce, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return false;
+        }
+        gaps.clear();
+        self.gap_count.store(0, Ordering::Release);
+        self.synced_nonce.store(chain_nonce, Ordering::Release);
+        true
+    }
+
     #[inline(always)]
     fn reserve_next_nonce(&self) -> u64 {
         if self.gap_count.load(Ordering::Relaxed) > 0 {
@@ -403,6 +439,13 @@ impl NonceManager {
         }
     }
 
+    /// Recover a stranded-nonce stall for an address by rewinding to
+    /// `chain_nonce`, only when `pending_count == 0` and the chain is behind
+    /// local. See [`NonceTracker::recover_stalled`]. Returns true if it rewound.
+    pub fn recover_stalled(&self, address: Address, chain_nonce: u64) -> bool {
+        self.get_tracker(address).recover_stalled(chain_nonce)
+    }
+
     /// Wait for sync notification
     pub async fn wait_for_sync(&self) {
         self.sync_notify.notified().await;
@@ -496,6 +539,14 @@ impl SingleAddressNonceManager {
     #[inline]
     pub fn sync(&self, chain_nonce: u64) {
         self.tracker.sync_forward(chain_nonce);
+    }
+
+    /// Recover a stranded-nonce stall by rewinding to `chain_nonce`, only when
+    /// `pending_count == 0` and the chain is behind local. See
+    /// [`NonceTracker::recover_stalled`]. Returns true if it rewound.
+    #[inline]
+    pub fn recover_stalled(&self, chain_nonce: u64) -> bool {
+        self.tracker.recover_stalled(chain_nonce)
     }
 
     /// Get pending count
@@ -690,6 +741,58 @@ mod tests {
         assert_eq!(tracker.peek(), 11);
         assert_eq!(tracker.get_and_increment(), 11);
         assert_eq!(tracker.pending_count(), 2);
+    }
+
+    /// Reproduce the production stall: committed txs (RPC-accepted) that never
+    /// mine leave `current` ahead of chain. `sync_forward` is forward-only and
+    /// cannot heal it; `recover_stalled` rewinds to the chain nonce so the lane
+    /// resumes issuing valid nonces.
+    #[test]
+    fn test_recover_stalled_heals_committed_never_mined() {
+        let tracker = Arc::new(NonceTracker::new(100));
+
+        let mut r0 = tracker.reserve();
+        assert!(r0.commit()); // nonce 100 "accepted" by RPC
+        let mut r1 = tracker.reserve();
+        assert!(r1.commit()); // nonce 101 "accepted" by RPC
+        assert_eq!(tracker.peek(), 102);
+
+        // Chain never mined 100/101 — forward-sync is a no-op (stuck stall).
+        assert!(!tracker.sync_forward(100));
+        assert_eq!(tracker.peek(), 102);
+
+        // Recovery rewinds to the chain nonce.
+        assert!(tracker.recover_stalled(100));
+        assert_eq!(tracker.peek(), 100);
+        assert_eq!(tracker.synced_nonce(), 100);
+        assert_eq!(tracker.get_and_increment(), 100);
+    }
+
+    /// recover_stalled is a no-op when the chain is not behind local.
+    #[test]
+    fn test_recover_stalled_noop_when_chain_not_behind() {
+        let tracker = Arc::new(NonceTracker::new(100));
+        let mut r = tracker.reserve();
+        assert!(r.commit()); // current=101, pending=0
+        assert!(!tracker.recover_stalled(101)); // chain == current
+        assert!(!tracker.recover_stalled(105)); // chain ahead of current
+        assert_eq!(tracker.peek(), 101);
+    }
+
+    /// recover_stalled drops recycled gaps (meaningless after a rewind).
+    #[test]
+    fn test_recover_stalled_clears_gaps() {
+        let tracker = Arc::new(NonceTracker::new(100));
+        tracker.get_and_increment(); // 100, current=101
+        tracker.get_and_increment(); // 101, current=102
+        tracker.confirm();
+        tracker.confirm(); // pending=0
+        tracker.release(100); // recycle middle gap 100
+        assert_eq!(tracker.gap_count(), 1);
+
+        assert!(tracker.recover_stalled(100));
+        assert_eq!(tracker.gap_count(), 0);
+        assert_eq!(tracker.peek(), 100);
     }
 
     #[test]
