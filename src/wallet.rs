@@ -163,7 +163,10 @@ impl Default for WalletConfig {
 /// Use this when you know a transaction is likely coming but don't have all params yet.
 /// Call `wallet.preheat()` to get this context, then use it to sign when ready.
 pub struct PreheatedContext {
-    /// Pre-allocated nonce
+    /// Pre-allocated nonce. For warmup-only contexts (see
+    /// [`Wallet::preheat_warmup_only`]) this is [`u64::MAX`] until the nonce is
+    /// lazily reserved in [`Wallet::sign_with_preheat`]; do NOT read it as the
+    /// broadcast nonce — the bound value is sourced from `reservation`.
     pub nonce: u64,
     /// Cached gas price (if fetched)
     pub gas_price: Option<U256>,
@@ -175,7 +178,8 @@ pub struct PreheatedContext {
     pub preheated_at: Instant,
     /// Whether this context has been used
     used: AtomicBool,
-    /// RAII nonce reservation backing this preheat.
+    /// RAII nonce reservation backing this preheat. `None` for a warmup-only
+    /// context until `sign_with_preheat` reserves one at sign time.
     reservation: parking_lot::Mutex<Option<ReservedNonce>>,
 }
 
@@ -190,6 +194,23 @@ impl PreheatedContext {
             preheated_at: Instant::now(),
             used: AtomicBool::new(false),
             reservation: parking_lot::Mutex::new(Some(reservation)),
+        }
+    }
+
+    /// Build a warmup-only context with NO nonce reservation. The nonce is
+    /// reserved lazily in [`Wallet::sign_with_preheat`] so that broadcasts bind
+    /// nonces in send order rather than preheat order (avoids out-of-order
+    /// strands when many contexts are held concurrently across a long
+    /// pre-broadcast wait).
+    fn new_warmup_only() -> Self {
+        Self {
+            nonce: u64::MAX,
+            gas_price: None,
+            priority_fee: None,
+            max_fee: None,
+            preheated_at: Instant::now(),
+            used: AtomicBool::new(false),
+            reservation: parking_lot::Mutex::new(None),
         }
     }
 
@@ -812,6 +833,99 @@ impl FastWallet {
         Ok(ctx)
     }
 
+    /// Like [`preheat`](Self::preheat) but does NOT reserve a nonce. The nonce
+    /// is reserved lazily in [`sign_with_preheat`](Self::sign_with_preheat) at
+    /// sign time, so concurrently-held contexts bind nonces in broadcast order
+    /// rather than preheat order (avoids out-of-order strands). Still prefetches
+    /// gas when `fetch_gas` is set.
+    pub async fn preheat_warmup_only(&self, fetch_gas: bool) -> WalletResult<PreheatedContext> {
+        let total_start = Instant::now();
+        let mut ctx = PreheatedContext::new_warmup_only();
+
+        if fetch_gas {
+            let gas_cached = self.read_gas_cache(&self.gas_price_cache).is_some();
+            let priority_cached = self.read_gas_cache(&self.priority_fee_cache).is_some();
+            let gas = async {
+                let start = Instant::now();
+                let result = self.get_gas_price().await;
+                (start.elapsed().as_millis(), result)
+            };
+            let priority = async {
+                let start = Instant::now();
+                let result = self.get_priority_fee().await;
+                (start.elapsed().as_millis(), result)
+            };
+            // Fetch gas prices in parallel
+            let ((gas_ms, gas_price), (priority_fee_ms, priority_fee)) =
+                tokio::join!(gas, priority);
+
+            ctx.gas_price = gas_price.ok();
+            ctx.priority_fee = priority_fee.ok();
+
+            // Calculate max fee if we have both
+            if let (Some(base), Some(priority)) = (ctx.gas_price, ctx.priority_fee) {
+                // max_fee = base_fee * 2 + priority_fee (common strategy)
+                ctx.max_fee = Some(base + base + priority);
+            }
+            info!(
+                nonce_deferred = true,
+                gas_cached,
+                priority_cached,
+                gas_ms,
+                priority_fee_ms,
+                total_ms = total_start.elapsed().as_millis(),
+                gas_ready = ctx.gas_price.is_some(),
+                priority_fee_ready = ctx.priority_fee.is_some(),
+                "fast-wallet warmup-only preheat gas ready"
+            );
+        } else {
+            info!(
+                nonce_deferred = true,
+                total_ms = total_start.elapsed().as_millis(),
+                "fast-wallet warmup-only preheat ready"
+            );
+        }
+
+        Ok(ctx)
+    }
+
+    /// Like [`preheat_full`](Self::preheat_full) but defers the nonce
+    /// reservation to sign time (see [`preheat_warmup_only`](Self::preheat_warmup_only)).
+    pub async fn preheat_full_warmup_only(
+        &self,
+        fetch_gas: bool,
+    ) -> WalletResult<PreheatedContext> {
+        let total_start = Instant::now();
+        let warmup = async {
+            let start = Instant::now();
+            let result = self.warmup_connections().await;
+            (start.elapsed().as_millis(), result)
+        };
+        let context = async {
+            let start = Instant::now();
+            let result = self.preheat_warmup_only(fetch_gas).await;
+            (start.elapsed().as_millis(), result)
+        };
+
+        // Warm connections and (optionally) fetch gas in parallel.
+        let ((warmup_ms, (primary_ok, batch_count)), (context_ms, ctx)) =
+            tokio::join!(warmup, context);
+        let ctx = ctx?;
+        info!(
+            total_ms = total_start.elapsed().as_millis(),
+            warmup_ms,
+            context_ms,
+            primary_ok,
+            batch_count,
+            fetch_gas,
+            nonce_deferred = true,
+            gas_ready = ctx.gas_price.is_some(),
+            priority_fee_ready = ctx.priority_fee.is_some(),
+            "fast-wallet full warmup-only preheat complete"
+        );
+        Ok(ctx)
+    }
+
     // ==================== Nonce Management ====================
 
     /// Sync nonce from chain using the `pending` tag (includes mempool).
@@ -1055,7 +1169,21 @@ impl FastWallet {
             ));
         }
 
-        request.nonce = ctx.nonce;
+        // Source the nonce from the reservation, reserving lazily for a
+        // warmup-only context. This binds the nonce at sign time (broadcast
+        // order) rather than preheat order, so concurrently-held contexts that
+        // fire out of order do not strand a high nonce behind a lower gap.
+        let nonce = {
+            let mut reservation = ctx.reservation.lock();
+            if reservation.is_none() {
+                *reservation = Some(self.nonce_manager.reserve());
+            }
+            reservation
+                .as_ref()
+                .expect("reservation present after lazy reserve")
+                .nonce()
+        };
+        request.nonce = nonce;
         request.chain_id = self.config.chain_id;
 
         // Use preheated gas prices if not specified
@@ -2090,6 +2218,64 @@ mod tests {
             assert_eq!(wallet.current_nonce(), 101);
         }
 
+        assert_eq!(wallet.current_nonce(), 100);
+        assert_eq!(wallet.sign(test_request()).unwrap().nonce(), 100);
+    }
+
+    #[test]
+    fn test_warmup_only_reserves_nonce_at_sign() {
+        let wallet = FastWalletBuilder::new(TEST_PRIVATE_KEY, "http://localhost:8545")
+            .chain_id(1)
+            .build_with_nonce(100)
+            .unwrap();
+
+        // Warmup-only context holds NO reservation: nonce is the sentinel and
+        // the wallet counter has not advanced.
+        let ctx = PreheatedContext::new_warmup_only();
+        assert_eq!(ctx.nonce, u64::MAX);
+        assert_eq!(wallet.current_nonce(), 100);
+
+        // Signing reserves the nonce lazily, sourced from the reservation.
+        let tx = wallet.sign_with_preheat(&ctx, test_request()).unwrap();
+        assert_eq!(tx.nonce(), 100);
+        assert_eq!(wallet.current_nonce(), 101);
+        wallet.commit_preheat(&ctx);
+    }
+
+    #[test]
+    fn test_warmup_only_binds_nonce_in_sign_order_not_creation_order() {
+        let wallet = FastWalletBuilder::new(TEST_PRIVATE_KEY, "http://localhost:8545")
+            .chain_id(1)
+            .build_with_nonce(100)
+            .unwrap();
+
+        // Two warmup-only contexts created in order A then B...
+        let ctx_a = PreheatedContext::new_warmup_only();
+        let ctx_b = PreheatedContext::new_warmup_only();
+
+        // ...but signed B-first: B must get the lower nonce. This is the fix —
+        // eager preheat would have bound A=100, B=101 at creation, stranding
+        // B's tx behind A if A never broadcasts.
+        let tx_b = wallet.sign_with_preheat(&ctx_b, test_request()).unwrap();
+        let tx_a = wallet.sign_with_preheat(&ctx_a, test_request()).unwrap();
+        assert_eq!(tx_b.nonce(), 100);
+        assert_eq!(tx_a.nonce(), 101);
+        wallet.commit_preheat(&ctx_a);
+        wallet.commit_preheat(&ctx_b);
+    }
+
+    #[test]
+    fn test_warmup_only_unused_drop_consumes_no_nonce() {
+        let wallet = FastWalletBuilder::new(TEST_PRIVATE_KEY, "http://localhost:8545")
+            .chain_id(1)
+            .build_with_nonce(100)
+            .unwrap();
+
+        {
+            let ctx = PreheatedContext::new_warmup_only();
+            wallet.cancel_preheat(ctx); // never signed
+        }
+        // No reservation was ever taken, so the counter is untouched.
         assert_eq!(wallet.current_nonce(), 100);
         assert_eq!(wallet.sign(test_request()).unwrap().nonce(), 100);
     }
