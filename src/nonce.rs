@@ -440,8 +440,10 @@ impl NonceManager {
     }
 
     /// Recover a stranded-nonce stall for an address by rewinding to
-    /// `chain_nonce`, only when `pending_count == 0` and the chain is behind
-    /// local. See [`NonceTracker::recover_stalled`]. Returns true if it rewound.
+    /// `chain_nonce` when the chain is behind local. NOT gated on
+    /// `pending_count`; the caller must prove no tx is live at or above
+    /// `chain_nonce`. See [`NonceTracker::recover_stalled`]. Returns true if it
+    /// rewound.
     pub fn recover_stalled(&self, address: Address, chain_nonce: u64) -> bool {
         self.get_tracker(address).recover_stalled(chain_nonce)
     }
@@ -541,8 +543,9 @@ impl SingleAddressNonceManager {
         self.tracker.sync_forward(chain_nonce);
     }
 
-    /// Recover a stranded-nonce stall by rewinding to `chain_nonce`, only when
-    /// `pending_count == 0` and the chain is behind local. See
+    /// Recover a stranded-nonce stall by rewinding to `chain_nonce` when the
+    /// chain is behind local. NOT gated on `pending_count`; the caller must
+    /// prove no tx is live at or above `chain_nonce`. See
     /// [`NonceTracker::recover_stalled`]. Returns true if it rewound.
     #[inline]
     pub fn recover_stalled(&self, chain_nonce: u64) -> bool {

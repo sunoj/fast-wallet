@@ -458,14 +458,18 @@ impl FastWallet {
     }
 
     /// Recover a stranded-nonce stall by rewinding the local nonce to
-    /// `chain_nonce`, but only when nothing is in flight (`pending_count == 0`)
-    /// and the chain is behind local. See [`NonceTracker::recover_stalled`].
-    /// Returns true if it rewound.
+    /// `chain_nonce` when the chain is behind local. See
+    /// [`NonceTracker::recover_stalled`]. Returns true if it rewound.
     ///
-    /// Intended for a health-check task that has observed a sustained stall
-    /// (`nonce_health_check().stalled` with `pending_count() == 0` across
-    /// several checks). The `pending_count == 0` gate makes it safe to call;
-    /// the sustained-stall precondition avoids clobbering a slow-to-mine tx.
+    /// This is NOT internally gated on `pending_count` or any in-flight check —
+    /// it only verifies `chain_nonce < current`, then rewinds and clears gaps.
+    /// ALL safety proof is the CALLER's responsibility: before calling, the
+    /// caller must establish that no transaction is genuinely live at or above
+    /// `chain_nonce`. A sustained stall plus a single pending-nonce read is a
+    /// weak proof under multi-RPC/preconf propagation; prefer corroborating it
+    /// with a second chain view (pending == latest), the in-flight ledger
+    /// (`nonce_health_check().lowest_unresolved` aged out), and/or an
+    /// independent-RPC liveness probe of the stranded nonce's tx hashes.
     #[inline]
     pub fn recover_stalled(&self, chain_nonce: u64) -> bool {
         self.nonce_manager.recover_stalled(chain_nonce)
