@@ -9,6 +9,7 @@
 
 use crate::error::{WalletError, WalletResult};
 use crate::gas_provider::GasPriceProvider;
+use crate::inflight::{InflightNonceLedger, InflightNonceSnapshot};
 use crate::nonce::{ReservedNonce, SingleAddressNonceManager};
 use crate::rpc::{BatchRpcClient, RpcClient, SendResult};
 use crate::signer::FastSigner;
@@ -262,6 +263,10 @@ impl PreheatedContext {
             reservation.release();
         }
     }
+
+    fn reserved_nonce(&self) -> Option<u64> {
+        self.reservation.lock().as_ref().map(|nonce| nonce.nonce())
+    }
 }
 
 /// Wallet status returned by `self_check()`
@@ -304,7 +309,7 @@ impl std::fmt::Display for WalletStatus {
 }
 
 /// Nonce health state returned by `nonce_health_check()`
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NonceHealth {
     /// Local high-water nonce.
     pub current: u64,
@@ -312,8 +317,14 @@ pub struct NonceHealth {
     pub effective_next: u64,
     /// Next nonce reported by the chain.
     pub chain_next: u64,
+    /// Next nonce reported by latest state, excluding provider-local pending.
+    pub chain_latest: Option<u64>,
     /// Number of recycled gaps available for reuse.
     pub gap_count: u64,
+    /// Count of signed/broadcast nonces not released or mined in the local ledger.
+    pub inflight_count: usize,
+    /// Lowest unresolved local ledger entry at or above `chain_next`.
+    pub lowest_unresolved: Option<InflightNonceSnapshot>,
     /// Whether effective next nonce is far ahead of chain.
     pub stalled: bool,
 }
@@ -342,6 +353,8 @@ pub struct FastWallet {
     warmed_up: AtomicBool,
     /// Gas fetch serializer (double-checked locking for coalescing)
     gas_serializer: GasFetchSerializer,
+    /// Local per-nonce signed/broadcast ledger for recovery observability.
+    inflight_nonces: InflightNonceLedger,
 }
 
 impl FastWallet {
@@ -368,6 +381,7 @@ impl FastWallet {
             priority_fee_cache: RwLock::new(None),
             warmed_up: AtomicBool::new(false),
             gas_serializer: GasFetchSerializer::new(),
+            inflight_nonces: InflightNonceLedger::default(),
             config,
         })
     }
@@ -412,6 +426,7 @@ impl FastWallet {
             priority_fee_cache: RwLock::new(None),
             warmed_up: AtomicBool::new(false),
             gas_serializer: GasFetchSerializer::new(),
+            inflight_nonces: InflightNonceLedger::default(),
             config,
         })
     }
@@ -741,11 +756,17 @@ impl FastWallet {
 
     /// Commit a preheated context after an externally managed broadcast succeeds.
     pub fn commit_preheat(&self, ctx: &PreheatedContext) {
+        if let Some(nonce) = ctx.reserved_nonce() {
+            self.inflight_nonces.mark_committed(nonce);
+        }
         ctx.commit_reservation();
     }
 
     /// Release a preheated context after signing but before broadcast acceptance.
     pub fn release_preheat(&self, ctx: &PreheatedContext) {
+        if let Some(nonce) = ctx.reserved_nonce() {
+            self.inflight_nonces.mark_released(nonce, "preheat_release");
+        }
         ctx.release_reservation();
     }
 
@@ -933,6 +954,7 @@ impl FastWallet {
     pub async fn sync_nonce(&self) -> WalletResult<u64> {
         let chain_nonce = self.rpc_client.get_nonce(self.address()).await?;
         self.nonce_manager.sync(chain_nonce);
+        self.inflight_nonces.prune_consumed(chain_nonce);
         Ok(chain_nonce)
     }
 
@@ -944,12 +966,32 @@ impl FastWallet {
     pub async fn sync_nonce_latest(&self) -> WalletResult<u64> {
         let chain_nonce = self.rpc_client.get_nonce_latest(self.address()).await?;
         self.nonce_manager.sync(chain_nonce);
+        self.inflight_nonces.prune_consumed(chain_nonce);
         Ok(chain_nonce)
     }
 
     /// Confirm a nonce was used (call after transaction is confirmed)
     pub fn confirm_nonce(&self) {
         self.nonce_manager.confirm();
+    }
+
+    /// Mark a known transaction as mined in the local in-flight ledger.
+    pub fn mark_transaction_mined(&self, tx: &Transaction) {
+        self.inflight_nonces.mark_mined(tx.nonce(), tx.hash());
+    }
+
+    /// Count signed/broadcast nonces still unresolved in the local ledger.
+    pub fn inflight_count(&self) -> usize {
+        self.inflight_nonces.unresolved_count()
+    }
+
+    /// Inspect the lowest unresolved nonce at or above a chain nonce.
+    pub fn lowest_unresolved_inflight(
+        &self,
+        chain_next: u64,
+    ) -> Option<InflightNonceSnapshot> {
+        self.inflight_nonces
+            .lowest_unresolved_at_or_above(chain_next)
     }
 
     // ==================== Gas Price ====================
@@ -1093,7 +1135,7 @@ impl FastWallet {
             request.gas_limit = self.config.default_gas_limit;
         }
 
-        self.release_on_sign_error(nonce, request.build_and_sign(&self.signer))
+        self.record_signed_or_release(nonce, request.build_and_sign(&self.signer))
     }
 
     /// Sign a transaction with explicit nonce (does NOT increment internal counter)
@@ -1115,7 +1157,7 @@ impl FastWallet {
             request.gas_limit = self.config.default_gas_limit;
         }
 
-        request.build_and_sign(&self.signer)
+        self.record_signed_without_release(request.build_and_sign(&self.signer))
     }
 
     /// Sign multiple alternative transactions with the same nonce
@@ -1151,6 +1193,7 @@ impl FastWallet {
     #[inline]
     pub fn release_nonce(&self, nonce: u64) {
         self.nonce_manager.release(nonce);
+        self.inflight_nonces.mark_released(nonce, "manual_release");
     }
 
     // ==================== Transaction Signing ====================
@@ -1213,7 +1256,7 @@ impl FastWallet {
         if result.is_err() {
             ctx.release_reservation();
         }
-        result
+        self.record_signed_without_release(result)
     }
 
     /// Sign an EIP-1559 transaction
@@ -1238,7 +1281,7 @@ impl FastWallet {
             .nonce(nonce)
             .chain_id(self.config.chain_id);
 
-        self.release_on_sign_error(nonce, request.build_and_sign(&self.signer))
+        self.record_signed_or_release(nonce, request.build_and_sign(&self.signer))
     }
 
     /// Sign a legacy transaction
@@ -1261,18 +1304,35 @@ impl FastWallet {
             .nonce(nonce)
             .chain_id(self.config.chain_id);
 
-        self.release_on_sign_error(nonce, request.build_and_sign(&self.signer))
+        self.record_signed_or_release(nonce, request.build_and_sign(&self.signer))
     }
 
     // ==================== Transaction Sending ====================
 
-    fn release_on_sign_error(
+    fn record_signed_or_release(
         &self,
         nonce: u64,
         result: WalletResult<Transaction>,
     ) -> WalletResult<Transaction> {
-        if result.is_err() {
-            self.nonce_manager.release(nonce);
+        match result {
+            Ok(tx) => {
+                self.inflight_nonces.record_signed(tx.nonce(), tx.hash());
+                Ok(tx)
+            }
+            Err(error) => {
+                self.nonce_manager.release(nonce);
+                self.inflight_nonces.mark_released(nonce, "sign_error");
+                Err(error)
+            }
+        }
+    }
+
+    fn record_signed_without_release(
+        &self,
+        result: WalletResult<Transaction>,
+    ) -> WalletResult<Transaction> {
+        if let Ok(tx) = result.as_ref() {
+            self.inflight_nonces.record_signed(tx.nonce(), tx.hash());
         }
         result
     }
@@ -1340,12 +1400,15 @@ impl FastWallet {
         let result = self.broadcast_signed_hash(tx).await;
 
         match &result {
-            Ok(_) => {
-                // Transaction accepted
+            Ok(tx_hash) => {
+                self.inflight_nonces
+                    .mark_broadcast_accepted(tx.nonce(), *tx_hash);
             }
             Err(e) => {
                 // Release nonce for reuse
                 self.nonce_manager.release(tx.nonce());
+                self.inflight_nonces
+                    .mark_released(tx.nonce(), "send_signed_error");
 
                 // Nonce-drift recovery. Both "too low" (we replayed an already-mined
                 // nonce) and "too high" (local counter skipped ahead of chain) indicate
@@ -1373,9 +1436,14 @@ impl FastWallet {
         let result = self.broadcast_signed_result(tx, sign_ms).await;
 
         match &result {
-            Ok(_) => {}
+            Ok(_) => {
+                self.inflight_nonces
+                    .mark_broadcast_accepted(tx.nonce(), tx.hash());
+            }
             Err(e) => {
                 self.nonce_manager.release(tx.nonce());
+                self.inflight_nonces
+                    .mark_released(tx.nonce(), "send_signed_detailed_error");
                 self.recover_nonce_error(e).await;
             }
         }
@@ -1398,6 +1466,8 @@ impl FastWallet {
 
         while start.elapsed() < max_wait {
             if self.rpc_client.tx_exists(tx_hash).await.unwrap_or(false) {
+                self.inflight_nonces
+                    .mark_mempool_seen(tx.nonce(), tx_hash);
                 return Ok(true);
             }
             tokio::time::sleep(poll_interval).await;
@@ -1420,8 +1490,12 @@ impl FastWallet {
         if let Err(error) = result {
             tracing::warn!(%tx_hash, error = %error, "re-broadcast failed; releasing nonce");
             self.nonce_manager.release(tx.nonce());
+            self.inflight_nonces
+                .mark_released(tx.nonce(), "verify_rebroadcast_error");
             return Err(error);
         };
+        self.inflight_nonces
+            .mark_rebroadcast_accepted(tx.nonce(), tx_hash);
         tracing::info!(%tx_hash, "re-broadcast succeeded");
         Ok(false)
     }
@@ -1431,14 +1505,23 @@ impl FastWallet {
         let current = self.current_nonce();
         let effective_next = self.effective_next_nonce();
         let chain_next = self.rpc_client.get_nonce(self.address()).await?;
+        let chain_latest = self.rpc_client.get_nonce_latest(self.address()).await.ok();
         let gap_count = self.nonce_manager.gap_count();
+        self.inflight_nonces.prune_consumed(chain_next);
+        let lowest_unresolved = self
+            .inflight_nonces
+            .lowest_unresolved_at_or_above(chain_next);
+        let inflight_count = self.inflight_nonces.unresolved_count();
         // If local is >2 ahead of chain, nonces are stuck in-flight
         let stalled = effective_next > chain_next + 2;
         Ok(NonceHealth {
             current,
             effective_next,
             chain_next,
+            chain_latest,
             gap_count,
+            inflight_count,
+            lowest_unresolved,
             stalled,
         })
     }
@@ -1459,9 +1542,15 @@ impl FastWallet {
         ctx.mark_broadcasting()?;
         let result = self.broadcast_signed_hash(&tx).await;
         match &result {
-            Ok(_) => ctx.commit_reservation(),
+            Ok(tx_hash) => {
+                ctx.commit_reservation();
+                self.inflight_nonces
+                    .mark_broadcast_accepted(tx.nonce(), *tx_hash);
+            }
             Err(error) => {
                 ctx.release_reservation();
+                self.inflight_nonces
+                    .mark_released(tx.nonce(), "send_with_preheat_error");
                 self.recover_nonce_error(error).await;
             }
         }
@@ -1480,9 +1569,15 @@ impl FastWallet {
         ctx.mark_broadcasting()?;
         let result = self.broadcast_signed_result(&tx, sign_ms).await;
         match &result {
-            Ok(_) => ctx.commit_reservation(),
+            Ok(_) => {
+                ctx.commit_reservation();
+                self.inflight_nonces
+                    .mark_broadcast_accepted(tx.nonce(), tx.hash());
+            }
             Err(error) => {
                 ctx.release_reservation();
+                self.inflight_nonces
+                    .mark_released(tx.nonce(), "send_with_preheat_detailed_error");
                 self.recover_nonce_error(error).await;
             }
         }
@@ -1584,9 +1679,15 @@ impl FastWallet {
         ctx.mark_broadcasting()?;
         let result = self.broadcast_signed_hash(&tx).await;
         match &result {
-            Ok(_) => ctx.commit_reservation(),
+            Ok(tx_hash) => {
+                ctx.commit_reservation();
+                self.inflight_nonces
+                    .mark_broadcast_accepted(tx.nonce(), *tx_hash);
+            }
             Err(error) => {
                 ctx.release_reservation();
+                self.inflight_nonces
+                    .mark_released(tx.nonce(), "send_optimistic_with_preheat_error");
                 self.recover_nonce_error(error).await;
             }
         }
@@ -2055,6 +2156,51 @@ mod tests {
     }
 
     #[test]
+    fn test_sign_records_inflight_nonce_and_manual_release_resolves_it() {
+        let wallet = FastWalletBuilder::new(TEST_PRIVATE_KEY, "http://localhost:8545")
+            .chain_id(1)
+            .build_with_nonce(42)
+            .unwrap();
+
+        let tx = wallet.sign(test_request()).unwrap();
+
+        let inflight = wallet.lowest_unresolved_inflight(42).unwrap();
+        assert_eq!(inflight.nonce, 42);
+        assert_eq!(inflight.tx_hashes, vec![tx.hash()]);
+        assert_eq!(wallet.inflight_count(), 1);
+
+        wallet.release_nonce(42);
+
+        assert!(wallet.lowest_unresolved_inflight(42).is_none());
+        assert_eq!(wallet.inflight_count(), 0);
+    }
+
+    #[test]
+    fn test_sign_with_nonce_records_replacement_hashes() {
+        let wallet = FastWalletBuilder::new(TEST_PRIVATE_KEY, "http://localhost:8545")
+            .chain_id(1)
+            .build_with_nonce(7)
+            .unwrap();
+        let first = wallet.sign_with_nonce(test_request(), 7).unwrap();
+        let second = wallet
+            .sign_with_nonce(
+                TransactionRequest::new()
+                    .to(Address::repeat_byte(2))
+                    .value(U256::from(1u64))
+                    .gas_limit(21000)
+                    .gas_price(U256::from(21_000_000_000u64)),
+                7,
+            )
+            .unwrap();
+
+        let inflight = wallet.lowest_unresolved_inflight(7).unwrap();
+        assert_eq!(inflight.nonce, 7);
+        assert_eq!(inflight.tx_hashes.len(), 2);
+        assert!(inflight.tx_hashes.contains(&first.hash()));
+        assert!(inflight.tx_hashes.contains(&second.hash()));
+    }
+
+    #[test]
     fn test_sign_auto_nonce() {
         let wallet = FastWalletBuilder::new(TEST_PRIVATE_KEY, "http://localhost:8545")
             .chain_id(1)
@@ -2288,7 +2434,7 @@ mod tests {
             .unwrap();
 
         let nonce = wallet.nonce_manager.get_nonce();
-        let result = wallet.release_on_sign_error(
+        let result = wallet.record_signed_or_release(
             nonce,
             Err(WalletError::SigningError(
                 "forced signing error".to_string(),
