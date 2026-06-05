@@ -19,6 +19,19 @@ thread_local! {
     static ENCODE_BUF: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(512));
 }
 
+/// Minimum replace-by-fee bump, in basis points. Geth's default `PriceBump` is
+/// 10%; we use 12.5% as a safe margin so a re-broadcast strictly clears the floor.
+pub const RBF_MIN_BUMP_BPS: u32 = 1250;
+
+/// Multiply `v` by `(1 + bump_bps/10000)`, rounding up so the result is strictly
+/// greater than `v` for any non-zero `v` (needed to satisfy RBF replacement).
+#[inline]
+pub(crate) fn bump_u256(v: U256, bump_bps: u32) -> U256 {
+    let denom = U256::from(10_000u32);
+    let num = v * U256::from(10_000u32 + bump_bps);
+    (num + denom - U256::from(1u8)) / denom
+}
+
 /// Transaction request (unsigned transaction parameters)
 #[derive(Debug, Clone, Default)]
 pub struct TransactionRequest {
@@ -536,6 +549,36 @@ impl TypedTransaction {
             TypedTransaction::Eip1559(tx) => tx.nonce,
         }
     }
+
+    /// EIP-1559 max fee per gas (`None` for legacy/2930).
+    pub fn max_fee_per_gas(&self) -> Option<U256> {
+        match self {
+            TypedTransaction::Eip1559(tx) => Some(tx.max_fee_per_gas),
+            _ => None,
+        }
+    }
+
+    /// EIP-1559 max priority fee per gas (`None` for legacy/2930).
+    pub fn max_priority_fee_per_gas(&self) -> Option<U256> {
+        match self {
+            TypedTransaction::Eip1559(tx) => Some(tx.max_priority_fee_per_gas),
+            _ => None,
+        }
+    }
+
+    /// Clone with EIP-1559 fees (both tip and max-fee) bumped by `bump_bps`.
+    /// Returns `None` for non-EIP-1559 txs. The result is unsigned — re-sign it.
+    pub fn with_bumped_fees(&self, bump_bps: u32) -> Option<TypedTransaction> {
+        match self {
+            TypedTransaction::Eip1559(tx) => {
+                let mut bumped = tx.clone();
+                bumped.max_priority_fee_per_gas = bump_u256(tx.max_priority_fee_per_gas, bump_bps);
+                bumped.max_fee_per_gas = bump_u256(tx.max_fee_per_gas, bump_bps);
+                Some(TypedTransaction::Eip1559(bumped))
+            }
+            _ => None,
+        }
+    }
 }
 
 impl Transaction {
@@ -581,6 +624,29 @@ impl Transaction {
     /// Get the nonce
     pub fn nonce(&self) -> u64 {
         self.typed_tx.nonce()
+    }
+
+    /// EIP-1559 max fee per gas (`None` for legacy/2930).
+    pub fn max_fee_per_gas(&self) -> Option<U256> {
+        self.typed_tx.max_fee_per_gas()
+    }
+
+    /// EIP-1559 max priority fee per gas (`None` for legacy/2930).
+    pub fn max_priority_fee_per_gas(&self) -> Option<U256> {
+        self.typed_tx.max_priority_fee_per_gas()
+    }
+
+    /// Re-sign this transaction with EIP-1559 fees bumped by `bump_bps` (for an
+    /// RBF re-broadcast of an evicted/underpriced tx). Same nonce, higher fees,
+    /// so at most one of the original and the replacement can mine. Returns
+    /// `None` for non-EIP-1559 txs (caller falls back to a same-gas re-send).
+    pub fn bumped_resign(
+        &self,
+        signer: &FastSigner,
+        bump_bps: u32,
+    ) -> Option<WalletResult<Transaction>> {
+        let bumped = self.typed_tx.with_bumped_fees(bump_bps)?;
+        Some(Transaction::sign(bumped, signer))
     }
 }
 
@@ -878,5 +944,67 @@ mod tests {
             .unwrap();
 
         assert!(!tx.encoded().is_empty());
+    }
+
+    #[test]
+    fn test_bump_u256_ceils_strictly_above() {
+        // 12.5% of 1000 = 1125 exactly.
+        assert_eq!(bump_u256(U256::from(1000u64), 1250), U256::from(1125u64));
+        // Fractional results round UP so the bump always strictly exceeds the input.
+        assert_eq!(bump_u256(U256::from(1u64), 1250), U256::from(2u64)); // ceil(1.125)
+        assert_eq!(bump_u256(U256::from(8u64), 1250), U256::from(9u64)); // ceil(9.0)
+                                                                         // Zero stays zero (no fee to bump).
+        assert_eq!(bump_u256(U256::ZERO, 1250), U256::ZERO);
+    }
+
+    fn signed_eip1559(tip: u64, max_fee: u64, nonce: u64) -> Transaction {
+        let signer = FastSigner::from_hex(TEST_PRIVATE_KEY).unwrap();
+        TransactionRequest::new()
+            .to(Address::repeat_byte(1))
+            .value(U256::ZERO)
+            .gas_limit(21000)
+            .max_priority_fee_per_gas(U256::from(tip))
+            .max_fee_per_gas(U256::from(max_fee))
+            .nonce(nonce)
+            .chain_id(1)
+            .build_and_sign(&signer)
+            .unwrap()
+    }
+
+    #[test]
+    fn test_bumped_resign_bumps_both_fees_keeps_nonce_changes_hash() {
+        let signer = FastSigner::from_hex(TEST_PRIVATE_KEY).unwrap();
+        let tx = signed_eip1559(1_000_000_000, 20_000_000_000, 7);
+
+        let bumped = tx
+            .bumped_resign(&signer, RBF_MIN_BUMP_BPS)
+            .unwrap()
+            .unwrap();
+
+        // Both tip and max-fee strictly increased (RBF requires BOTH).
+        assert!(
+            bumped.max_priority_fee_per_gas().unwrap() > tx.max_priority_fee_per_gas().unwrap()
+        );
+        assert!(bumped.max_fee_per_gas().unwrap() > tx.max_fee_per_gas().unwrap());
+        // Same nonce so original and replacement are mutually exclusive.
+        assert_eq!(bumped.nonce(), tx.nonce());
+        // New fees ⇒ a different signed tx hash.
+        assert_ne!(bumped.hash(), tx.hash());
+    }
+
+    #[test]
+    fn test_bumped_resign_none_for_legacy() {
+        let signer = FastSigner::from_hex(TEST_PRIVATE_KEY).unwrap();
+        let legacy = TransactionRequest::new()
+            .to(Address::repeat_byte(1))
+            .value(U256::ZERO)
+            .gas_limit(21000)
+            .gas_price(U256::from(20_000_000_000u64))
+            .nonce(0)
+            .chain_id(1)
+            .build_and_sign(&signer)
+            .unwrap();
+        assert!(legacy.bumped_resign(&signer, RBF_MIN_BUMP_BPS).is_none());
+        assert!(legacy.max_fee_per_gas().is_none());
     }
 }

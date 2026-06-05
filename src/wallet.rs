@@ -13,10 +13,10 @@ use crate::inflight::{InflightNonceLedger, InflightNonceSnapshot};
 use crate::nonce::{ReservedNonce, SingleAddressNonceManager};
 use crate::rpc::{BatchRpcClient, RpcClient, SendResult};
 use crate::signer::FastSigner;
-use crate::transaction::{Transaction, TransactionRequest};
+use crate::transaction::{bump_u256, Transaction, TransactionRequest, RBF_MIN_BUMP_BPS};
 use alloy::primitives::{Address, Bytes, B256, U256};
 use futures_util::future::join_all;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -329,6 +329,32 @@ pub struct NonceHealth {
     pub stalled: bool,
 }
 
+/// Idempotency window for [`FastWallet::replace_stalled_nonce`]: a second call for
+/// the same nonce within this window is a no-op (avoids spamming replacements while
+/// a streak-driven caller polls each block).
+const STALL_REPLACE_WINDOW: Duration = Duration::from_secs(3);
+
+/// Outcome of [`FastWallet::replace_stalled_nonce`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplaceOutcome {
+    /// A higher-fee replacement was broadcast at `nonce` to unblock the queue.
+    /// (v0.1.40 ships only the cancel form; RBF of the original payload lands later.)
+    Cancelled {
+        /// The nonce that was replaced (`chain_next`).
+        nonce: u64,
+        /// Hash of the broadcast replacement tx.
+        tx_hash: B256,
+    },
+    /// Not in a head-of-line stall (chain disagrees `chain_next` is next, or this
+    /// nonce was already replaced within [`STALL_REPLACE_WINDOW`]). No action taken.
+    NotStalled,
+    /// No unresolved in-flight nonce at or above `chain_next`. No action taken.
+    NoCandidate,
+    /// A concurrent reservation/external consumption moved the local counter behind
+    /// `chain_next`; replacing would be unsafe. No action taken.
+    RaceAborted,
+}
+
 /// High-performance EVM wallet optimized for liquidation bots
 ///
 /// # Features
@@ -355,6 +381,8 @@ pub struct FastWallet {
     gas_serializer: GasFetchSerializer,
     /// Local per-nonce signed/broadcast ledger for recovery observability.
     inflight_nonces: InflightNonceLedger,
+    /// Last `(nonce, at)` replaced by `replace_stalled_nonce`, for idempotency.
+    last_stall_replace: Mutex<Option<(u64, Instant)>>,
 }
 
 impl FastWallet {
@@ -382,6 +410,7 @@ impl FastWallet {
             warmed_up: AtomicBool::new(false),
             gas_serializer: GasFetchSerializer::new(),
             inflight_nonces: InflightNonceLedger::default(),
+            last_stall_replace: Mutex::new(None),
             config,
         })
     }
@@ -427,6 +456,7 @@ impl FastWallet {
             warmed_up: AtomicBool::new(false),
             gas_serializer: GasFetchSerializer::new(),
             inflight_nonces: InflightNonceLedger::default(),
+            last_stall_replace: Mutex::new(None),
             config,
         })
     }
@@ -470,6 +500,13 @@ impl FastWallet {
     /// with a second chain view (pending == latest), the in-flight ledger
     /// (`nonce_health_check().lowest_unresolved` aged out), and/or an
     /// independent-RPC liveness probe of the stranded nonce's tx hashes.
+    ///
+    /// This rewind path handles only the DROPPED-reservation case (chain behind
+    /// local, nothing in flight). For the head-of-line stall where txs ARE in
+    /// flight (`inflight_count > 0`), do NOT rewind — use
+    /// [`replace_stalled_nonce`](Self::replace_stalled_nonce) instead, which is
+    /// safe precisely because it replaces the stuck nonce rather than rewinding
+    /// past live broadcasts.
     #[inline]
     pub fn recover_stalled(&self, chain_nonce: u64) -> bool {
         self.nonce_manager.recover_stalled(chain_nonce)
@@ -1473,14 +1510,24 @@ impl FastWallet {
             tokio::time::sleep(poll_interval).await;
         }
 
-        // TX not found — re-broadcast to all endpoints
+        // TX not found — re-broadcast with bumped fees (RBF). A tx that vanished was
+        // likely evicted as underpriced; an identical-gas re-send would be rejected as
+        // a duplicate or dropped again. Bumping tip+maxFee by the RBF floor lets it land.
+        // Same nonce ⇒ original and replacement are mutually exclusive (≤1 mines).
+        let resend = tx
+            .bumped_resign(&self.signer, RBF_MIN_BUMP_BPS)
+            .and_then(|r| r.ok());
+        let send_tx = resend.as_ref().unwrap_or(tx);
+        let send_hash = send_tx.hash();
         tracing::warn!(
-            %tx_hash,
+            old_tx_hash = %tx_hash,
+            new_tx_hash = %send_hash,
             nonce = tx.nonce(),
+            bumped = resend.is_some(),
             elapsed_ms = start.elapsed().as_millis() as u64,
-            "TX not in mempool after verification window, re-broadcasting"
+            "TX not in mempool after verification window, re-broadcasting with bumped fees"
         );
-        let hex_tx = tx.to_hex();
+        let hex_tx = send_tx.to_hex();
         let result = if let Some(batch_client) = &self.batch_client {
             batch_client.broadcast_transaction(&hex_tx).await
         } else {
@@ -1488,15 +1535,15 @@ impl FastWallet {
         };
 
         if let Err(error) = result {
-            tracing::warn!(%tx_hash, error = %error, "re-broadcast failed; releasing nonce");
+            tracing::warn!(%send_hash, error = %error, "re-broadcast failed; releasing nonce");
             self.nonce_manager.release(tx.nonce());
             self.inflight_nonces
                 .mark_released(tx.nonce(), "verify_rebroadcast_error");
             return Err(error);
         };
         self.inflight_nonces
-            .mark_rebroadcast_accepted(tx.nonce(), tx_hash);
-        tracing::info!(%tx_hash, "re-broadcast succeeded");
+            .mark_rebroadcast_accepted(tx.nonce(), send_hash);
+        tracing::info!(%send_hash, "re-broadcast succeeded");
         Ok(false)
     }
 
@@ -1524,6 +1571,97 @@ impl FastWallet {
             lowest_unresolved,
             stalled,
         })
+    }
+
+    /// Replace the head-of-line stuck nonce so the chain advances and the queue
+    /// behind it unblocks. This is the recovery path that works WITH in-flight
+    /// transactions present — the condition the [`recover_stalled`](Self::recover_stalled)
+    /// rewind intentionally refuses. v0.1.40 ships the **cancel** form: a 0-value
+    /// self-transfer at `chain_next` with a high tip; the original stranded tx (if
+    /// any) and the cancel share the nonce, so at most one mines and the queue
+    /// advances regardless.
+    ///
+    /// Safety: acts only when the chain agrees `chain_next` is next (pending-tag
+    /// proof via `eth_getTransactionCount(latest)`), never targets a nonce below
+    /// `chain_next` (already mined), aborts if a concurrent reservation/external
+    /// consumption moved the local counter behind `chain_next`, and is idempotent
+    /// within [`STALL_REPLACE_WINDOW`].
+    ///
+    /// `tip_bump_bps` is the desired tip bump over the current network priority fee;
+    /// it is floored at [`RBF_MIN_BUMP_BPS`].
+    pub async fn replace_stalled_nonce(
+        &self,
+        chain_next: u64,
+        tip_bump_bps: u32,
+    ) -> WalletResult<ReplaceOutcome> {
+        // Idempotency: skip a repeat replacement of the same nonce within the window.
+        if let Some((nonce, at)) = *self.last_stall_replace.lock() {
+            if nonce == chain_next && at.elapsed() < STALL_REPLACE_WINDOW {
+                return Ok(ReplaceOutcome::NotStalled);
+            }
+        }
+
+        // Pending-tag safety proof: the chain must agree `chain_next` is next, i.e.
+        // none of our in-flight txs at/above it are in the canonical pending set.
+        let chain_latest = self.rpc_client.get_nonce_latest(self.address()).await?;
+        if chain_latest != chain_next {
+            return Ok(ReplaceOutcome::NotStalled);
+        }
+
+        // There must actually be an unresolved in-flight nonce at/above the head.
+        self.inflight_nonces.prune_consumed(chain_next);
+        if self.lowest_unresolved_inflight(chain_next).is_none() {
+            return Ok(ReplaceOutcome::NoCandidate);
+        }
+
+        // CAS guard: the local high-water must be at/above the head. If it's behind,
+        // an external consumer advanced the account and replacing would be unsafe.
+        if self.current_nonce() < chain_next {
+            return Ok(ReplaceOutcome::RaceAborted);
+        }
+
+        // Build a competitive cancel: 0-value self-transfer at `chain_next`.
+        let bump_bps = tip_bump_bps.max(RBF_MIN_BUMP_BPS);
+        let tip = bump_u256(self.get_priority_fee().await?, bump_bps);
+        let max_fee = bump_u256(self.get_gas_price().await?, bump_bps).max(tip);
+
+        let request = TransactionRequest::new()
+            .to(self.address())
+            .value(U256::ZERO)
+            .gas_limit(21_000)
+            .max_priority_fee_per_gas(tip)
+            .max_fee_per_gas(max_fee);
+        let tx = self.sign_with_nonce(request, chain_next)?;
+        let tx_hash = tx.hash();
+        let hex_tx = tx.to_hex();
+
+        let result = if let Some(batch_client) = &self.batch_client {
+            batch_client.broadcast_transaction(&hex_tx).await
+        } else {
+            self.rpc_client.send_raw_transaction(&hex_tx).await
+        };
+
+        match result {
+            Ok(_) => {
+                self.inflight_nonces
+                    .mark_rebroadcast_accepted(chain_next, tx_hash);
+                *self.last_stall_replace.lock() = Some((chain_next, Instant::now()));
+                tracing::warn!(
+                    nonce = chain_next,
+                    %tx_hash,
+                    tip_wei = %tip,
+                    "replace_stalled_nonce: broadcast cancel self-transfer to unblock head-of-line queue"
+                );
+                Ok(ReplaceOutcome::Cancelled {
+                    nonce: chain_next,
+                    tx_hash,
+                })
+            }
+            Err(error) => {
+                tracing::warn!(nonce = chain_next, error = %error, "replace_stalled_nonce broadcast failed");
+                Err(error)
+            }
+        }
     }
 
     /// Sign and send a transaction in one call
@@ -2646,5 +2784,174 @@ mod tests {
             .build_with_nonce(0)
             .unwrap();
         assert!(wallet.config.gas_provider.is_none());
+    }
+
+    // ============ replace_stalled_nonce ============
+
+    /// Minimal method-routing mock JSON-RPC server. Each request gets its own
+    /// connection (`Connection: close`) so it is robust to client pooling; routes
+    /// by JSON-RPC `method`. `tx_found` controls `eth_getTransactionByHash`
+    /// (false = accepted-but-never-mined, the strand condition).
+    async fn mock_rpc_server(
+        latest_nonce: u64,
+        tip_wei: u64,
+        gas_price_wei: u64,
+        tx_found: bool,
+    ) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = match listener.accept().await {
+                    Ok(s) => s,
+                    Err(_) => break,
+                };
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let n = match stream.read(&mut buf).await {
+                        Ok(n) if n > 0 => n,
+                        _ => return,
+                    };
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let result = if req.contains("eth_getTransactionCount") {
+                        format!("\"0x{latest_nonce:x}\"")
+                    } else if req.contains("eth_maxPriorityFeePerGas") {
+                        format!("\"0x{tip_wei:x}\"")
+                    } else if req.contains("eth_gasPrice") {
+                        format!("\"0x{gas_price_wei:x}\"")
+                    } else if req.contains("eth_sendRawTransaction") {
+                        format!("\"0x{}\"", "11".repeat(32))
+                    } else if req.contains("eth_getTransactionByHash") {
+                        if tx_found {
+                            "{\"hash\":\"0x01\"}".to_string()
+                        } else {
+                            "null".to_string()
+                        }
+                    } else {
+                        "null".to_string()
+                    };
+                    let body = format!("{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{result}}}");
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn replace_stalled_nonce_broadcasts_cancel_under_inflight() {
+        // Strand: chain frozen at 50 (latest == 50), one in-flight nonce at 50.
+        let url = mock_rpc_server(50, 1_000_000_000, 20_000_000_000, false).await;
+        let wallet = FastWalletBuilder::new(TEST_PRIVATE_KEY, &url)
+            .chain_id(1)
+            .build_with_nonce(50)
+            .unwrap();
+        // Create an in-flight candidate at nonce 50 (advances local high-water to 51).
+        wallet.sign(test_request()).unwrap();
+        assert!(wallet.current_nonce() >= 50);
+
+        let outcome = wallet.replace_stalled_nonce(50, 0).await.unwrap();
+        match outcome {
+            ReplaceOutcome::Cancelled { nonce, .. } => assert_eq!(nonce, 50),
+            other => panic!("expected Cancelled, got {other:?}"),
+        }
+        // Idempotency state recorded.
+        assert_eq!(wallet.last_stall_replace.lock().map(|(n, _)| n), Some(50));
+    }
+
+    #[tokio::test]
+    async fn replace_stalled_nonce_refuses_when_chain_disagrees() {
+        // Chain latest is 40, not the 50 the caller thinks is stuck → not a stall.
+        let url = mock_rpc_server(40, 1_000_000_000, 20_000_000_000, false).await;
+        let wallet = FastWalletBuilder::new(TEST_PRIVATE_KEY, &url)
+            .chain_id(1)
+            .build_with_nonce(50)
+            .unwrap();
+        assert_eq!(
+            wallet.replace_stalled_nonce(50, 0).await.unwrap(),
+            ReplaceOutcome::NotStalled
+        );
+    }
+
+    #[tokio::test]
+    async fn replace_stalled_nonce_no_candidate_when_ledger_empty() {
+        let url = mock_rpc_server(50, 1_000_000_000, 20_000_000_000, false).await;
+        let wallet = FastWalletBuilder::new(TEST_PRIVATE_KEY, &url)
+            .chain_id(1)
+            .build_with_nonce(50)
+            .unwrap();
+        // No in-flight tx → nothing to replace.
+        assert_eq!(
+            wallet.replace_stalled_nonce(50, 0).await.unwrap(),
+            ReplaceOutcome::NoCandidate
+        );
+    }
+
+    #[tokio::test]
+    async fn replace_stalled_nonce_race_aborts_when_local_behind_head() {
+        // Local counter at 42, but an in-flight tx exists at 50 and chain says 50 is
+        // next: the local high-water is behind the head → unsafe, abort.
+        let url = mock_rpc_server(50, 1_000_000_000, 20_000_000_000, false).await;
+        let wallet = FastWalletBuilder::new(TEST_PRIVATE_KEY, &url)
+            .chain_id(1)
+            .build_with_nonce(42)
+            .unwrap();
+        // sign_with_nonce records an in-flight at 50 without moving the counter.
+        wallet.sign_with_nonce(test_request(), 50).unwrap();
+        assert_eq!(wallet.current_nonce(), 42);
+        assert_eq!(
+            wallet.replace_stalled_nonce(50, 0).await.unwrap(),
+            ReplaceOutcome::RaceAborted
+        );
+    }
+
+    #[tokio::test]
+    async fn replace_stalled_nonce_idempotent_within_window() {
+        // No RPC should be hit: the idempotency guard returns before any network call.
+        let wallet = FastWalletBuilder::new(TEST_PRIVATE_KEY, "http://127.0.0.1:1")
+            .chain_id(1)
+            .build_with_nonce(50)
+            .unwrap();
+        *wallet.last_stall_replace.lock() = Some((50, Instant::now()));
+        assert_eq!(
+            wallet.replace_stalled_nonce(50, 0).await.unwrap(),
+            ReplaceOutcome::NotStalled
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_broadcast_rebroadcasts_bumped_when_tx_vanished() {
+        // tx never appears in mempool → verify_broadcast must re-broadcast (bumped)
+        // and report Ok(false) (rebroadcast accepted), not error.
+        let url = mock_rpc_server(0, 1_000_000_000, 20_000_000_000, false).await;
+        let wallet = FastWalletBuilder::new(TEST_PRIVATE_KEY, &url)
+            .chain_id(1)
+            .build_with_nonce(0)
+            .unwrap();
+        let tx = TransactionRequest::new()
+            .to(Address::repeat_byte(1))
+            .value(U256::ZERO)
+            .gas_limit(21000)
+            .max_priority_fee_per_gas(U256::from(1_000_000_000u64))
+            .max_fee_per_gas(U256::from(20_000_000_000u64))
+            .nonce(0)
+            .chain_id(1)
+            .build_and_sign(&wallet.signer)
+            .unwrap();
+        let verified = wallet
+            .verify_broadcast(&tx, tx.hash(), Duration::from_millis(50))
+            .await
+            .unwrap();
+        assert!(
+            !verified,
+            "tx was never in mempool, so verify must report rebroadcast"
+        );
     }
 }
