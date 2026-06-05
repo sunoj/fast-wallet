@@ -541,7 +541,16 @@ impl FastWallet {
         self.nonce_manager.recover_stalled(chain_nonce)
     }
 
-    /// Get RPC client reference
+    /// Get RPC client reference.
+    ///
+    /// LEDGER CONTRACT: this is a raw escape hatch. Broadcasting a transaction at a
+    /// managed nonce through `wallet.rpc().send_raw_transaction(..)` (instead of
+    /// [`send`](Self::send)/[`send_signed`](Self::send_signed)/
+    /// [`send_with_preheat`](Self::send_with_preheat)) bypasses the in-flight fee
+    /// ledger, so [`replace_stalled_nonce`](Self::replace_stalled_nonce) will compute
+    /// its bump from a STALE fee basis and may underprice the real (unrecorded) tx.
+    /// Use `rpc()` for reads (`call`, receipts, nonce); broadcast managed nonces only
+    /// through the wallet's send methods.
     pub fn rpc(&self) -> &RpcClient {
         &self.rpc_client
     }
@@ -1675,6 +1684,13 @@ impl FastWallet {
     ///   `chain_next`. A stall where `chain_next` is a released LOCAL gap (nothing
     ///   in flight there) is left to the [`recover_stalled`](Self::recover_stalled)
     ///   rewind path, which is the correct tool for the dropped-reservation case.
+    /// - LEDGER CONTRACT: the stranded fee basis comes from the in-flight ledger,
+    ///   which is authoritative ONLY for nonces broadcast through this wallet's send
+    ///   methods ([`send`](Self::send) / [`send_signed`](Self::send_signed) /
+    ///   [`send_with_preheat`](Self::send_with_preheat) / [`verify_broadcast`](Self::verify_broadcast)).
+    ///   A tx broadcast at a managed nonce via a raw escape hatch ([`rpc`](Self::rpc),
+    ///   `TransactionBroadcaster`) is NOT recorded, so the cancel could bump from a
+    ///   stale (lower) basis. Broadcast managed nonces only through the send methods.
     pub async fn replace_stalled_nonce(
         &self,
         chain_next: u64,

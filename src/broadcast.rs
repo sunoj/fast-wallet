@@ -481,7 +481,13 @@ impl TransactionBroadcaster {
         }
     }
 
-    /// Broadcast transaction using configured strategy
+    /// Broadcast transaction using configured strategy.
+    ///
+    /// NOTE: `TransactionBroadcaster` is a standalone multi-RPC sender and does NOT
+    /// touch any `FastWallet` in-flight ledger. If you broadcast a managed nonce here,
+    /// `FastWallet::replace_stalled_nonce` will have no record of this tx's fee and may
+    /// underprice its stall-recovery cancel. Route managed-nonce broadcasts through the
+    /// wallet's own send methods instead.
     pub async fn broadcast(&self, tx: &Transaction) -> BroadcastResult {
         let raw_tx = tx.to_hex();
 
