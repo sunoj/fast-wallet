@@ -2,7 +2,7 @@
 //! Exports snapshots used by nonce health checks and recovery decisions.
 //! Deps: alloy hashes, parking_lot Mutex, and std collections/time.
 
-use alloy::primitives::B256;
+use alloy::primitives::{B256, U256};
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
@@ -30,6 +30,11 @@ pub struct InflightNonceSnapshot {
     pub age: Duration,
     pub accepted_broadcasts: u32,
     pub release_reason: Option<String>,
+    /// Highest `max_fee_per_gas` broadcast for this nonce (EIP-1559 only). Lets a
+    /// replacement bump relative to the stranded tx's own fee, not just network price.
+    pub max_fee_seen: Option<U256>,
+    /// Highest `max_priority_fee_per_gas` broadcast for this nonce (EIP-1559 only).
+    pub max_priority_seen: Option<U256>,
 }
 
 #[derive(Debug)]
@@ -40,10 +45,25 @@ struct InflightNonceRecord {
     first_seen: Instant,
     accepted_broadcasts: u32,
     release_reason: Option<String>,
+    max_fee_seen: Option<U256>,
+    max_priority_seen: Option<U256>,
+}
+
+/// Keep the larger of an existing tracked fee and a newly observed one.
+fn merge_max(slot: &mut Option<U256>, observed: Option<U256>) {
+    if let Some(value) = observed {
+        *slot = Some(slot.map_or(value, |cur| cur.max(value)));
+    }
 }
 
 impl InflightNonceRecord {
-    fn new(nonce: u64, tx_hash: B256, now: Instant) -> Self {
+    fn new(
+        nonce: u64,
+        tx_hash: B256,
+        max_fee: Option<U256>,
+        max_priority: Option<U256>,
+        now: Instant,
+    ) -> Self {
         let mut tx_hashes = BTreeSet::new();
         tx_hashes.insert(tx_hash);
         Self {
@@ -53,6 +73,8 @@ impl InflightNonceRecord {
             first_seen: now,
             accepted_broadcasts: 0,
             release_reason: None,
+            max_fee_seen: max_fee,
+            max_priority_seen: max_priority,
         }
     }
 
@@ -64,6 +86,8 @@ impl InflightNonceRecord {
             age: now.saturating_duration_since(self.first_seen),
             accepted_broadcasts: self.accepted_broadcasts,
             release_reason: self.release_reason.clone(),
+            max_fee_seen: self.max_fee_seen,
+            max_priority_seen: self.max_priority_seen,
         }
     }
 }
@@ -75,19 +99,29 @@ pub struct InflightNonceLedger {
 }
 
 impl InflightNonceLedger {
-    pub fn record_signed(&self, nonce: u64, tx_hash: B256) {
+    pub fn record_signed(
+        &self,
+        nonce: u64,
+        tx_hash: B256,
+        max_fee: Option<U256>,
+        max_priority: Option<U256>,
+    ) {
         let mut records = self.records.lock();
         let now = Instant::now();
         records
             .entry(nonce)
             .and_modify(|record| {
                 record.tx_hashes.insert(tx_hash);
+                merge_max(&mut record.max_fee_seen, max_fee);
+                merge_max(&mut record.max_priority_seen, max_priority);
                 if record.status == InflightNonceStatus::Released {
                     record.status = InflightNonceStatus::Signed;
                     record.release_reason = None;
                 }
             })
-            .or_insert_with(|| InflightNonceRecord::new(nonce, tx_hash, now));
+            .or_insert_with(|| {
+                InflightNonceRecord::new(nonce, tx_hash, max_fee, max_priority, now)
+            });
         prune_old_records(&mut records);
     }
 
@@ -119,7 +153,7 @@ impl InflightNonceLedger {
                 record.release_reason = Some(reason.clone());
             })
             .or_insert_with(|| {
-                let mut record = InflightNonceRecord::new(nonce, B256::ZERO, now);
+                let mut record = InflightNonceRecord::new(nonce, B256::ZERO, None, None, now);
                 record.tx_hashes.clear();
                 record.status = InflightNonceStatus::Released;
                 record.release_reason = Some(reason);
@@ -137,7 +171,7 @@ impl InflightNonceLedger {
                 record.release_reason = None;
             })
             .or_insert_with(|| {
-                let mut record = InflightNonceRecord::new(nonce, B256::ZERO, now);
+                let mut record = InflightNonceRecord::new(nonce, B256::ZERO, None, None, now);
                 record.tx_hashes.clear();
                 record.status = InflightNonceStatus::Committed;
                 record
@@ -187,7 +221,7 @@ impl InflightNonceLedger {
                 record.release_reason = release_reason.clone();
             })
             .or_insert_with(|| {
-                let mut record = InflightNonceRecord::new(nonce, tx_hash, now);
+                let mut record = InflightNonceRecord::new(nonce, tx_hash, None, None, now);
                 record.status = status;
                 record.accepted_broadcasts = u32::from(is_broadcast_acceptance(status));
                 record.release_reason = release_reason;
@@ -227,10 +261,10 @@ mod tests {
     #[test]
     fn ledger_tracks_lowest_unresolved_nonce_with_replacements() {
         let ledger = InflightNonceLedger::default();
-        ledger.record_signed(10, B256::repeat_byte(1));
+        ledger.record_signed(10, B256::repeat_byte(1), None, None);
         ledger.mark_broadcast_accepted(10, B256::repeat_byte(1));
-        ledger.record_signed(10, B256::repeat_byte(2));
-        ledger.record_signed(11, B256::repeat_byte(3));
+        ledger.record_signed(10, B256::repeat_byte(2), None, None);
+        ledger.record_signed(11, B256::repeat_byte(3), None, None);
 
         let low = ledger.lowest_unresolved_at_or_above(10).unwrap();
         assert_eq!(low.nonce, 10);
@@ -247,8 +281,8 @@ mod tests {
     #[test]
     fn ledger_prunes_consumed_nonces() {
         let ledger = InflightNonceLedger::default();
-        ledger.record_signed(20, B256::repeat_byte(4));
-        ledger.record_signed(21, B256::repeat_byte(5));
+        ledger.record_signed(20, B256::repeat_byte(4), None, None);
+        ledger.record_signed(21, B256::repeat_byte(5), None, None);
 
         ledger.prune_consumed(21);
 
@@ -258,9 +292,31 @@ mod tests {
     }
 
     #[test]
+    fn ledger_retains_highest_seen_fees_per_nonce() {
+        let ledger = InflightNonceLedger::default();
+        // First broadcast at a high fee, then a replacement at a lower fee: the
+        // ledger must keep the HIGHEST so a cancel can still out-bid the stranded tx.
+        ledger.record_signed(
+            5,
+            B256::repeat_byte(1),
+            Some(U256::from(100u64)),
+            Some(U256::from(10u64)),
+        );
+        ledger.record_signed(
+            5,
+            B256::repeat_byte(2),
+            Some(U256::from(50u64)),
+            Some(U256::from(5u64)),
+        );
+        let snap = ledger.lowest_unresolved_at_or_above(5).unwrap();
+        assert_eq!(snap.max_fee_seen, Some(U256::from(100u64)));
+        assert_eq!(snap.max_priority_seen, Some(U256::from(10u64)));
+    }
+
+    #[test]
     fn committed_nonce_remains_unresolved_until_mined_or_released() {
         let ledger = InflightNonceLedger::default();
-        ledger.record_signed(30, B256::repeat_byte(6));
+        ledger.record_signed(30, B256::repeat_byte(6), None, None);
 
         ledger.mark_committed(30);
 

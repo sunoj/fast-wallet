@@ -60,8 +60,8 @@ pub use rpc::SendResult;
 pub use signer::FastSigner;
 pub use transaction::{Transaction, TransactionRequest, TypedTransaction};
 pub use wallet::{
-    FastWallet, FastWalletBuilder, NonceHealth, PreheatedContext, ReplaceOutcome, WalletConfig,
-    WalletStatus,
+    FastWallet, FastWalletBuilder, NonceHealth, PreheatedContext, ReplaceOutcome, VerifyOutcome,
+    WalletConfig, WalletStatus,
 };
 
 /// Re-export commonly used types

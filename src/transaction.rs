@@ -28,8 +28,10 @@ pub const RBF_MIN_BUMP_BPS: u32 = 1250;
 #[inline]
 pub(crate) fn bump_u256(v: U256, bump_bps: u32) -> U256 {
     let denom = U256::from(10_000u32);
-    let num = v * U256::from(10_000u32 + bump_bps);
-    (num + denom - U256::from(1u8)) / denom
+    // Saturating so an extreme fee/bump can't wrap; real fees are nowhere near
+    // U256::MAX, but a panic in the recovery path is never acceptable.
+    let num = v.saturating_mul(U256::from(10_000u32 + bump_bps));
+    (num.saturating_add(denom - U256::from(1u8))) / denom
 }
 
 /// Transaction request (unsigned transaction parameters)
