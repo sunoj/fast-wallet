@@ -28,9 +28,10 @@ pub const RBF_MIN_BUMP_BPS: u32 = 1250;
 #[inline]
 pub(crate) fn bump_u256(v: U256, bump_bps: u32) -> U256 {
     let denom = U256::from(10_000u32);
-    // Saturating so an extreme fee/bump can't wrap; real fees are nowhere near
-    // U256::MAX, but a panic in the recovery path is never acceptable.
-    let num = v.saturating_mul(U256::from(10_000u32 + bump_bps));
+    // u64 widening avoids a `10_000 + bump_bps` u32 overflow panic for extreme
+    // caller-supplied bumps; saturating U256 math guards the (unreachable for real
+    // fees) product overflow. A panic in the recovery path is never acceptable.
+    let num = v.saturating_mul(U256::from(10_000u64 + bump_bps as u64));
     (num.saturating_add(denom - U256::from(1u8))) / denom
 }
 
