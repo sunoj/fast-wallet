@@ -100,7 +100,12 @@ impl InflightNonceLedger {
     }
 
     pub fn mark_rebroadcast_accepted(&self, nonce: u64, tx_hash: B256) {
-        self.update(nonce, tx_hash, InflightNonceStatus::RebroadcastAccepted, None);
+        self.update(
+            nonce,
+            tx_hash,
+            InflightNonceStatus::RebroadcastAccepted,
+            None,
+        );
     }
 
     pub fn mark_released(&self, nonce: u64, reason: impl Into<String>) {
@@ -193,7 +198,10 @@ impl InflightNonceLedger {
 }
 
 fn is_unresolved(status: InflightNonceStatus) -> bool {
-    !matches!(status, InflightNonceStatus::Released | InflightNonceStatus::Mined)
+    !matches!(
+        status,
+        InflightNonceStatus::Released | InflightNonceStatus::Mined
+    )
 }
 
 fn is_broadcast_acceptance(status: InflightNonceStatus) -> bool {

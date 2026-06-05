@@ -986,10 +986,7 @@ impl FastWallet {
     }
 
     /// Inspect the lowest unresolved nonce at or above a chain nonce.
-    pub fn lowest_unresolved_inflight(
-        &self,
-        chain_next: u64,
-    ) -> Option<InflightNonceSnapshot> {
+    pub fn lowest_unresolved_inflight(&self, chain_next: u64) -> Option<InflightNonceSnapshot> {
         self.inflight_nonces
             .lowest_unresolved_at_or_above(chain_next)
     }
@@ -1466,8 +1463,7 @@ impl FastWallet {
 
         while start.elapsed() < max_wait {
             if self.rpc_client.tx_exists(tx_hash).await.unwrap_or(false) {
-                self.inflight_nonces
-                    .mark_mempool_seen(tx.nonce(), tx_hash);
+                self.inflight_nonces.mark_mempool_seen(tx.nonce(), tx_hash);
                 return Ok(true);
             }
             tokio::time::sleep(poll_interval).await;
