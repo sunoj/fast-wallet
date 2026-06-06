@@ -108,9 +108,22 @@ impl RpcClient {
     /// This establishes TCP/TLS connections ahead of time, saving 5-20ms
     /// on subsequent requests. Use this before time-critical operations.
     pub async fn warmup(&self) -> WalletResult<()> {
-        // eth_chainId is the lightest RPC call - just returns the chain ID
-        let _: String = self.request("eth_chainId", json!([])).await?;
-        Ok(())
+        // eth_chainId is the lightest RPC call - just returns the chain ID.
+        // Bound warmup with a short timeout so a blackholed / network-partitioned
+        // endpoint cannot stall callers (e.g. preheat_full's `join!`) for the full
+        // 30s reqwest timeout. Warmup is best-effort connection priming — a miss is
+        // non-fatal (the real send still establishes the connection), so a slow
+        // endpoint should be abandoned quickly rather than block the hot path.
+        const WARMUP_TIMEOUT: Duration = Duration::from_millis(500);
+        match tokio::time::timeout(
+            WARMUP_TIMEOUT,
+            self.request::<String>("eth_chainId", json!([])),
+        )
+        .await
+        {
+            Ok(result) => result.map(|_| ()),
+            Err(_) => Err(WalletError::Timeout),
+        }
     }
 
     /// Get next request ID (atomic, lock-free)
@@ -772,6 +785,32 @@ mod tests {
         assert_eq!(
             result.tx_hash,
             "0x2222222222222222222222222222222222222222222222222222222222222222"
+        );
+    }
+
+    #[tokio::test]
+    async fn warmup_bails_out_fast_on_blackholed_endpoint() {
+        // Accept + read the request but never reply, holding the connection open
+        // far past the warmup timeout — simulates a blackholed / partitioned RPC.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 2048];
+            let _ = stream.read(&mut buf).await;
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            let _ = &mut stream;
+        });
+
+        let client = RpcClient::new(format!("http://{addr}")).unwrap();
+        let start = Instant::now();
+        let result = client.warmup().await;
+        let elapsed = start.elapsed();
+
+        assert!(result.is_err(), "warmup must fail on a blackholed endpoint");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "warmup must bail via the 500ms timeout, not the 30s reqwest timeout (took {elapsed:?})"
         );
     }
 }
