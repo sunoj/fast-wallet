@@ -1553,6 +1553,34 @@ impl FastWallet {
     }
 
     /// Verify a broadcast TX is visible in the mempool/chain.
+    /// Poll `eth_getTransactionByHash` for `tx_hash` for up to `max_wait`, WITHOUT
+    /// re-broadcasting or touching the nonce. Marks the in-flight ledger
+    /// `MempoolSeen` when observed (preserving the propagation signal used by
+    /// nonce-health gating). Returns true iff the tx was observed within the window.
+    ///
+    /// This is the safe variant for callers that have already handed `tx_hash` to a
+    /// receipt poller and own their own retry/reclaim: unlike [`Self::verify_broadcast`]
+    /// it never bumps the fee, never changes the tracked hash, and never releases the
+    /// nonce — so a fire-and-forget lane's receipt poll keeps pointing at a hash that
+    /// can still mine, and the caller's reclaim ownership is unaffected.
+    pub async fn verify_broadcast_check_only(
+        &self,
+        tx: &Transaction,
+        tx_hash: B256,
+        max_wait: Duration,
+    ) -> WalletResult<bool> {
+        let poll_interval = Duration::from_millis(500);
+        let start = Instant::now();
+        while start.elapsed() < max_wait {
+            if self.rpc_client.tx_exists(tx_hash).await.unwrap_or(false) {
+                self.inflight_nonces.mark_mempool_seen(tx.nonce(), tx_hash);
+                return Ok(true);
+            }
+            tokio::time::sleep(poll_interval).await;
+        }
+        Ok(false)
+    }
+
     /// Polls `eth_getTransactionByHash` for up to `max_wait`. If not found, re-broadcasts
     /// with bumped fees (the vanished tx was likely evicted as underpriced; an
     /// identical-gas re-send won't land). Same nonce ⇒ original and replacement are
@@ -1564,24 +1592,26 @@ impl FastWallet {
     /// MUST rebind to `effective_hash`; the original hash will never appear on-chain
     /// once it has been replaced. Releases the nonce and returns the error if the
     /// re-broadcast cannot be sent.
+    ///
+    /// If your caller has already handed `tx_hash` to a receipt poller and owns its
+    /// own retry/reclaim (e.g. a fire-and-forget lane), use
+    /// [`Self::verify_broadcast_check_only`] instead — it never bumps the hash or
+    /// touches the nonce.
     pub async fn verify_broadcast(
         &self,
         tx: &Transaction,
         tx_hash: B256,
         max_wait: Duration,
     ) -> WalletResult<VerifyOutcome> {
-        let poll_interval = Duration::from_millis(500);
         let start = Instant::now();
-
-        while start.elapsed() < max_wait {
-            if self.rpc_client.tx_exists(tx_hash).await.unwrap_or(false) {
-                self.inflight_nonces.mark_mempool_seen(tx.nonce(), tx_hash);
-                return Ok(VerifyOutcome {
-                    in_mempool: true,
-                    effective_hash: tx_hash,
-                });
-            }
-            tokio::time::sleep(poll_interval).await;
+        if self
+            .verify_broadcast_check_only(tx, tx_hash, max_wait)
+            .await?
+        {
+            return Ok(VerifyOutcome {
+                in_mempool: true,
+                effective_hash: tx_hash,
+            });
         }
 
         // TX not found — re-broadcast with bumped fees (RBF, +12.5% floor).
@@ -3334,5 +3364,30 @@ mod tests {
             tx.hash(),
             "rebroadcast bumped the fees, so the effective hash must change"
         );
+    }
+
+    #[tokio::test]
+    async fn verify_broadcast_check_only_no_rebroadcast_no_release() {
+        // tx never appears → check_only returns false WITHOUT re-broadcasting or
+        // releasing the nonce (contrast verify_broadcast, which bumps + may release).
+        // The caller owns reclaim and keeps tracking the original hash.
+        let (url, sent) = mock_rpc_server(0, 1_000_000_000, 20_000_000_000, false).await;
+        let wallet = FastWalletBuilder::new(TEST_PRIVATE_KEY, &url)
+            .chain_id(1)
+            .build_with_nonce(0)
+            .unwrap();
+        let ctx = PreheatedContext::new(wallet.nonce_manager.reserve());
+        let tx = wallet.sign_with_preheat(&ctx, test_request()).unwrap();
+        wallet.commit_preheat(&ctx);
+
+        let found = wallet
+            .verify_broadcast_check_only(&tx, tx.hash(), Duration::from_millis(50))
+            .await
+            .unwrap();
+
+        assert!(!found, "tx was never in mempool");
+        assert!(sent.lock().is_empty(), "check_only must NOT re-broadcast");
+        // nonce 0 stays consumed (not released) → next sign advances to nonce 1.
+        assert_eq!(wallet.sign(test_request()).unwrap().nonce(), 1);
     }
 }
