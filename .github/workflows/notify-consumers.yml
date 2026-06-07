@@ -1,0 +1,29 @@
+# Library-side release hook (A) of the dep-freshness mechanism.
+# On a new release tag, file/refresh upgrade issues on every bot repo that
+# pins an older tag of THIS library. Same engine as the daily cron backstop (B):
+# sunoj/zhuge-tools/lib-upgrade-check.sh. Drop this identical file into any
+# shared-lib repo — the lib name is auto-detected from the repo name.
+#
+# Requires repo secret CONSUMER_ISSUES_TOKEN: a PAT (classic `repo` scope, or
+# fine-grained with Contents:read on sunoj/zhuge-tools + Issues:write on the bot
+# repos). The default GITHUB_TOKEN cannot open issues in OTHER repos.
+name: notify-consumers
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: read
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out shared tools
+        uses: actions/checkout@v4
+        with:
+          repository: sunoj/zhuge-tools
+          token: ${{ secrets.CONSUMER_ISSUES_TOKEN }}
+          path: zhuge-tools
+      - name: File upgrade issues on lagging consumers
+        env:
+          GH_TOKEN: ${{ secrets.CONSUMER_ISSUES_TOKEN }}
+        run: bash zhuge-tools/lib-upgrade-check.sh --lib "${{ github.event.repository.name }}" --verbose
