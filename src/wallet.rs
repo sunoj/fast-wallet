@@ -2583,20 +2583,22 @@ mod tests {
     }
 
     /// End-to-end via the sync builder path (`build_with_nonce`, no network
-    /// access needed): confirms the wallet actually constructs with a
-    /// `batch_client` when `broadcast_rpcs_exclusive` is used, exercising
-    /// the real code path (not just the pure resolver function above).
+    /// access needed): confirms that a NON-EMPTY exclusive broadcast list
+    /// constructs a batch client containing ONLY the exclusive endpoints —
+    /// `endpoint_count() == 1`, not 2 — i.e. primary_rpc is genuinely never
+    /// folded in for this case. (Round-2 audit correction: this does NOT
+    /// discriminate old vs. new code — `resolve_broadcast_rpcs`'s exclusive
+    /// branch already excluded primary_rpc correctly for non-empty lists in
+    /// the original 105846e commit; the actual bug this session fixed was
+    /// specific to an EMPTY exclusive list silently falling back to
+    /// primary-only broadcast — see the two `_rejects_empty_exclusive_`
+    /// tests below for that regression coverage instead.)
     #[test]
     fn build_with_nonce_exclusive_broadcast_constructs_batch_client() {
         let wallet = FastWalletBuilder::new(TEST_PRIVATE_KEY, "http://localhost:8545")
             .broadcast_rpcs_exclusive(vec!["http://localhost:8546".into()])
             .build_with_nonce(0)
             .unwrap();
-        // Cross-audit finding: asserting only `is_some()` would pass equally
-        // under the pre-fix bug (which also produces a non-empty batch
-        // client, just with 2 endpoints instead of 1). Assert the actual
-        // endpoint count to discriminate "primary excluded" from "primary
-        // leaked in" — 1 endpoint (only the exclusive one), not 2.
         assert_eq!(wallet.batch_client.as_ref().unwrap().endpoint_count(), 1);
     }
 
