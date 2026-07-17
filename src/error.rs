@@ -52,6 +52,9 @@ pub enum WalletError {
 
     #[error("Transaction timeout")]
     Timeout,
+
+    #[error("Invalid wallet configuration: {0}")]
+    InvalidConfig(String),
 }
 
 /// Result type alias for wallet operations
