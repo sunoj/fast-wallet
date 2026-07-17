@@ -2379,6 +2379,19 @@ impl FastWalletBuilder {
 
     /// Build the wallet (async - fetches nonce from chain if not provided)
     pub async fn build(self) -> WalletResult<FastWallet> {
+        // Cross-audit finding (both codex and an independent reviewer,
+        // 2026-07-17): `broadcast_rpcs_exclusive(vec![])` used to silently
+        // skip batch_client construction entirely (the `!is_empty()` guards
+        // below never fire), leaving the wallet to fall back to
+        // `self.rpc_client` (primary_rpc) for every broadcast — exactly the
+        // public-endpoint leak `exclusive_broadcast` exists to prevent, with
+        // no error raised. Fail loudly instead: an exclusive broadcast set
+        // with zero endpoints can never honor its own exclusivity contract.
+        if self.exclusive_broadcast && self.broadcast_rpcs.is_empty() {
+            return Err(WalletError::InvalidConfig(
+                "broadcast_rpcs_exclusive requires at least one RPC endpoint — an empty list would silently fall back to broadcasting via primary_rpc".into(),
+            ));
+        }
         let gas_rpc_url = self.gas_rpc_url;
 
         if let Some(nonce) = self.initial_nonce {
@@ -2435,6 +2448,13 @@ impl FastWalletBuilder {
 
     /// Build with known nonce (synchronous - no RPC call)
     pub fn build_with_nonce(self, nonce: u64) -> WalletResult<FastWallet> {
+        // See the matching guard in `build()` — an empty exclusive broadcast
+        // set must fail loudly, not silently fall back to primary_rpc.
+        if self.exclusive_broadcast && self.broadcast_rpcs.is_empty() {
+            return Err(WalletError::InvalidConfig(
+                "broadcast_rpcs_exclusive requires at least one RPC endpoint — an empty list would silently fall back to broadcasting via primary_rpc".into(),
+            ));
+        }
         let mut wallet =
             FastWallet::with_known_nonce(&self.private_key, &self.primary_rpc, nonce, self.config)?;
 
@@ -2572,7 +2592,36 @@ mod tests {
             .broadcast_rpcs_exclusive(vec!["http://localhost:8546".into()])
             .build_with_nonce(0)
             .unwrap();
-        assert!(wallet.batch_client.is_some());
+        // Cross-audit finding: asserting only `is_some()` would pass equally
+        // under the pre-fix bug (which also produces a non-empty batch
+        // client, just with 2 endpoints instead of 1). Assert the actual
+        // endpoint count to discriminate "primary excluded" from "primary
+        // leaked in" — 1 endpoint (only the exclusive one), not 2.
+        assert_eq!(wallet.batch_client.as_ref().unwrap().endpoint_count(), 1);
+    }
+
+    /// Cross-audit finding (both codex and an independent reviewer,
+    /// 2026-07-17): an empty exclusive broadcast list must fail loudly, not
+    /// silently degrade to broadcasting via primary_rpc.
+    #[test]
+    fn build_with_nonce_rejects_empty_exclusive_broadcast_list() {
+        let result = FastWalletBuilder::new(TEST_PRIVATE_KEY, "http://localhost:8545")
+            .broadcast_rpcs_exclusive(vec![])
+            .build_with_nonce(0);
+        assert!(matches!(result, Err(WalletError::InvalidConfig(_))));
+    }
+
+    /// Same guard, but on the async `build()` path (a separate function
+    /// with its own duplicated check, not a delegate of `build_with_nonce`)
+    /// — must not be exercised only on the sync path and assumed identical.
+    #[tokio::test]
+    async fn build_rejects_empty_exclusive_broadcast_list() {
+        let result = FastWalletBuilder::new(TEST_PRIVATE_KEY, "http://localhost:8545")
+            .broadcast_rpcs_exclusive(vec![])
+            .initial_nonce(0)
+            .build()
+            .await;
+        assert!(matches!(result, Err(WalletError::InvalidConfig(_))));
     }
 
     #[test]
