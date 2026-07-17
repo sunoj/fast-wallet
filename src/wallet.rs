@@ -2172,8 +2172,23 @@ pub struct FastWalletBuilder {
     primary_rpc: String,
     gas_rpc_url: Option<String>,
     broadcast_rpcs: Vec<String>,
+    exclusive_broadcast: bool,
     config: WalletConfig,
     initial_nonce: Option<u64>,
+}
+
+/// Resolve the final broadcast RPC list: `primary_rpc` prepended unless
+/// `exclusive` is set, in which case `broadcast_rpcs` is used as-is. Shared
+/// by `FastWalletBuilder::build()`/`build_with_nonce()` so the two callers
+/// can't drift on this logic.
+fn resolve_broadcast_rpcs(primary_rpc: &str, broadcast_rpcs: Vec<String>, exclusive: bool) -> Vec<String> {
+    if exclusive {
+        broadcast_rpcs
+    } else {
+        let mut all_rpcs = vec![primary_rpc.to_string()];
+        all_rpcs.extend(broadcast_rpcs);
+        all_rpcs
+    }
 }
 
 impl FastWalletBuilder {
@@ -2183,6 +2198,7 @@ impl FastWalletBuilder {
             primary_rpc: primary_rpc.into(),
             gas_rpc_url: None,
             broadcast_rpcs: Vec::new(),
+            exclusive_broadcast: false,
             config: WalletConfig::default(),
             initial_nonce: None,
         }
@@ -2209,6 +2225,7 @@ impl FastWalletBuilder {
             primary_rpc: format!("https://eth.blinklabs.xyz/v1/{}", api_key),
             gas_rpc_url: None,
             broadcast_rpcs: Vec::new(),
+            exclusive_broadcast: false,
             config: WalletConfig::default(),
             initial_nonce: None,
         }
@@ -2228,14 +2245,37 @@ impl FastWalletBuilder {
             primary_rpc: format!("https://{}.blinklabs.xyz/v1/{}", chain, api_key),
             gas_rpc_url: None,
             broadcast_rpcs: Vec::new(),
+            exclusive_broadcast: false,
             config: WalletConfig::default(),
             initial_nonce: None,
         }
     }
 
-    /// Add RPC endpoints for parallel broadcasting
+    /// Add RPC endpoints for parallel broadcasting. `primary_rpc` is always
+    /// included in the broadcast fan-out alongside these (the default,
+    /// backward-compatible behavior) — see `broadcast_rpcs_exclusive` if
+    /// `primary_rpc` must NOT receive the signed transaction.
     pub fn broadcast_rpcs(mut self, rpcs: Vec<String>) -> Self {
         self.broadcast_rpcs = rpcs;
+        self.exclusive_broadcast = false;
+        self
+    }
+
+    /// Add RPC endpoints for parallel broadcasting, WITHOUT including
+    /// `primary_rpc` in the broadcast set.
+    ///
+    /// Use this when `primary_rpc` must not receive the signed transaction —
+    /// e.g. `primary_rpc` is a public endpoint and `rpcs` is meant to be an
+    /// exclusively private-routing broadcast set (Flashbots Protect, MEV
+    /// Blocker, etc.) for MEV protection. `primary_rpc` is still used for
+    /// everything else (nonce fetch, `eth_call`, receipt polling via
+    /// `self.rpc()`) — only the broadcast fan-out excludes it.
+    ///
+    /// Contrast with `broadcast_rpcs`, which always prepends `primary_rpc`
+    /// to the broadcast list.
+    pub fn broadcast_rpcs_exclusive(mut self, rpcs: Vec<String>) -> Self {
+        self.broadcast_rpcs = rpcs;
+        self.exclusive_broadcast = true;
         self
     }
 
@@ -2350,8 +2390,8 @@ impl FastWalletBuilder {
             )?;
 
             if !self.broadcast_rpcs.is_empty() {
-                let mut all_rpcs = vec![self.primary_rpc.clone()];
-                all_rpcs.extend(self.broadcast_rpcs);
+                let all_rpcs =
+                    resolve_broadcast_rpcs(&self.primary_rpc, self.broadcast_rpcs, self.exclusive_broadcast);
                 wallet.batch_client = Some(Arc::new(BatchRpcClient::new(all_rpcs)?));
             }
 
@@ -2361,13 +2401,20 @@ impl FastWalletBuilder {
 
             Ok(wallet)
         } else if !self.broadcast_rpcs.is_empty() {
-            let mut wallet = FastWallet::with_multiple_rpcs(
-                &self.private_key,
-                &self.primary_rpc,
-                self.broadcast_rpcs,
-                self.config,
-            )
-            .await?;
+            let mut wallet = if self.exclusive_broadcast {
+                let mut wallet =
+                    FastWallet::new(&self.private_key, &self.primary_rpc, self.config).await?;
+                wallet.batch_client = Some(Arc::new(BatchRpcClient::new(self.broadcast_rpcs)?));
+                wallet
+            } else {
+                FastWallet::with_multiple_rpcs(
+                    &self.private_key,
+                    &self.primary_rpc,
+                    self.broadcast_rpcs,
+                    self.config,
+                )
+                .await?
+            };
 
             if let Some(url) = gas_rpc_url {
                 wallet.gas_rpc_client = Some(Arc::new(RpcClient::new(&url)?));
@@ -2392,8 +2439,8 @@ impl FastWalletBuilder {
             FastWallet::with_known_nonce(&self.private_key, &self.primary_rpc, nonce, self.config)?;
 
         if !self.broadcast_rpcs.is_empty() {
-            let mut all_rpcs = vec![self.primary_rpc.clone()];
-            all_rpcs.extend(self.broadcast_rpcs);
+            let all_rpcs =
+                resolve_broadcast_rpcs(&self.primary_rpc, self.broadcast_rpcs, self.exclusive_broadcast);
             wallet.batch_client = Some(Arc::new(BatchRpcClient::new(all_rpcs)?));
         }
 
@@ -2452,6 +2499,80 @@ mod tests {
 
         assert_eq!(wallet.current_nonce(), 0);
         assert_eq!(wallet.config.chain_id, 1);
+    }
+
+    /// Default (backward-compatible) behavior: `primary_rpc` is always
+    /// included in the broadcast fan-out alongside the configured
+    /// `broadcast_rpcs`.
+    #[test]
+    fn resolve_broadcast_rpcs_default_includes_primary() {
+        let rpcs = resolve_broadcast_rpcs(
+            "https://primary.example.com",
+            vec!["https://a.example.com".into(), "https://b.example.com".into()],
+            false,
+        );
+        assert_eq!(
+            rpcs,
+            vec![
+                "https://primary.example.com".to_string(),
+                "https://a.example.com".to_string(),
+                "https://b.example.com".to_string(),
+            ]
+        );
+    }
+
+    /// Exclusive mode: `primary_rpc` must NOT appear anywhere in the
+    /// resolved broadcast list — this is the actual fix for the MEV-leak
+    /// this feature exists to close (a public primary_rpc must never
+    /// receive a tx meant to be routed exclusively through private
+    /// endpoints like Flashbots Protect / MEV Blocker).
+    #[test]
+    fn resolve_broadcast_rpcs_exclusive_excludes_primary() {
+        let primary = "https://primary.example.com";
+        let rpcs = resolve_broadcast_rpcs(
+            primary,
+            vec!["https://relay.flashbots.net".into(), "https://rpc.mevblocker.io/fullprivacy".into()],
+            true,
+        );
+        assert_eq!(
+            rpcs,
+            vec![
+                "https://relay.flashbots.net".to_string(),
+                "https://rpc.mevblocker.io/fullprivacy".to_string(),
+            ]
+        );
+        assert!(!rpcs.iter().any(|url| url == primary), "primary_rpc leaked into an exclusive broadcast set");
+    }
+
+    /// `broadcast_rpcs_exclusive` builder method actually sets the flag the
+    /// resolver reads — a regression here would silently re-introduce the
+    /// leak even with the resolver itself correct.
+    #[test]
+    fn broadcast_rpcs_exclusive_sets_the_exclusive_flag() {
+        let builder = FastWalletBuilder::new(TEST_PRIVATE_KEY, "https://primary.example.com")
+            .broadcast_rpcs_exclusive(vec!["https://relay.flashbots.net".into()]);
+        assert!(builder.exclusive_broadcast);
+
+        // The non-exclusive method must leave it false, and switching back
+        // via `broadcast_rpcs` after calling the exclusive variant must
+        // reset the flag rather than leaving stale exclusive state.
+        let builder = FastWalletBuilder::new(TEST_PRIVATE_KEY, "https://primary.example.com")
+            .broadcast_rpcs_exclusive(vec!["https://relay.flashbots.net".into()])
+            .broadcast_rpcs(vec!["https://a.example.com".into()]);
+        assert!(!builder.exclusive_broadcast);
+    }
+
+    /// End-to-end via the sync builder path (`build_with_nonce`, no network
+    /// access needed): confirms the wallet actually constructs with a
+    /// `batch_client` when `broadcast_rpcs_exclusive` is used, exercising
+    /// the real code path (not just the pure resolver function above).
+    #[test]
+    fn build_with_nonce_exclusive_broadcast_constructs_batch_client() {
+        let wallet = FastWalletBuilder::new(TEST_PRIVATE_KEY, "http://localhost:8545")
+            .broadcast_rpcs_exclusive(vec!["http://localhost:8546".into()])
+            .build_with_nonce(0)
+            .unwrap();
+        assert!(wallet.batch_client.is_some());
     }
 
     #[test]
