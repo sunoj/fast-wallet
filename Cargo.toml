@@ -5,7 +5,7 @@
 
 [package]
 name = "fast-wallet"
-version = "0.1.43"
+version = "0.2.0"
 edition = "2021"
 description = "High-performance EVM wallet optimized for liquidation bots and MEV"
 authors = ["Ming <ming@xinxiao.tech>"]
@@ -72,6 +72,9 @@ serde_json = "1.0"
 
 # Hex encoding/decoding
 hex = "0.4"
+
+# Wipe plaintext private-key material from memory (buffers + intermediates, drop)
+zeroize = "1"
 
 # Error handling
 thiserror = "2.0"

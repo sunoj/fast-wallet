@@ -13,12 +13,33 @@
 use crate::crypto::{keccak256, public_key_to_address};
 use crate::error::{WalletError, WalletResult};
 use alloy::primitives::{Address, B256};
+use std::path::Path;
+use zeroize::Zeroize;
 
 #[cfg(not(feature = "secp256k1-ffi"))]
-use k256::ecdsa::{SigningKey, VerifyingKey};
+use k256::ecdsa::SigningKey;
 
 #[cfg(feature = "secp256k1-ffi")]
 use secp256k1::{Message, PublicKey, SecretKey, SECP256K1};
+
+/// Where a signer's private key comes from.
+///
+/// The hot path (`sign_hash*`) is identical regardless of source — the key is
+/// unsealed into memory exactly once at construction, then all signing is local.
+pub enum KeySource<'a> {
+    /// Raw hex private key. For development / no-KMS deployments.
+    Hex(&'a str),
+    /// systemd-delivered credential: reads `$CREDENTIALS_DIRECTORY/<name>`, a
+    /// file systemd has already decrypted from its encrypted-at-rest form
+    /// (`LoadCredentialEncrypted=`). fast-wallet never sees the ciphertext.
+    ///
+    /// `name` must be a trusted, separator-free credential name (normally a
+    /// hardcoded literal such as `"executor-key"`). It is joined onto
+    /// `$CREDENTIALS_DIRECTORY`; an absolute path or one containing `..` would
+    /// escape that directory via `Path::join`, so never thread attacker- or
+    /// config-influenced input into it.
+    Credential(&'a str),
+}
 
 /// Recovery ID with chain ID for EIP-155
 #[derive(Debug, Clone, Copy)]
@@ -48,7 +69,6 @@ impl RecoverableSignature {
 /// Fast ECDSA signer with pre-computed public key and address
 pub struct FastSigner {
     signing_key: SigningKey,
-    verifying_key: VerifyingKey,
     address: Address,
 }
 
@@ -64,7 +84,6 @@ pub struct FastSigner {
 /// ~2-3x faster than the pure Rust implementation.
 pub struct FastSigner {
     secret_key: SecretKey,
-    public_key: PublicKey,
     address: Address,
 }
 
@@ -79,17 +98,14 @@ impl FastSigner {
         let signing_key = SigningKey::from_bytes(private_key.into())
             .map_err(|e| WalletError::InvalidPrivateKey(e.to_string()))?;
 
-        let verifying_key = *signing_key.verifying_key();
-
-        // Get uncompressed public key (without 0x04 prefix)
-        let pubkey_point = verifying_key.to_encoded_point(false);
+        // Derive the address from the (uncompressed, 0x04-prefixed) public key.
+        let pubkey_point = signing_key.verifying_key().to_encoded_point(false);
         let pubkey_bytes = pubkey_point.as_bytes();
         // Skip the 0x04 prefix
         let address = public_key_to_address(&pubkey_bytes[1..]);
 
         Ok(Self {
             signing_key,
-            verifying_key,
             address,
         })
     }
@@ -97,18 +113,22 @@ impl FastSigner {
     /// Create a new signer from a hex-encoded private key
     pub fn from_hex(hex_key: &str) -> WalletResult<Self> {
         let hex_key = hex_key.strip_prefix("0x").unwrap_or(hex_key);
-        let key_bytes = hex::decode(hex_key)?;
+        let mut key_bytes = hex::decode(hex_key)?;
 
         if key_bytes.len() != 32 {
+            let len = key_bytes.len();
+            key_bytes.zeroize();
             return Err(WalletError::InvalidPrivateKey(format!(
-                "Expected 32 bytes, got {}",
-                key_bytes.len()
+                "Expected 32 bytes, got {len}"
             )));
         }
 
         let mut private_key = [0u8; 32];
         private_key.copy_from_slice(&key_bytes);
-        Self::new(&private_key)
+        key_bytes.zeroize();
+        let signer = Self::new(&private_key);
+        private_key.zeroize();
+        signer
     }
 
     /// Get the Ethereum address
@@ -196,17 +216,14 @@ impl FastSigner {
         let secret_key = SecretKey::from_slice(private_key)
             .map_err(|e| WalletError::InvalidPrivateKey(e.to_string()))?;
 
-        // Use the global context with precomputed tables
+        // Derive the address from the (uncompressed, 0x04-prefixed) public key.
         let public_key = PublicKey::from_secret_key(SECP256K1, &secret_key);
-
-        // Get uncompressed public key bytes (65 bytes with 0x04 prefix)
         let pubkey_bytes = public_key.serialize_uncompressed();
         // Skip the 0x04 prefix
         let address = public_key_to_address(&pubkey_bytes[1..]);
 
         Ok(Self {
             secret_key,
-            public_key,
             address,
         })
     }
@@ -214,18 +231,22 @@ impl FastSigner {
     /// Create a new signer from a hex-encoded private key
     pub fn from_hex(hex_key: &str) -> WalletResult<Self> {
         let hex_key = hex_key.strip_prefix("0x").unwrap_or(hex_key);
-        let key_bytes = hex::decode(hex_key)?;
+        let mut key_bytes = hex::decode(hex_key)?;
 
         if key_bytes.len() != 32 {
+            let len = key_bytes.len();
+            key_bytes.zeroize();
             return Err(WalletError::InvalidPrivateKey(format!(
-                "Expected 32 bytes, got {}",
-                key_bytes.len()
+                "Expected 32 bytes, got {len}"
             )));
         }
 
         let mut private_key = [0u8; 32];
         private_key.copy_from_slice(&key_bytes);
-        Self::new(&private_key)
+        key_bytes.zeroize();
+        let signer = Self::new(&private_key);
+        private_key.zeroize();
+        signer
     }
 
     /// Get the Ethereum address
@@ -306,25 +327,48 @@ impl FastSigner {
     }
 }
 
-#[cfg(not(feature = "secp256k1-ffi"))]
-impl Clone for FastSigner {
-    fn clone(&self) -> Self {
-        Self {
-            signing_key: self.signing_key.clone(),
-            verifying_key: self.verifying_key,
-            address: self.address,
+// Construction entry that is identical across both backends. The hot path is
+// untouched; only the source of the key material differs.
+//
+// `FastSigner` deliberately does NOT implement `Clone`: cloning would copy
+// plaintext key material into new memory and defeat zeroize-on-drop. It is
+// never cloned internally — every call site borrows `&signer`.
+impl FastSigner {
+    /// Build a signer from any [`KeySource`].
+    ///
+    /// - [`KeySource::Hex`] is the existing behavior.
+    /// - [`KeySource::Credential`] reads `$CREDENTIALS_DIRECTORY/<name>` (a file
+    ///   systemd decrypts for us at service start), parses it as a hex key, and
+    ///   wipes the plaintext buffer immediately after. Signing stays fully local.
+    pub fn from_source(src: KeySource<'_>) -> WalletResult<Self> {
+        match src {
+            KeySource::Hex(hex_key) => Self::from_hex(hex_key),
+            KeySource::Credential(name) => {
+                let dir = std::env::var("CREDENTIALS_DIRECTORY")
+                    .map_err(|_| WalletError::NoCredentialsDir)?;
+                let mut buf = std::fs::read_to_string(Path::new(&dir).join(name))
+                    .map_err(|e| WalletError::CredentialError(e.to_string()))?;
+                // `from_hex` wipes its own decode intermediates; we wipe the file buffer.
+                let signer = Self::from_hex(buf.trim());
+                buf.zeroize();
+                signer
+            }
         }
     }
 }
 
+// secp256k1's `SecretKey` has no zeroize-on-drop; wipe it explicitly. (The k256
+// backend's `SigningKey` is `ZeroizeOnDrop` upstream, so it needs no manual Drop.)
+//
+// Weaker guarantee than the k256 default: `secp256k1::SecretKey` is `Copy`, and
+// libsecp256k1's own docs warn the compiler may freely copy the key array. This
+// erases the struct-resident copy; transient stack copies made during
+// construction are outside our control (short of `mlock`/crate change). The
+// default k256 backend has no such caveat.
 #[cfg(feature = "secp256k1-ffi")]
-impl Clone for FastSigner {
-    fn clone(&self) -> Self {
-        Self {
-            secret_key: self.secret_key,
-            public_key: self.public_key,
-            address: self.address,
-        }
+impl Drop for FastSigner {
+    fn drop(&mut self) {
+        self.secret_key.non_secure_erase();
     }
 }
 
@@ -356,10 +400,39 @@ mod tests {
     }
 
     #[test]
-    fn test_signer_clone() {
-        let signer = FastSigner::from_hex(TEST_PRIVATE_KEY).unwrap();
-        let cloned = signer.clone();
-        assert_eq!(signer.address(), cloned.address());
+    fn test_from_source_hex_matches_from_hex() {
+        let a = FastSigner::from_source(KeySource::Hex(TEST_PRIVATE_KEY)).unwrap();
+        let b = FastSigner::from_hex(TEST_PRIVATE_KEY).unwrap();
+        assert_eq!(a.address(), b.address());
+    }
+
+    // Full credential lifecycle in one test so the process-global
+    // CREDENTIALS_DIRECTORY env var is never manipulated by two tests in
+    // parallel (which would race).
+    #[test]
+    fn test_from_source_credential_lifecycle() {
+        // 1. Missing dir → NoCredentialsDir.
+        std::env::remove_var("CREDENTIALS_DIRECTORY");
+        assert!(matches!(
+            FastSigner::from_source(KeySource::Credential("executor-key")),
+            Err(WalletError::NoCredentialsDir)
+        ));
+
+        // 2. Point at a temp dir holding the key file (with trailing newline,
+        //    as systemd-creds / editors commonly leave), expect success.
+        let dir = std::env::temp_dir().join("fast_wallet_cred_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let key_path = dir.join("executor-key");
+        std::fs::write(&key_path, format!("{TEST_PRIVATE_KEY}\n")).unwrap();
+        std::env::set_var("CREDENTIALS_DIRECTORY", &dir);
+
+        let signer = FastSigner::from_source(KeySource::Credential("executor-key")).unwrap();
+        let expected = FastSigner::from_hex(TEST_PRIVATE_KEY).unwrap();
+        assert_eq!(signer.address(), expected.address());
+
+        // Cleanup.
+        std::fs::remove_file(&key_path).ok();
+        std::env::remove_var("CREDENTIALS_DIRECTORY");
     }
 
     #[test]

@@ -57,7 +57,7 @@ pub use gas_provider::GasPriceProvider;
 pub use inflight::{InflightNonceLedger, InflightNonceSnapshot, InflightNonceStatus};
 pub use nonce::{NonceManager, ReservedNonce};
 pub use rpc::SendResult;
-pub use signer::FastSigner;
+pub use signer::{FastSigner, KeySource};
 pub use transaction::{Transaction, TransactionRequest, TypedTransaction};
 pub use wallet::{
     FastWallet, FastWalletBuilder, NonceHealth, PreheatedContext, ReplaceOutcome, VerifyOutcome,

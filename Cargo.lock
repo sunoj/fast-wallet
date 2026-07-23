@@ -1248,7 +1248,7 @@ dependencies = [
 
 [[package]]
 name = "fast-wallet"
-version = "0.1.43"
+version = "0.2.0"
 dependencies = [
  "alloy",
  "async-trait",
@@ -1266,6 +1266,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]
