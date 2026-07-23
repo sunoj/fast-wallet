@@ -55,6 +55,12 @@ pub enum WalletError {
 
     #[error("Invalid wallet configuration: {0}")]
     InvalidConfig(String),
+
+    #[error("CREDENTIALS_DIRECTORY not set (not running under systemd credential delivery)")]
+    NoCredentialsDir,
+
+    #[error("Credential read error: {0}")]
+    CredentialError(String),
 }
 
 /// Result type alias for wallet operations
