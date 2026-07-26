@@ -285,6 +285,7 @@ pub struct TransactionBroadcaster {
 impl TransactionBroadcaster {
     /// Create a new broadcaster with default settings
     pub fn new(endpoints: Vec<RpcEndpoint>) -> WalletResult<Self> {
+        crate::tls::ensure_provider();
         let client = Client::builder()
             .pool_max_idle_per_host(20)
             .pool_idle_timeout(Duration::from_secs(300))

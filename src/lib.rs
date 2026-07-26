@@ -48,6 +48,7 @@ pub mod inflight;
 pub mod nonce;
 pub mod rpc;
 pub mod signer;
+pub mod tls;
 pub mod transaction;
 pub mod wallet;
 

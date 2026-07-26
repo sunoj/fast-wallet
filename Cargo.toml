@@ -5,7 +5,7 @@
 
 [package]
 name = "fast-wallet"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "High-performance EVM wallet optimized for liquidation bots and MEV"
 authors = ["Ming <ming@xinxiao.tech>"]
@@ -64,7 +64,13 @@ alloy = { version = "1.0", default-features = false, features = ["std", "rlp"] }
 futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 
 # HTTP client for RPC
-reqwest = { version = "0.12", features = ["json", "rustls-tls", "http2"], default-features = false }
+# reqwest 0.13 offers only `rustls` (selects aws-lc-rs -> aws-lc-sys, a C/asm
+# build hostile to cross-compilation) or `rustls-no-provider`. We take the
+# latter to stay cross-compile clean and install `ring` ourselves in src/tls.rs,
+# so the move stays non-breaking for consumers. NOTE: 0.13 removed
+# `rustls-tls-webpki-roots`; roots now come from rustls-platform-verifier.
+reqwest = { version = "0.13", features = ["json", "rustls-no-provider", "http2"], default-features = false }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }

@@ -68,6 +68,7 @@ pub struct RpcClient {
 impl RpcClient {
     /// Create a new RPC client with optimized settings
     pub fn new(url: impl Into<String>) -> WalletResult<Self> {
+        crate::tls::ensure_provider();
         let client = Client::builder()
             .pool_max_idle_per_host(10)
             .pool_idle_timeout(Duration::from_secs(300))
