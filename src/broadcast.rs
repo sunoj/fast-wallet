@@ -473,7 +473,7 @@ impl TransactionBroadcaster {
                 let hash = alloy::primitives::keccak256(&tx_bytes);
                 tracing::warn!(
                     tx_hash = %hash,
-                    endpoint = %endpoint.url,
+                    endpoint = %crate::rpc::endpoint_host(&endpoint.url),
                     "RPC returned null result for eth_sendRawTransaction — TX likely accepted"
                 );
                 Ok(hash)

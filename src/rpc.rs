@@ -156,18 +156,23 @@ impl RpcClient {
             id: self.next_id(),
         };
 
+        // Redact where the error is BUILT, not where it is logged: a reqwest
+        // error embeds the keyed request URL, and this error is returned to
+        // callers that log it verbatim, wrap it in `format!("{e}")`, or hand it
+        // to per-endpoint telemetry. Sanitising downstream means one missed
+        // call site is a leaked API key.
         let response = self
             .client
             .post(&self.url)
             .json(&req)
             .send()
             .await
-            .map_err(|e| WalletError::NetworkError(e.to_string()))?;
+            .map_err(|e| WalletError::NetworkError(redact_urls(&e.to_string())))?;
 
         let rpc_response: RpcResponse<T> = response
             .json()
             .await
-            .map_err(|e| WalletError::RpcError(e.to_string()))?;
+            .map_err(|e| WalletError::RpcError(redact_urls(&e.to_string())))?;
 
         if let Some(error) = rpc_response.error {
             return Err(WalletError::RpcError(format_rpc_error(&error)));
@@ -531,9 +536,11 @@ pub fn redact_urls(message: &str) -> String {
         };
         out.push_str(&rest[..start]);
         let tail = &rest[start..];
-        let end = tail
-            .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | ')' | ',' | '>'))
-            .unwrap_or(tail.len());
+        // Consume to the next whitespace, never to a punctuation delimiter: a
+        // key may legitimately contain `,`, `)` or a quote, and stopping early
+        // would leave the remainder of it in the message. Losing a trailing
+        // `)` from `url (https://...)` is the right trade.
+        let end = tail.find(char::is_whitespace).unwrap_or(tail.len());
         out.push_str(endpoint_host(&tail[..end]));
         rest = &tail[end..];
     }
@@ -755,6 +762,11 @@ mod tests {
         // Several URLs in one message, and text after the last one.
         let many = redact_urls("https://a.io/k1 then https://b.io/k2 done");
         assert_eq!(many, "a.io then b.io done");
+
+        // Punctuation inside the key must not end the redaction early.
+        let punctuated = redact_urls("failed for url (https://host.io/k,SECRET) retrying");
+        assert!(!punctuated.contains("SECRET"), "{punctuated}");
+        assert_eq!(punctuated, "failed for url (host.io retrying");
 
         // Nothing to redact must round-trip untouched.
         assert_eq!(
