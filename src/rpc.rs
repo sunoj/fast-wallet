@@ -54,7 +54,7 @@ fn format_rpc_error(error: &RpcError) -> String {
             .unwrap_or_else(|| data.to_string());
         msg.push_str(&format!(" data={data_str}"));
     }
-    msg
+    redact_urls(&msg)
 }
 
 /// High-performance RPC client
@@ -297,12 +297,12 @@ impl RpcClient {
             semaphore_wait_ms: 0,
             broadcast_fanout_ms: endpoint_ms,
             fastest_endpoint_ms: endpoint_ms,
-            fastest_endpoint_url: self.url.clone(),
+            fastest_endpoint_host: endpoint_host(&self.url).to_string(),
             slowest_endpoint_ms: endpoint_ms,
             first_success_endpoint_index: 0,
             failed_endpoints: 0,
             connection_reused,
-            per_endpoint_ms: vec![(self.url.clone(), Ok(endpoint_ms))],
+            per_endpoint_ms: vec![(endpoint_host(&self.url).to_string(), Ok(endpoint_ms))],
         })
     }
 
@@ -499,11 +499,14 @@ pub struct SendResult {
     pub semaphore_wait_ms: u64,
     pub broadcast_fanout_ms: u64,
     pub fastest_endpoint_ms: u64,
-    pub fastest_endpoint_url: String,
+    /// Host of the endpoint that answered first. Host, never the URL:
+    /// consumers log this field, and RPC URLs carry API keys.
+    pub fastest_endpoint_host: String,
     pub slowest_endpoint_ms: u64,
     pub first_success_endpoint_index: usize,
     pub failed_endpoints: usize,
     pub connection_reused: bool,
+    /// Per-endpoint verdict as `(host, ms | redacted error)`.
     pub per_endpoint_ms: Vec<(String, Result<u64, String>)>,
 }
 
@@ -647,7 +650,7 @@ impl BatchRpcClient {
             slowest_endpoint_ms = slowest_endpoint_ms.max(endpoint_ms);
             match result {
                 Ok((hash, connection_reused)) => {
-                    per_endpoint_ms.push((url.clone(), Ok(endpoint_ms)));
+                    per_endpoint_ms.push((endpoint_host(&url).to_string(), Ok(endpoint_ms)));
                     if !remaining.is_empty() {
                         // The endpoints that had not answered yet still run to
                         // completion, but their verdicts used to be dropped —
@@ -682,7 +685,7 @@ impl BatchRpcClient {
                         semaphore_wait_ms: 0,
                         broadcast_fanout_ms: fanout_started.elapsed().as_millis() as u64,
                         fastest_endpoint_ms: endpoint_ms,
-                        fastest_endpoint_url: url,
+                        fastest_endpoint_host: endpoint_host(&url).to_string(),
                         slowest_endpoint_ms,
                         first_success_endpoint_index: endpoint_index,
                         failed_endpoints,
@@ -694,7 +697,10 @@ impl BatchRpcClient {
                     failed_endpoints += 1;
                     // Redact at capture: `per_endpoint_ms` is logged by callers,
                     // and a reqwest error carries the keyed request URL.
-                    per_endpoint_ms.push((url, Err(redact_urls(&e.to_string()))));
+                    per_endpoint_ms.push((
+                        endpoint_host(&url).to_string(),
+                        Err(redact_urls(&e.to_string())),
+                    ));
                     last_err = Some(e);
                     pending = remaining;
                 }
@@ -901,7 +907,7 @@ mod tests {
             .expect("broadcast should succeed");
 
         assert_eq!(result.first_success_endpoint_index, 1);
-        assert_eq!(result.fastest_endpoint_url, fast);
+        assert_eq!(result.fastest_endpoint_host, endpoint_host(&fast));
         assert_eq!(
             result.tx_hash,
             "0x2222222222222222222222222222222222222222222222222222222222222222"

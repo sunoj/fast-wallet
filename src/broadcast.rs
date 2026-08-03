@@ -768,7 +768,9 @@ fn format_rpc_error(error: &RpcError) -> String {
             .unwrap_or_else(|| data.to_string());
         msg.push_str(&format!(" data={data_str}"));
     }
-    msg
+    // `message` and `data` are server-supplied and end up in logs, Discord and
+    // DB columns; a node that echoes the request back would carry our key.
+    crate::rpc::redact_urls(&msg)
 }
 
 fn parse_b256_hex(s: &str) -> WalletResult<B256> {
