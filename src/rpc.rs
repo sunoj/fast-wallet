@@ -515,6 +515,32 @@ pub fn endpoint_host(url: &str) -> &str {
         .map_or(authority, |(_, host)| host)
 }
 
+/// Replace every URL inside a message with just its host.
+///
+/// `reqwest::Error::to_string()` embeds the request URL — API key and all
+/// (`error sending request for url (https://host/v2/<key>)`), so error text
+/// from a broadcast attempt can never be logged verbatim.
+pub fn redact_urls(message: &str) -> String {
+    let mut out = String::with_capacity(message.len());
+    let mut rest = message;
+    loop {
+        let start = match (rest.find("http://"), rest.find("https://")) {
+            (Some(plain), Some(tls)) => plain.min(tls),
+            (Some(only), None) | (None, Some(only)) => only,
+            (None, None) => break,
+        };
+        out.push_str(&rest[..start]);
+        let tail = &rest[start..];
+        let end = tail
+            .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | ')' | ',' | '>'))
+            .unwrap_or(tail.len());
+        out.push_str(endpoint_host(&tail[..end]));
+        rest = &tail[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
 impl BatchRpcClient {
     /// Create a new batch client with multiple RPC endpoints
     pub fn new(urls: Vec<String>) -> WalletResult<Self> {
@@ -636,7 +662,7 @@ impl BatchRpcClient {
                                         %tx_hash,
                                         %endpoint,
                                         endpoint_ms = late_ms,
-                                        %error,
+                                        error = %redact_urls(&error.to_string()),
                                         "late broadcast endpoint rejected"
                                     ),
                                 }
@@ -659,7 +685,9 @@ impl BatchRpcClient {
                 }
                 Err(e) => {
                     failed_endpoints += 1;
-                    per_endpoint_ms.push((url, Err(e.to_string())));
+                    // Redact at capture: `per_endpoint_ms` is logged by callers,
+                    // and a reqwest error carries the keyed request URL.
+                    per_endpoint_ms.push((url, Err(redact_urls(&e.to_string()))));
                     last_err = Some(e);
                     pending = remaining;
                 }
@@ -690,6 +718,50 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    #[test]
+    fn endpoint_host_drops_the_key_bearing_parts() {
+        assert_eq!(
+            endpoint_host("https://base-mainnet.infura.io/v3/deadbeefdeadbeef"),
+            "base-mainnet.infura.io"
+        );
+        assert_eq!(
+            endpoint_host("https://sleek-vineyard.base-mainnet.quiknode.pro/abc123/"),
+            "sleek-vineyard.base-mainnet.quiknode.pro"
+        );
+        assert_eq!(
+            endpoint_host("http://162.250.127.74:8545"),
+            "162.250.127.74:8545"
+        );
+        assert_eq!(
+            endpoint_host("https://user:secret@rpc.example.com/x"),
+            "rpc.example.com"
+        );
+        assert_eq!(
+            endpoint_host("https://host.example.com/?key=secret"),
+            "host.example.com"
+        );
+    }
+
+    #[test]
+    fn redact_urls_strips_keys_out_of_error_text() {
+        // The exact shape reqwest produces, which is what reaches per_endpoint.
+        let raw = "error sending request for url (https://base-mainnet.g.alchemy.com/v2/SECRETKEY)";
+        let clean = redact_urls(raw);
+        assert!(!clean.contains("SECRETKEY"), "{clean}");
+        assert!(!clean.contains("/v2/"), "{clean}");
+        assert!(clean.contains("base-mainnet.g.alchemy.com"), "{clean}");
+
+        // Several URLs in one message, and text after the last one.
+        let many = redact_urls("https://a.io/k1 then https://b.io/k2 done");
+        assert_eq!(many, "a.io then b.io done");
+
+        // Nothing to redact must round-trip untouched.
+        assert_eq!(
+            redact_urls("replacement transaction underpriced"),
+            "replacement transaction underpriced"
+        );
+    }
 
     #[test]
     fn test_parse_u64_hex() {

@@ -115,8 +115,18 @@ impl InflightNonceLedger {
                 merge_max(&mut record.max_fee_seen, max_fee);
                 merge_max(&mut record.max_priority_seen, max_priority);
                 if record.status == InflightNonceStatus::Released {
+                    // A released nonce handed back out starts a NEW attempt, so
+                    // its age restarts here. Age answers "how long has this
+                    // nonce been unresolved", and callers gate a rewind on it —
+                    // inheriting the previous attempt's age would let a
+                    // freshly broadcast tx look stranded on its first check.
+                    // Re-signing a nonce that is still Signed/BroadcastAccepted
+                    // is a replacement for a tx that IS still stranded, so that
+                    // case deliberately keeps the original clock.
                     record.status = InflightNonceStatus::Signed;
                     record.release_reason = None;
+                    record.first_seen = now;
+                    record.accepted_broadcasts = 0;
                 }
             })
             .or_insert_with(|| {
@@ -276,6 +286,43 @@ mod tests {
         let low = ledger.lowest_unresolved_at_or_above(10).unwrap();
         assert_eq!(low.nonce, 11);
         assert_eq!(ledger.unresolved_count(), 1);
+    }
+
+    #[test]
+    fn released_nonce_handed_out_again_restarts_its_age() {
+        let ledger = InflightNonceLedger::default();
+        ledger.record_signed(30, B256::repeat_byte(6), None, None);
+        ledger.mark_broadcast_accepted(30, B256::repeat_byte(6));
+        std::thread::sleep(Duration::from_millis(25));
+        assert!(ledger.lowest_unresolved_at_or_above(30).unwrap().age >= Duration::from_millis(25));
+
+        ledger.mark_released(30, "candidate_dropped");
+        ledger.record_signed(30, B256::repeat_byte(7), None, None);
+
+        // Callers read this age as proof the transaction was dropped and rewind
+        // on it. A new attempt at a recycled nonce inheriting the previous
+        // attempt's clock would look stranded on its very first health check.
+        let fresh = ledger.lowest_unresolved_at_or_above(30).unwrap();
+        assert!(fresh.age < Duration::from_millis(25), "age must restart");
+        assert_eq!(fresh.status, InflightNonceStatus::Signed);
+    }
+
+    #[test]
+    fn replacement_at_a_still_unresolved_nonce_keeps_the_original_clock() {
+        // The opposite case: re-signing a nonce that was never released is a
+        // replacement for a tx that IS still stranded. Restarting the clock
+        // there would let a bump loop keep the entry permanently young and the
+        // rewind gate would never fire.
+        let ledger = InflightNonceLedger::default();
+        ledger.record_signed(40, B256::repeat_byte(8), None, None);
+        ledger.mark_broadcast_accepted(40, B256::repeat_byte(8));
+        std::thread::sleep(Duration::from_millis(25));
+
+        ledger.record_signed(40, B256::repeat_byte(9), None, None);
+
+        let entry = ledger.lowest_unresolved_at_or_above(40).unwrap();
+        assert!(entry.age >= Duration::from_millis(25), "clock must persist");
+        assert_eq!(entry.status, InflightNonceStatus::BroadcastAccepted);
     }
 
     #[test]
