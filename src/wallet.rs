@@ -325,8 +325,41 @@ pub struct NonceHealth {
     pub inflight_count: usize,
     /// Lowest unresolved local ledger entry at or above `chain_next`.
     pub lowest_unresolved: Option<InflightNonceSnapshot>,
-    /// Whether effective next nonce is far ahead of chain.
+    /// Whether the local nonce is ahead of chain with a stranded entry behind it.
     pub stalled: bool,
+}
+
+/// How long the lowest unresolved in-flight nonce may sit unmined before
+/// [`FastWallet::nonce_health_check`] calls the lane stalled.
+///
+/// The local counter only advances when a new transaction is dispatched, so a
+/// distance-only rule is flow-driven: a lane that strands and then goes quiet
+/// never reports, and a single stranded nonce on a fan-out wallet (gap of 1)
+/// can never reach any distance threshold at all. Age does not depend on flow.
+///
+/// Detection is not action. Every rewind proof lives in the caller (sustained
+/// stall streak, `pending == latest`, its own minimum unresolved age, the
+/// independent-RPC liveness probe) and is unchanged by this constant.
+const STALL_MIN_UNRESOLVED_AGE: Duration = Duration::from_secs(30);
+
+/// Decide whether a lane is stalled, given the local counter, the chain's next
+/// nonce, and the lowest unresolved ledger entry at or above it.
+///
+/// Two independent triggers, both requiring the local counter to be ahead:
+/// - **age** — the stranded entry has sat past [`STALL_MIN_UNRESOLVED_AGE`].
+///   This is the one that fires on a gap of 1 and on a lane that has gone quiet.
+/// - **distance** — local has run more than 2 ahead. The original rule, kept so
+///   a stall the ledger has no entry for still reports.
+fn nonce_stalled(
+    effective_next: u64,
+    chain_next: u64,
+    lowest_unresolved: Option<&InflightNonceSnapshot>,
+) -> bool {
+    if effective_next <= chain_next {
+        return false;
+    }
+    let aged_out = lowest_unresolved.is_some_and(|entry| entry.age >= STALL_MIN_UNRESOLVED_AGE);
+    aged_out || effective_next > chain_next + 2
 }
 
 /// Idempotency window for [`FastWallet::replace_stalled_nonce`]: a second call for
@@ -1671,8 +1704,7 @@ impl FastWallet {
             .inflight_nonces
             .lowest_unresolved_at_or_above(chain_next);
         let inflight_count = self.inflight_nonces.unresolved_count();
-        // If local is >2 ahead of chain, nonces are stuck in-flight
-        let stalled = effective_next > chain_next + 2;
+        let stalled = nonce_stalled(effective_next, chain_next, lowest_unresolved.as_ref());
         Ok(NonceHealth {
             current,
             effective_next,
@@ -3389,5 +3421,54 @@ mod tests {
         assert!(sent.lock().is_empty(), "check_only must NOT re-broadcast");
         // nonce 0 stays consumed (not released) → next sign advances to nonce 1.
         assert_eq!(wallet.sign(test_request()).unwrap().nonce(), 1);
+    }
+
+    use crate::inflight::InflightNonceStatus;
+
+    fn unresolved(nonce: u64, age: Duration) -> InflightNonceSnapshot {
+        InflightNonceSnapshot {
+            nonce,
+            tx_hashes: vec![B256::repeat_byte(9)],
+            status: InflightNonceStatus::BroadcastAccepted,
+            age,
+            accepted_broadcasts: 1,
+            release_reason: None,
+            max_fee_seen: None,
+            max_priority_seen: None,
+        }
+    }
+
+    #[test]
+    fn stall_is_detected_at_a_gap_of_one_once_the_entry_ages() {
+        // The case a distance-only rule can never see: one stranded nonce on a
+        // fan-out wallet. `effective_next` is 1 ahead and stays there, so
+        // `> chain_next + 2` is false forever no matter how long it sits.
+        let aged = unresolved(100, Duration::from_secs(31));
+        assert!(nonce_stalled(101, 100, Some(&aged)));
+        assert!(
+            !(101 > 100 + 2),
+            "guard: the distance rule alone would miss this"
+        );
+    }
+
+    #[test]
+    fn young_unresolved_entry_is_not_yet_a_stall() {
+        // Base/preconf propagation lag: a tx we just broadcast may not be
+        // visible on this RPC view yet. Do not call that stranded.
+        let young = unresolved(100, Duration::from_secs(5));
+        assert!(!nonce_stalled(101, 100, Some(&young)));
+    }
+
+    #[test]
+    fn distance_rule_still_fires_without_a_ledger_entry() {
+        assert!(nonce_stalled(103, 100, None));
+        assert!(!nonce_stalled(102, 100, None));
+    }
+
+    #[test]
+    fn never_stalled_when_local_is_not_ahead_of_chain() {
+        let aged = unresolved(100, Duration::from_secs(600));
+        assert!(!nonce_stalled(100, 100, Some(&aged)));
+        assert!(!nonce_stalled(99, 100, Some(&aged)));
     }
 }

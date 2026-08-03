@@ -502,6 +502,19 @@ pub struct SendResult {
     pub per_endpoint_ms: Vec<(String, Result<u64, String>)>,
 }
 
+/// Host portion of an endpoint URL, for logs.
+///
+/// RPC URLs carry API keys in the path or the query string, so the host is the
+/// only part that is ever safe to emit.
+pub fn endpoint_host(url: &str) -> &str {
+    let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
+    // `user:pass@host` — userinfo is a credential, keep only what follows it.
+    authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host)
+}
+
 impl BatchRpcClient {
     /// Create a new batch client with multiple RPC endpoints
     pub fn new(urls: Vec<String>) -> WalletResult<Self> {
@@ -603,8 +616,31 @@ impl BatchRpcClient {
                 Ok((hash, connection_reused)) => {
                     per_endpoint_ms.push((url.clone(), Ok(endpoint_ms)));
                     if !remaining.is_empty() {
+                        // The endpoints that had not answered yet still run to
+                        // completion, but their verdicts used to be dropped —
+                        // so "one endpoint accepted, the rest rejected" logged
+                        // as a plain success and a transaction that never
+                        // reached a builder was undiagnosable after the fact.
+                        let tx_hash = format!("{hash:?}");
                         tokio::spawn(async move {
-                            join_all(remaining).await;
+                            for (_, late_url, late_result, late_ms) in join_all(remaining).await {
+                                let endpoint = endpoint_host(&late_url);
+                                match late_result {
+                                    Ok(_) => tracing::debug!(
+                                        %tx_hash,
+                                        %endpoint,
+                                        endpoint_ms = late_ms,
+                                        "late broadcast endpoint accepted"
+                                    ),
+                                    Err(error) => tracing::warn!(
+                                        %tx_hash,
+                                        %endpoint,
+                                        endpoint_ms = late_ms,
+                                        %error,
+                                        "late broadcast endpoint rejected"
+                                    ),
+                                }
+                            }
                         });
                     }
                     return Ok(SendResult {
