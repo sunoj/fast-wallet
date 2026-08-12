@@ -202,14 +202,16 @@ impl RpcClient {
             return Err(WalletError::RpcError(format_rpc_error(&error)));
         }
 
-        // Mark only after a clean result. A live host that answers every call
-        // with a JSON-RPC error is not warm in any useful sense, and marking it
-        // here would suppress the next probe for a whole throttle window.
-        self.mark_last_success();
-
-        rpc_response
+        let result = rpc_response
             .result
-            .ok_or_else(|| WalletError::RpcError("Empty response".to_string()))
+            .ok_or_else(|| WalletError::RpcError("Empty response".to_string()))?;
+
+        // Mark only after a fully successful response. A live host that answers
+        // every call with a JSON-RPC error — or with neither result nor error —
+        // is not warm in any useful sense, and marking it here would suppress
+        // the next probe for a whole throttle window.
+        self.mark_last_success();
+        Ok(result)
     }
 
     /// Get the current nonce for an address
@@ -925,6 +927,44 @@ mod tests {
             hits.load(Ordering::SeqCst),
             2,
             "a JSON-RPC error must not earn a throttle window"
+        );
+    }
+
+    /// Round-2 re-audit residual: a body carrying neither `result` nor `error`
+    /// is still an endpoint that is not serving, so it must not earn a window.
+    #[tokio::test]
+    async fn empty_response_does_not_suppress_next_warmup() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicU64::new(0));
+        let hits_clone = hits.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                hits_clone.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 2048];
+                let _ = stream.read(&mut buf).await;
+                let body = r#"{"jsonrpc":"2.0","id":1}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        let client = RpcClient::new(format!("http://{addr}")).unwrap();
+
+        assert!(client.warmup().await.is_err());
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        assert!(client.warmup().await.is_err());
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "a body with neither result nor error must not earn a throttle window"
         );
     }
 
