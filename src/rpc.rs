@@ -198,11 +198,14 @@ impl RpcClient {
             .await
             .map_err(|e| WalletError::RpcError(e.to_string()))?;
 
-        self.mark_last_success();
-
         if let Some(error) = rpc_response.error {
             return Err(WalletError::RpcError(format_rpc_error(&error)));
         }
+
+        // Mark only after a clean result. A live host that answers every call
+        // with a JSON-RPC error is not warm in any useful sense, and marking it
+        // here would suppress the next probe for a whole throttle window.
+        self.mark_last_success();
 
         rpc_response
             .result
@@ -877,6 +880,66 @@ mod tests {
             }
         });
         (format!("http://{addr}"), hits)
+    }
+
+    /// Serves HTTP 200 with a well-formed JSON-RPC *error* body — a host that is
+    /// reachable and answering but not actually serving.
+    async fn counting_rpc_error_server() -> (String, Arc<AtomicU64>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicU64::new(0));
+        let hits_clone = hits.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                hits_clone.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 2048];
+                let _ = stream.read(&mut buf).await;
+                let body = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"Network mismatch"}}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        (format!("http://{addr}"), hits)
+    }
+
+    /// Cross-audit finding (2026-08-12): marking success before inspecting
+    /// `rpc_response.error` let a live-but-broken endpoint buy a full throttle
+    /// window, so warmup went quiet for 60s exactly when it should have probed.
+    #[tokio::test]
+    async fn jsonrpc_error_does_not_suppress_next_warmup() {
+        let (url, hits) = counting_rpc_error_server().await;
+        let client = RpcClient::new(url).unwrap();
+
+        assert!(client.warmup().await.is_err());
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        assert!(client.warmup().await.is_err());
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "a JSON-RPC error must not earn a throttle window"
+        );
+    }
+
+    /// Same guard on the request path: a failed call must not mark the endpoint
+    /// warm and silence the warmup that follows it.
+    #[tokio::test]
+    async fn failed_rpc_request_does_not_suppress_warmup() {
+        let (url, hits) = counting_rpc_error_server().await;
+        let client = RpcClient::new(url).unwrap();
+
+        assert!(client.chain_id().await.is_err());
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        assert!(client.warmup().await.is_err());
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
