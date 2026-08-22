@@ -256,12 +256,13 @@ impl PreheatedContext {
         }
     }
 
-    fn release_reservation(&self) {
+    fn release_reservation(&self) -> bool {
         self.used.store(true, Ordering::Release);
         let mut reservation = self.reservation.lock();
         if let Some(mut reservation) = reservation.take() {
-            reservation.release();
+            return reservation.release();
         }
+        false
     }
 
     fn reserved_nonce(&self) -> Option<u64> {
@@ -715,7 +716,8 @@ impl FastWallet {
     ///
     /// # Warning
     /// Dropping an unused context releases its nonce. After signing, callers
-    /// must commit or release the context based on broadcast acceptance.
+    /// may release only before broadcast starts; mark it broadcasting before
+    /// handing the signed bytes to an RPC, then commit after inclusion.
     pub async fn preheat(&self, fetch_gas: bool) -> WalletResult<PreheatedContext> {
         let total_start = Instant::now();
 
@@ -824,10 +826,8 @@ impl FastWallet {
     /// for sign-now-broadcast-later flows where the context is dropped before
     /// the send completes. A `Broadcasting` reservation's `Drop` is a no-op
     /// (left for chain sync), so dropping the context will NOT release a nonce
-    /// that is bound to a signed, soon-to-be-broadcast transaction — while a
-    /// caller that later abandons the lane still reclaims it explicitly via
-    /// `release_nonce`. This preserves the pre-v0.1.31 (no-RAII) lifecycle for
-    /// callers that own nonce reclaim themselves. Returns Err if the
+    /// that is bound to a signed, soon-to-be-broadcast transaction. Chain
+    /// reconciliation owns it after that transition. Returns Err if the
     /// reservation was already finalized.
     pub fn mark_preheat_broadcasting(&self, ctx: &PreheatedContext) -> WalletResult<()> {
         ctx.mark_broadcasting()
@@ -841,12 +841,13 @@ impl FastWallet {
         ctx.commit_reservation();
     }
 
-    /// Release a preheated context after signing but before broadcast acceptance.
+    /// Release a preheated context before broadcasting its signed transaction.
     pub fn release_preheat(&self, ctx: &PreheatedContext) {
-        if let Some(nonce) = ctx.reserved_nonce() {
+        let nonce = ctx.reserved_nonce();
+        if ctx.release_reservation() {
+            let nonce = nonce.expect("released preheat reservation has a nonce");
             self.inflight_nonces.mark_released(nonce, "preheat_release");
         }
-        ctx.release_reservation();
     }
 
     // ==================== Connection Warmup ====================
@@ -1423,6 +1424,15 @@ impl FastWallet {
         result
     }
 
+    fn record_broadcast_candidate(&self, tx: &Transaction) {
+        self.inflight_nonces.record_signed(
+            tx.nonce(),
+            tx.hash(),
+            tx.max_fee_per_gas(),
+            tx.max_priority_fee_per_gas(),
+        );
+    }
+
     async fn broadcast_signed_hash(&self, tx: &Transaction) -> WalletResult<B256> {
         let _permit = tokio::time::timeout(
             self.config.pending_acquire_timeout,
@@ -1481,30 +1491,20 @@ impl FastWallet {
     /// Send a pre-signed transaction
     ///
     /// Uses a timeout when acquiring the pending transaction permit to avoid
-    /// blocking indefinitely when many transactions are in-flight.
+    /// blocking indefinitely when many transactions are in-flight. Once this
+    /// method is called, an error leaves the nonce for chain reconciliation:
+    /// a racing endpoint may have accepted the signed bytes without returning
+    /// a successful response.
     pub async fn send_signed(&self, tx: &Transaction) -> WalletResult<B256> {
+        self.record_broadcast_candidate(tx);
         let result = self.broadcast_signed_hash(tx).await;
 
         match &result {
             Ok(tx_hash) => {
-                // Retain fees even for externally-signed txs that never went through
-                // our sign* helpers, so a later replace_stalled_nonce can bump over
-                // this tx's own (possibly over-paid) fee, not just network price.
-                self.inflight_nonces.record_signed(
-                    tx.nonce(),
-                    *tx_hash,
-                    tx.max_fee_per_gas(),
-                    tx.max_priority_fee_per_gas(),
-                );
                 self.inflight_nonces
                     .mark_broadcast_accepted(tx.nonce(), *tx_hash);
             }
             Err(e) => {
-                // Release nonce for reuse
-                self.nonce_manager.release(tx.nonce());
-                self.inflight_nonces
-                    .mark_released(tx.nonce(), "send_signed_error");
-
                 // Nonce-drift recovery. Both "too low" (we replayed an already-mined
                 // nonce) and "too high" (local counter skipped ahead of chain) indicate
                 // the local tracker has diverged from the chain, so force an RPC resync.
@@ -1528,23 +1528,15 @@ impl FastWallet {
         tx: &Transaction,
         sign_ms: f64,
     ) -> WalletResult<SendResult> {
+        self.record_broadcast_candidate(tx);
         let result = self.broadcast_signed_result(tx, sign_ms).await;
 
         match &result {
             Ok(_) => {
-                self.inflight_nonces.record_signed(
-                    tx.nonce(),
-                    tx.hash(),
-                    tx.max_fee_per_gas(),
-                    tx.max_priority_fee_per_gas(),
-                );
                 self.inflight_nonces
                     .mark_broadcast_accepted(tx.nonce(), tx.hash());
             }
             Err(e) => {
-                self.nonce_manager.release(tx.nonce());
-                self.inflight_nonces
-                    .mark_released(tx.nonce(), "send_signed_detailed_error");
                 self.recover_nonce_error(e).await;
             }
         }
@@ -1590,8 +1582,8 @@ impl FastWallet {
     /// as-is, and `effective_hash` is the hash the caller should now track — the
     /// ORIGINAL when found, or the NEW bumped hash after a re-broadcast. Callers
     /// MUST rebind to `effective_hash`; the original hash will never appear on-chain
-    /// once it has been replaced. Releases the nonce and returns the error if the
-    /// re-broadcast cannot be sent.
+    /// once it has been replaced. A failed re-broadcast leaves the nonce for chain
+    /// reconciliation because an RPC error cannot disprove acceptance.
     ///
     /// If your caller has already handed `tx_hash` to a receipt poller and owns its
     /// own retry/reclaim (e.g. a fire-and-forget lane), use
@@ -1636,10 +1628,8 @@ impl FastWallet {
         };
 
         if let Err(error) = result {
-            tracing::warn!(%send_hash, error = %error, "re-broadcast failed; releasing nonce");
-            self.nonce_manager.release(tx.nonce());
-            self.inflight_nonces
-                .mark_released(tx.nonce(), "verify_rebroadcast_error");
+            tracing::warn!(%send_hash, error = %error,
+                "re-broadcast failed; leaving nonce for chain reconciliation");
             return Err(error);
         };
         // Record the bumped tx's hash AND its (higher) fees so a later
@@ -1847,9 +1837,6 @@ impl FastWallet {
                     .mark_broadcast_accepted(tx.nonce(), *tx_hash);
             }
             Err(error) => {
-                ctx.release_reservation();
-                self.inflight_nonces
-                    .mark_released(tx.nonce(), "send_with_preheat_error");
                 self.recover_nonce_error(error).await;
             }
         }
@@ -1874,9 +1861,6 @@ impl FastWallet {
                     .mark_broadcast_accepted(tx.nonce(), tx.hash());
             }
             Err(error) => {
-                ctx.release_reservation();
-                self.inflight_nonces
-                    .mark_released(tx.nonce(), "send_with_preheat_detailed_error");
                 self.recover_nonce_error(error).await;
             }
         }
@@ -1984,9 +1968,6 @@ impl FastWallet {
                     .mark_broadcast_accepted(tx.nonce(), *tx_hash);
             }
             Err(error) => {
-                ctx.release_reservation();
-                self.inflight_nonces
-                    .mark_released(tx.nonce(), "send_optimistic_with_preheat_error");
                 self.recover_nonce_error(error).await;
             }
         }
@@ -2917,7 +2898,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_verify_broadcast_rebroadcast_failure_releases_nonce() {
+    async fn test_verify_broadcast_rebroadcast_failure_retains_nonce() {
         let url = rpc_error_server().await;
         let wallet = FastWalletBuilder::new(TEST_PRIVATE_KEY, &url)
             .chain_id(1)
@@ -2932,7 +2913,7 @@ mod tests {
             .await;
 
         assert!(result.is_err());
-        assert_eq!(wallet.sign(test_request()).unwrap().nonce(), 0);
+        assert_eq!(wallet.sign(test_request()).unwrap().nonce(), 1);
     }
 
     #[test]
@@ -3541,7 +3522,7 @@ mod tests {
     #[tokio::test]
     async fn verify_broadcast_check_only_no_rebroadcast_no_release() {
         // tx never appears → check_only returns false WITHOUT re-broadcasting or
-        // releasing the nonce (contrast verify_broadcast, which bumps + may release).
+        // changing the nonce (verify_broadcast may bump but also retains ownership).
         // The caller owns reclaim and keeps tracking the original hash.
         let (url, sent) = mock_rpc_server(0, 1_000_000_000, 20_000_000_000, false).await;
         let wallet = FastWalletBuilder::new(TEST_PRIVATE_KEY, &url)
