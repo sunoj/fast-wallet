@@ -321,10 +321,12 @@ impl ReservedNonce {
         true
     }
 
-    /// Release a held or broadcasting nonce back to the tracker.
+    /// Release a nonce that has not entered broadcast back to the tracker.
+    ///
+    /// Once broadcasting starts, an RPC error cannot prove the transaction was
+    /// not accepted by another endpoint. Chain reconciliation owns that nonce.
     pub fn release(&mut self) -> bool {
-        if self.state != ReservedNonceState::Held && self.state != ReservedNonceState::Broadcasting
-        {
+        if self.state != ReservedNonceState::Held {
             return false;
         }
         self.tracker.release(self.nonce);
