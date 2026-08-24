@@ -436,6 +436,13 @@ impl TransactionBroadcaster {
             return Err(WalletError::RpcError(format_rpc_error(&error)));
         }
 
+        // Nor does a body carrying neither `result` nor `error`. RpcClient has
+        // had this guard since v0.1.44; the batch broadcaster never did, so a
+        // host answering `{}` bought itself a full window here.
+        if rpc_response.result.is_none() {
+            return Err(WalletError::RpcError("Empty response".to_string()));
+        }
+
         self.mark_last_success(&endpoint.url);
         Ok(())
     }
@@ -1171,6 +1178,50 @@ mod tests {
             }
         });
         (format!("http://{addr}"), hits)
+    }
+
+    async fn counting_empty_rpc_server() -> (String, Arc<AtomicU64>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicU64::new(0));
+        let hits_clone = hits.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                hits_clone.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 2048];
+                let _ = stream.read(&mut buf).await;
+                let body = r#"{"jsonrpc":"2.0","id":1}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        (format!("http://{addr}"), hits)
+    }
+
+    /// Cross-audit finding (2026-08-24): `rpc.rs` rejected a body with neither
+    /// `result` nor `error` from v0.1.44 onward, but the batch broadcaster never
+    /// did — a host answering `{}` bought a full throttle window and silenced the
+    /// probe that would have exposed it.
+    #[tokio::test]
+    async fn empty_response_does_not_suppress_next_warmup() {
+        let (url, hits) = counting_empty_rpc_server().await;
+        let broadcaster = TransactionBroadcaster::new(vec![RpcEndpoint::public(url)]).unwrap();
+
+        assert_eq!(broadcaster.warmup().await, 0);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert_eq!(broadcaster.warmup().await, 0);
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "a body with neither result nor error must not earn a throttle window"
+        );
     }
 
     /// Cross-audit finding (2026-08-12): see the twin test in `rpc.rs`.
