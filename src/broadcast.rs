@@ -7,8 +7,10 @@
 //! - Configurable retry strategies
 
 use crate::error::{WalletError, WalletResult};
+use crate::rpc::WARMUP_THROTTLE_WINDOW;
 use crate::transaction::Transaction;
 use alloy::primitives::B256;
+use dashmap::DashMap;
 use futures_util::future::{join_all, select_all};
 use futures_util::FutureExt;
 use reqwest::Client;
@@ -280,6 +282,7 @@ pub struct TransactionBroadcaster {
     pub strategy: BroadcastStrategy,
     default_timeout: Duration,
     request_id: AtomicU64,
+    last_success: DashMap<String, Instant>,
 }
 
 impl TransactionBroadcaster {
@@ -304,6 +307,7 @@ impl TransactionBroadcaster {
             strategy: BroadcastStrategy::RaceAll,
             default_timeout: Duration::from_secs(5),
             request_id: AtomicU64::new(1),
+            last_success: DashMap::new(),
         })
     }
 
@@ -378,8 +382,29 @@ impl TransactionBroadcaster {
         results.into_iter().filter(|r| r.is_ok()).count()
     }
 
+    fn should_skip_warmup(&self, url: &str) -> bool {
+        self.last_success
+            .get(url)
+            .map(|t| Instant::now().saturating_duration_since(*t) < WARMUP_THROTTLE_WINDOW)
+            .unwrap_or(false)
+    }
+
+    fn mark_last_success(&self, url: &str) {
+        self.last_success.insert(url.to_string(), Instant::now());
+    }
+
+    #[cfg(test)]
+    fn expire_warmup_throttle(&self, url: &str) {
+        self.last_success
+            .insert(url.to_string(), crate::rpc::expired_warmup_instant());
+    }
+
     /// Warm up a single endpoint
     async fn warmup_endpoint(&self, endpoint: &RpcEndpoint) -> WalletResult<()> {
+        if self.should_skip_warmup(&endpoint.url) {
+            return Ok(());
+        }
+
         let request_body = json!({
             "jsonrpc": "2.0",
             "method": "eth_chainId",
@@ -400,12 +425,18 @@ impl TransactionBroadcaster {
             .map_err(|_| WalletError::Timeout)?
             .map_err(|e| WalletError::NetworkError(e.to_string()))?;
 
-        // Just check that we got a valid response
-        let _: RpcResponse = response
+        let rpc_response: RpcResponse = response
             .json()
             .await
             .map_err(|e| WalletError::RpcError(e.to_string()))?;
 
+        // A JSON-RPC error means the host is reachable but not serving, so it
+        // must not earn a throttle window — see the same guard in RpcClient.
+        if let Some(error) = rpc_response.error {
+            return Err(WalletError::RpcError(format_rpc_error(&error)));
+        }
+
+        self.mark_last_success(&endpoint.url);
         Ok(())
     }
 
@@ -463,6 +494,10 @@ impl TransactionBroadcaster {
         if let Some(error) = rpc_response.error {
             return Err(WalletError::RpcError(format_rpc_error(&error)));
         }
+
+        // Clean result only — a rejected send leaves the endpoint eligible for
+        // the next warmup probe.
+        self.mark_last_success(&endpoint.url);
 
         match rpc_response.result {
             Some(s) => parse_b256_hex(&s),
@@ -949,6 +984,10 @@ impl Default for BroadcasterBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     #[test]
     fn test_broadcast_format_rpc_error_preserves_data() {
@@ -1081,5 +1120,127 @@ mod tests {
             .build()
             .unwrap();
         assert_eq!(broadcaster.endpoints.len(), 3);
+    }
+
+    async fn counting_rpc_server(result: &'static str) -> (String, Arc<AtomicU64>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicU64::new(0));
+        let hits_clone = hits.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                hits_clone.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 2048];
+                let _ = stream.read(&mut buf).await;
+                let body = format!(r#"{{"jsonrpc":"2.0","id":1,"result":"{result}"}}"#);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        (format!("http://{addr}"), hits)
+    }
+
+    /// Serves HTTP 200 with a JSON-RPC error body — reachable but not serving.
+    async fn counting_rpc_error_server() -> (String, Arc<AtomicU64>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicU64::new(0));
+        let hits_clone = hits.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                hits_clone.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 2048];
+                let _ = stream.read(&mut buf).await;
+                let body = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"Network mismatch"}}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        (format!("http://{addr}"), hits)
+    }
+
+    /// Cross-audit finding (2026-08-12): see the twin test in `rpc.rs`.
+    #[tokio::test]
+    async fn jsonrpc_error_does_not_suppress_next_warmup() {
+        let (url, hits) = counting_rpc_error_server().await;
+        let broadcaster = TransactionBroadcaster::new(vec![RpcEndpoint::public(url)]).unwrap();
+
+        assert_eq!(broadcaster.warmup().await, 0);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert_eq!(broadcaster.warmup().await, 0);
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "a JSON-RPC error must not earn a throttle window"
+        );
+    }
+
+    /// A rejected send must leave the endpoint eligible for the next probe.
+    #[tokio::test]
+    async fn failed_broadcast_does_not_suppress_warmup_probe() {
+        let (url, hits) = counting_rpc_error_server().await;
+        let broadcaster = TransactionBroadcaster::new(vec![RpcEndpoint::public(url)]).unwrap();
+
+        let result = broadcaster.broadcast_raw("0x01").await;
+        assert!(result.tx_hash.is_none());
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        assert_eq!(broadcaster.warmup().await, 0);
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn warmup_skips_probe_within_throttle_window() {
+        let (url, hits) = counting_rpc_server("0x1").await;
+        let broadcaster =
+            TransactionBroadcaster::new(vec![RpcEndpoint::public(url)]).unwrap();
+
+        assert_eq!(broadcaster.warmup().await, 1);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert_eq!(broadcaster.warmup().await, 1);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn warmup_probes_again_after_throttle_window() {
+        let (url, hits) = counting_rpc_server("0x1").await;
+        let broadcaster =
+            TransactionBroadcaster::new(vec![RpcEndpoint::public(url.clone())]).unwrap();
+
+        assert_eq!(broadcaster.warmup().await, 1);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        broadcaster.expire_warmup_throttle(&url);
+        assert_eq!(broadcaster.warmup().await, 1);
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn successful_broadcast_suppresses_warmup_probe() {
+        let hash = "0x1111111111111111111111111111111111111111111111111111111111111111";
+        let (url, hits) = counting_rpc_server(hash).await;
+        let broadcaster =
+            TransactionBroadcaster::new(vec![RpcEndpoint::public(url)]).unwrap();
+
+        let result = broadcaster.broadcast_raw("0x01").await;
+        assert!(result.tx_hash.is_some());
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        assert_eq!(broadcaster.warmup().await, 1);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
     }
 }

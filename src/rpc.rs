@@ -9,12 +9,19 @@ use crate::error::{WalletError, WalletResult};
 use alloy::primitives::{Address, B256, U256};
 use futures_util::future::{join_all, select_all};
 use futures_util::FutureExt;
+use parking_lot::Mutex;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+/// Skip `warmup()` when this endpoint completed a request within this window.
+/// 60s is well under the 300s reqwest `pool_idle_timeout` on RpcClient and
+/// TransactionBroadcaster, so a skipped probe still finds a live pooled
+/// connection. Call gaps longer than this always probe; gaps inside it skip.
+pub(crate) const WARMUP_THROTTLE_WINDOW: Duration = Duration::from_secs(60);
 
 /// JSON-RPC request
 #[derive(Debug, Serialize)]
@@ -63,6 +70,7 @@ pub struct RpcClient {
     url: String,
     request_id: AtomicU64,
     request_seen: AtomicBool,
+    last_success: Mutex<Option<Instant>>,
 }
 
 impl RpcClient {
@@ -86,6 +94,7 @@ impl RpcClient {
             url: url.into(),
             request_id: AtomicU64::new(1),
             request_seen: AtomicBool::new(false),
+            last_success: Mutex::new(None),
         })
     }
 
@@ -96,6 +105,7 @@ impl RpcClient {
             url: url.into(),
             request_id: AtomicU64::new(1),
             request_seen: AtomicBool::new(false),
+            last_success: Mutex::new(None),
         }
     }
 
@@ -109,6 +119,9 @@ impl RpcClient {
     /// This establishes TCP/TLS connections ahead of time, saving 5-20ms
     /// on subsequent requests. Use this before time-critical operations.
     pub async fn warmup(&self) -> WalletResult<()> {
+        if self.should_skip_warmup() {
+            return Ok(());
+        }
         // eth_chainId is the lightest RPC call - just returns the chain ID.
         // Bound warmup with a short timeout so a blackholed / network-partitioned
         // endpoint cannot stall callers (e.g. preheat_full's `join!`) for the full
@@ -143,6 +156,22 @@ impl RpcClient {
         self.request_seen.swap(true, Ordering::Relaxed)
     }
 
+    fn should_skip_warmup(&self) -> bool {
+        match *self.last_success.lock() {
+            Some(t) => Instant::now().saturating_duration_since(t) < WARMUP_THROTTLE_WINDOW,
+            None => false,
+        }
+    }
+
+    fn mark_last_success(&self) {
+        *self.last_success.lock() = Some(Instant::now());
+    }
+
+    #[cfg(test)]
+    fn expire_warmup_throttle(&self) {
+        *self.last_success.lock() = Some(expired_warmup_instant());
+    }
+
     /// Execute a raw JSON-RPC request
     async fn request<T: for<'de> Deserialize<'de>>(
         &self,
@@ -174,9 +203,16 @@ impl RpcClient {
             return Err(WalletError::RpcError(format_rpc_error(&error)));
         }
 
-        rpc_response
+        let result = rpc_response
             .result
-            .ok_or_else(|| WalletError::RpcError("Empty response".to_string()))
+            .ok_or_else(|| WalletError::RpcError("Empty response".to_string()))?;
+
+        // Mark only after a fully successful response. A live host that answers
+        // every call with a JSON-RPC error — or with neither result nor error —
+        // is not warm in any useful sense, and marking it here would suppress
+        // the next probe for a whole throttle window.
+        self.mark_last_success();
+        Ok(result)
     }
 
     /// Get the current nonce for an address
@@ -651,8 +687,17 @@ impl BatchRpcClient {
 }
 
 #[cfg(test)]
+pub(crate) fn expired_warmup_instant() -> Instant {
+    Instant::now()
+        .checked_sub(WARMUP_THROTTLE_WINDOW + Duration::from_millis(1))
+        .expect("monotonic clock origin is older than the warmup throttle window")
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -813,5 +858,200 @@ mod tests {
             elapsed < Duration::from_secs(2),
             "warmup must bail via the 500ms timeout, not the 30s reqwest timeout (took {elapsed:?})"
         );
+    }
+
+    async fn counting_rpc_server(result: &'static str) -> (String, Arc<AtomicU64>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicU64::new(0));
+        let hits_clone = hits.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                hits_clone.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 2048];
+                let _ = stream.read(&mut buf).await;
+                let body = format!(r#"{{"jsonrpc":"2.0","id":1,"result":"{result}"}}"#);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        (format!("http://{addr}"), hits)
+    }
+
+    /// Serves HTTP 200 with a well-formed JSON-RPC *error* body — a host that is
+    /// reachable and answering but not actually serving.
+    async fn counting_rpc_error_server() -> (String, Arc<AtomicU64>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicU64::new(0));
+        let hits_clone = hits.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                hits_clone.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 2048];
+                let _ = stream.read(&mut buf).await;
+                let body = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"Network mismatch"}}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        (format!("http://{addr}"), hits)
+    }
+
+    /// Cross-audit finding (2026-08-12): marking success before inspecting
+    /// `rpc_response.error` let a live-but-broken endpoint buy a full throttle
+    /// window, so warmup went quiet for 60s exactly when it should have probed.
+    #[tokio::test]
+    async fn jsonrpc_error_does_not_suppress_next_warmup() {
+        let (url, hits) = counting_rpc_error_server().await;
+        let client = RpcClient::new(url).unwrap();
+
+        assert!(client.warmup().await.is_err());
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        assert!(client.warmup().await.is_err());
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "a JSON-RPC error must not earn a throttle window"
+        );
+    }
+
+    /// Round-2 re-audit residual: a body carrying neither `result` nor `error`
+    /// is still an endpoint that is not serving, so it must not earn a window.
+    #[tokio::test]
+    async fn empty_response_does_not_suppress_next_warmup() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicU64::new(0));
+        let hits_clone = hits.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                hits_clone.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 2048];
+                let _ = stream.read(&mut buf).await;
+                let body = r#"{"jsonrpc":"2.0","id":1}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        let client = RpcClient::new(format!("http://{addr}")).unwrap();
+
+        assert!(client.warmup().await.is_err());
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        assert!(client.warmup().await.is_err());
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "a body with neither result nor error must not earn a throttle window"
+        );
+    }
+
+    /// Same guard on the request path: a failed call must not mark the endpoint
+    /// warm and silence the warmup that follows it.
+    #[tokio::test]
+    async fn failed_rpc_request_does_not_suppress_warmup() {
+        let (url, hits) = counting_rpc_error_server().await;
+        let client = RpcClient::new(url).unwrap();
+
+        assert!(client.chain_id().await.is_err());
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        assert!(client.warmup().await.is_err());
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn warmup_skips_probe_within_throttle_window() {
+        let (url, hits) = counting_rpc_server("0x1").await;
+        let client = RpcClient::new(url).unwrap();
+
+        client.warmup().await.unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        client.warmup().await.unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn warmup_probes_again_after_throttle_window() {
+        let (url, hits) = counting_rpc_server("0x1").await;
+        let client = RpcClient::new(url).unwrap();
+
+        client.warmup().await.unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        client.expire_warmup_throttle();
+        client.warmup().await.unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn successful_rpc_request_suppresses_warmup_probe() {
+        let (url, hits) = counting_rpc_server("0x1").await;
+        let client = RpcClient::new(url).unwrap();
+
+        client.chain_id().await.unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        client.warmup().await.unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_request_does_not_suppress_warmup() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicU64::new(0));
+        let hits_clone = hits.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                hits_clone.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 2048];
+                let _ = stream.read(&mut buf).await;
+            }
+        });
+
+        let client = RpcClient::new(format!("http://{addr}")).unwrap();
+        assert!(client.warmup().await.is_err());
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert!(client.warmup().await.is_err());
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn batch_warmup_throttled_skip_counts_as_success() {
+        let (url, hits) = counting_rpc_server("0x1").await;
+        let batch = BatchRpcClient::new(vec![url]).unwrap();
+
+        assert_eq!(batch.warmup().await, 1);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert_eq!(batch.warmup().await, 1);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
     }
 }
