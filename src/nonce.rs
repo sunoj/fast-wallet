@@ -220,10 +220,8 @@ impl NonceTracker {
         }
 
         let current = self.current.load(Ordering::Acquire);
-        if used_nonce < current {
-            if used_nonce >= synced && used_nonce < current && gaps.insert(used_nonce) {
-                self.gap_count.fetch_add(1, Ordering::AcqRel);
-            }
+        if used_nonce >= synced && used_nonce < current && gaps.insert(used_nonce) {
+            self.gap_count.fetch_add(1, Ordering::AcqRel);
         }
     }
 
