@@ -687,6 +687,13 @@ impl BatchRpcClient {
     }
 }
 
+/// Fold all-endpoints-failed errors into one, classifying each endpoint's
+/// error INDIVIDUALLY first. The aggregate is definitive only when every
+/// endpoint's own error is a definitive pre-check rejection; any mixed
+/// outcome (one endpoint rejected, another timed out / returned garbage)
+/// becomes a typed ambiguous error, so a definitive substring inside the
+/// joined message can never make a hidden-success aggregate look safe to
+/// recycle. Single-endpoint failures pass through unchanged.
 fn all_endpoint_errors(errors: Vec<WalletError>) -> WalletError {
     if errors.is_empty() {
         return WalletError::RpcError("No RPC endpoints".to_string());
@@ -697,11 +704,19 @@ fn all_endpoint_errors(errors: Vec<WalletError>) -> WalletError {
             .next()
             .unwrap_or_else(|| WalletError::RpcError("No RPC endpoints".to_string()));
     }
-    let errors = errors
+    let all_definitive = errors
+        .iter()
+        .all(crate::wallet::is_definitive_precheck_rejection);
+    let joined = errors
         .into_iter()
         .map(|error| error.to_string())
-        .collect::<Vec<_>>();
-    WalletError::RpcError(format!("All RPC endpoints failed: {}", errors.join(" | ")))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    if all_definitive {
+        WalletError::AllEndpointsRejectedDefinitively(joined)
+    } else {
+        WalletError::AmbiguousBroadcastFailure(joined)
+    }
 }
 
 #[cfg(test)]

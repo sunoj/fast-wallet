@@ -337,6 +337,13 @@ impl ReservedNonce {
     }
 
     /// Release a broadcasting nonce after every endpoint definitively rejected it.
+    ///
+    /// The released nonce becomes a reusable gap. If a HIGHER nonce is already
+    /// live in a pool it stays queued behind the gap until the next reservation
+    /// pops and broadcasts the gap nonce; the stall-replace path deliberately
+    /// does not cancel into a released gap (`gap_count > 0` gates the lossy
+    /// rewind), so the heal is "next fill reuses the gap" — strictly better
+    /// than the pre-fix behavior of burning the nonce.
     pub fn release_rejected_broadcast(&mut self) -> bool {
         if self.state != ReservedNonceState::Broadcasting {
             return false;

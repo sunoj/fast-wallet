@@ -344,10 +344,25 @@ pub struct NonceHealth {
 /// a streak-driven caller polls each block).
 const STALL_REPLACE_WINDOW: Duration = Duration::from_secs(3);
 
-fn is_definitive_precheck_rejection(error: &WalletError) -> bool {
+/// True only when `error` proves the endpoint's tx pre-check rejected the raw
+/// bytes, i.e. the tx entered no pool on that endpoint. Deny-first: typed
+/// ambiguous variants and any message containing an ambiguous marker short-
+/// circuit to false, and an unknown message is NOT definitive. Multi-endpoint
+/// aggregates never reach the string path — `all_endpoint_errors` classifies
+/// each endpoint's error individually and emits a typed aggregate, so one
+/// definitive substring inside a mixed aggregate cannot leak through (a mixed
+/// outcome means some endpoint may hold the bytes).
+///
+/// The definitive list is deliberately narrow: only phrases that originate
+/// from node-side tx validation on geth / OP-stack / Nitro. Broad tokens like
+/// "malformed" or "rlp" are excluded — proxy/gateway errors ("malformed
+/// response from upstream") contain them while the bytes may be live upstream.
+pub(crate) fn is_definitive_precheck_rejection(error: &WalletError) -> bool {
     match error {
         WalletError::InsufficientFunds | WalletError::GasLimitExceeded => return true,
-        WalletError::Timeout
+        WalletError::AllEndpointsRejectedDefinitively(_) => return true,
+        WalletError::AmbiguousBroadcastFailure(_)
+        | WalletError::Timeout
         | WalletError::NetworkError(_)
         | WalletError::HttpError(_)
         | WalletError::TransactionUnderpriced => return false,
@@ -366,24 +381,23 @@ fn is_definitive_precheck_rejection(error: &WalletError) -> bool {
         "temporarily",
         "nonce too high",
         "nonce too low",
+        "decoding response",
+        "bad gateway",
+        "upstream",
     ];
     if ambiguous.iter().any(|needle| message.contains(needle)) {
         return false;
     }
 
     let definitive = [
+        "insufficient funds for gas",
         "insufficient funds",
         "exceeds block gas limit",
         "exceed block gas limit",
-        "gas limit exceeded",
         "intrinsic gas too high",
         "invalid sender",
         "tx type not supported",
         "transaction type not supported",
-        "unsupported transaction type",
-        "malformed",
-        "invalid rlp",
-        "rlp",
     ];
     definitive.iter().any(|needle| message.contains(needle))
 }
@@ -3057,6 +3071,73 @@ mod tests {
             0,
             "all-endpoint definitive rejection must recycle the preheated nonce"
         );
+    }
+
+    /// Audit finding: one endpoint rejecting -32003 while another fails with an
+    /// unclassifiable error (its upstream may hold the bytes — hidden success)
+    /// must NOT recycle the nonce. Per-endpoint classification in
+    /// `all_endpoint_errors` yields AmbiguousBroadcastFailure for the mix.
+    #[tokio::test]
+    async fn mixed_endpoint_rejections_do_not_recycle_nonce() {
+        let primary = rpc_send_error_server(
+            -32003,
+            "insufficient funds for gas * price + value",
+        )
+        .await;
+        let secondary = rpc_send_error_server(-32700, "upstream proxy returned garbage").await;
+        let wallet = FastWalletBuilder::new(TEST_PRIVATE_KEY, &primary)
+            .chain_id(1)
+            .broadcast_rpcs(vec![secondary])
+            .build_with_nonce(0)
+            .unwrap();
+        let ctx = PreheatedContext::new(wallet.nonce_manager.reserve());
+
+        let result = wallet.send_with_preheat(&ctx, test_request()).await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            wallet.nonce_manager.reserve().nonce(),
+            1,
+            "a mixed endpoint outcome may hide an accepted tx; the nonce must stay consumed"
+        );
+    }
+
+    /// Audit finding: proxy/gateway noise containing broad tokens ("malformed",
+    /// "rlp") is NOT a definitive pre-check rejection — the bytes may be live
+    /// upstream. Such an error must leave the nonce for chain sync.
+    #[tokio::test]
+    async fn proxy_malformed_message_does_not_recycle_nonce() {
+        let url = rpc_send_error_server(-32603, "malformed response from upstream node").await;
+        let wallet = FastWalletBuilder::new(TEST_PRIVATE_KEY, &url)
+            .chain_id(1)
+            .build_with_nonce(0)
+            .unwrap();
+        let ctx = PreheatedContext::new(wallet.nonce_manager.reserve());
+
+        let result = wallet.send_with_preheat(&ctx, test_request()).await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            wallet.nonce_manager.reserve().nonce(),
+            1,
+            "proxy 'malformed' noise is not a node pre-check rejection; must not recycle"
+        );
+    }
+
+    #[test]
+    fn definitive_classifier_handles_typed_aggregates() {
+        assert!(is_definitive_precheck_rejection(
+            &WalletError::AllEndpointsRejectedDefinitively("a | b".into())
+        ));
+        assert!(!is_definitive_precheck_rejection(
+            &WalletError::AmbiguousBroadcastFailure("a | b".into())
+        ));
+        assert!(!is_definitive_precheck_rejection(&WalletError::RpcError(
+            "RPC error -32603: malformed response from upstream".into()
+        )));
+        assert!(!is_definitive_precheck_rejection(&WalletError::RpcError(
+            "All RPC endpoints failed: insufficient funds | error decoding response body".into()
+        )));
     }
 
     #[test]

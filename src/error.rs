@@ -103,6 +103,16 @@ pub enum WalletError {
     #[error("Transaction timeout")]
     Timeout,
 
+    /// Every broadcast endpoint returned a definitive pre-check rejection —
+    /// the raw bytes provably entered no pool. Safe to recycle the nonce.
+    #[error("All endpoints rejected definitively: {0}")]
+    AllEndpointsRejectedDefinitively(String),
+
+    /// Endpoints failed with mixed or ambiguous outcomes — at least one may
+    /// have accepted the bytes. The nonce must be left for chain sync.
+    #[error("Broadcast failed ambiguously: {0}")]
+    AmbiguousBroadcastFailure(String),
+
     #[error("Invalid wallet configuration: {0}")]
     InvalidConfig(String),
 
