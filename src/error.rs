@@ -15,14 +15,9 @@ pub fn parse_nonce_too_low(message: &str) -> Option<u64> {
 }
 
 fn nonce_too_low_details(message: &str) -> Option<&str> {
-    if let Some(details) = message.strip_prefix("nonce too low: ") {
-        return Some(details);
-    }
-
-    let (prefix, details) = message.rsplit_once(": nonce too low: ")?;
-    let code = prefix.strip_prefix("RPC error ").unwrap_or(prefix);
-    code.parse::<i64>().ok()?;
-    Some(details)
+    message
+        .rsplit_once("nonce too low: ")
+        .map(|(_, details)| details)
 }
 
 fn parse_arbitrum_nonce(details: &str) -> Option<u64> {
@@ -139,6 +134,16 @@ mod tests {
         );
         assert_eq!(
             WalletError::RpcError(format!("RPC error -32000: {message}")).authoritative_nonce(),
+            Some(5155)
+        );
+    }
+
+    #[test]
+    fn parses_wrapped_production_arbitrum_nonce_too_low_message() {
+        assert_eq!(
+            parse_nonce_too_low(
+                "sendRawTransaction: RPC error: RPC error -32000: nonce too low: address 0x59Ce835d7fbb2d9479e8794d3cf4893d9C7A02Eb, tx: 5154 state: 5155"
+            ),
             Some(5155)
         );
     }
