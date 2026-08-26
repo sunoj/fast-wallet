@@ -337,6 +337,16 @@ impl ReservedNonce {
         self.state = ReservedNonceState::Released;
         true
     }
+
+    /// Release a broadcasting nonce after every endpoint definitively rejected it.
+    pub fn release_rejected_broadcast(&mut self) -> bool {
+        if self.state != ReservedNonceState::Broadcasting {
+            return false;
+        }
+        self.tracker.release(self.nonce);
+        self.state = ReservedNonceState::Released;
+        true
+    }
 }
 
 impl Drop for ReservedNonce {

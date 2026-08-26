@@ -265,6 +265,15 @@ impl PreheatedContext {
         false
     }
 
+    fn release_rejected_broadcast(&self) -> bool {
+        self.used.store(true, Ordering::Release);
+        let mut reservation = self.reservation.lock();
+        if let Some(mut reservation) = reservation.take() {
+            return reservation.release_rejected_broadcast();
+        }
+        false
+    }
+
     fn reserved_nonce(&self) -> Option<u64> {
         self.reservation.lock().as_ref().map(|nonce| nonce.nonce())
     }
@@ -334,6 +343,50 @@ pub struct NonceHealth {
 /// the same nonce within this window is a no-op (avoids spamming replacements while
 /// a streak-driven caller polls each block).
 const STALL_REPLACE_WINDOW: Duration = Duration::from_secs(3);
+
+fn is_definitive_precheck_rejection(error: &WalletError) -> bool {
+    match error {
+        WalletError::InsufficientFunds | WalletError::GasLimitExceeded => return true,
+        WalletError::Timeout
+        | WalletError::NetworkError(_)
+        | WalletError::HttpError(_)
+        | WalletError::TransactionUnderpriced => return false,
+        _ => {}
+    }
+
+    let message = error.to_string().to_lowercase();
+    let ambiguous = [
+        "already known",
+        "known transaction",
+        "underpriced",
+        "fee too low",
+        "timeout",
+        "connection",
+        "network",
+        "temporarily",
+        "nonce too high",
+        "nonce too low",
+    ];
+    if ambiguous.iter().any(|needle| message.contains(needle)) {
+        return false;
+    }
+
+    let definitive = [
+        "insufficient funds",
+        "exceeds block gas limit",
+        "exceed block gas limit",
+        "gas limit exceeded",
+        "intrinsic gas too high",
+        "invalid sender",
+        "tx type not supported",
+        "transaction type not supported",
+        "unsupported transaction type",
+        "malformed",
+        "invalid rlp",
+        "rlp",
+    ];
+    definitive.iter().any(|needle| message.contains(needle))
+}
 
 /// Outcome of [`FastWallet::replace_stalled_nonce`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1488,6 +1541,20 @@ impl FastWallet {
         }
     }
 
+    async fn handle_preheat_broadcast_error(
+        &self,
+        ctx: &PreheatedContext,
+        tx: &Transaction,
+        error: &WalletError,
+    ) {
+        if is_definitive_precheck_rejection(error) && ctx.release_rejected_broadcast() {
+            self.inflight_nonces
+                .mark_released(tx.nonce(), "definitive_precheck_rejection");
+        } else {
+            self.recover_nonce_error(error).await;
+        }
+    }
+
     /// Send a pre-signed transaction
     ///
     /// Uses a timeout when acquiring the pending transaction permit to avoid
@@ -1837,7 +1904,7 @@ impl FastWallet {
                     .mark_broadcast_accepted(tx.nonce(), *tx_hash);
             }
             Err(error) => {
-                self.recover_nonce_error(error).await;
+                self.handle_preheat_broadcast_error(ctx, &tx, error).await;
             }
         }
         result
@@ -1861,7 +1928,7 @@ impl FastWallet {
                     .mark_broadcast_accepted(tx.nonce(), tx.hash());
             }
             Err(error) => {
-                self.recover_nonce_error(error).await;
+                self.handle_preheat_broadcast_error(ctx, &tx, error).await;
             }
         }
         result
@@ -1968,7 +2035,7 @@ impl FastWallet {
                     .mark_broadcast_accepted(tx.nonce(), *tx_hash);
             }
             Err(error) => {
-                self.recover_nonce_error(error).await;
+                self.handle_preheat_broadcast_error(ctx, &tx, error).await;
             }
         }
         result
@@ -2490,6 +2557,30 @@ mod tests {
         format!("http://{addr}")
     }
 
+    async fn rpc_send_error_server(code: i64, message: &'static str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf)
+                .await
+                .unwrap();
+            let body = format!(
+                r#"{{"jsonrpc":"2.0","id":1,"error":{{"code":{code},"message":"{message}"}}}}"#
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes())
+                .await
+                .unwrap();
+        });
+        format!("http://{addr}")
+    }
+
     #[test]
     fn test_wallet_builder_sync() {
         let wallet = FastWalletBuilder::new(TEST_PRIVATE_KEY, "http://localhost:8545")
@@ -2914,6 +3005,58 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(wallet.sign(test_request()).unwrap().nonce(), 1);
+    }
+
+    #[tokio::test]
+    async fn definitive_insufficient_funds_preheat_rejection_reuses_nonce() {
+        let url = rpc_send_error_server(
+            -32003,
+            "insufficient funds for gas * price + value",
+        )
+        .await;
+        let wallet = FastWalletBuilder::new(TEST_PRIVATE_KEY, &url)
+            .chain_id(1)
+            .build_with_nonce(0)
+            .unwrap();
+        let ctx = PreheatedContext::new(wallet.nonce_manager.reserve());
+
+        let result = wallet.send_with_preheat(&ctx, test_request()).await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            wallet.nonce_manager.reserve().nonce(),
+            0,
+            "definitive -32003 rejection must recycle the preheated nonce"
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_definitive_insufficient_funds_rejections_reuse_nonce() {
+        let primary = rpc_send_error_server(
+            -32003,
+            "insufficient funds for gas * price + value",
+        )
+        .await;
+        let secondary = rpc_send_error_server(
+            -32003,
+            "insufficient funds for gas * price + value",
+        )
+        .await;
+        let wallet = FastWalletBuilder::new(TEST_PRIVATE_KEY, &primary)
+            .chain_id(1)
+            .broadcast_rpcs(vec![secondary])
+            .build_with_nonce(0)
+            .unwrap();
+        let ctx = PreheatedContext::new(wallet.nonce_manager.reserve());
+
+        let result = wallet.send_with_preheat(&ctx, test_request()).await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            wallet.nonce_manager.reserve().nonce(),
+            0,
+            "all-endpoint definitive rejection must recycle the preheated nonce"
+        );
     }
 
     #[test]
