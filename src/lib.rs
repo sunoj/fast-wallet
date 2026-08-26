@@ -53,7 +53,7 @@ pub mod transaction;
 pub mod wallet;
 
 pub use broadcast::{BroadcastStrategy, BroadcasterBuilder, RpcEndpoint, TransactionBroadcaster};
-pub use error::{WalletError, WalletResult};
+pub use error::{parse_nonce_too_low, WalletError, WalletResult};
 pub use gas_provider::GasPriceProvider;
 pub use inflight::{InflightNonceLedger, InflightNonceSnapshot, InflightNonceStatus};
 pub use nonce::{NonceManager, ReservedNonce};

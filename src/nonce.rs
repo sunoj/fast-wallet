@@ -127,6 +127,10 @@ impl NonceTracker {
     }
 
     /// Sync from chain without rewinding over locally reserved nonces.
+    ///
+    /// When a nonce-too-low error reports state above the locally believed
+    /// chain nonce, call `sync_forward(state)` and treat the lane as healed;
+    /// never re-send the rejected transaction nonce.
     pub fn sync_forward(&self, chain_nonce: u64) -> bool {
         let mut gaps = self.gaps.lock();
         gaps.retain(|nonce| *nonce >= chain_nonce);
