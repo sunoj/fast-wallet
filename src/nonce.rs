@@ -220,10 +220,8 @@ impl NonceTracker {
         }
 
         let current = self.current.load(Ordering::Acquire);
-        if used_nonce < current {
-            if used_nonce >= synced && used_nonce < current && gaps.insert(used_nonce) {
-                self.gap_count.fetch_add(1, Ordering::AcqRel);
-            }
+        if used_nonce >= synced && used_nonce < current && gaps.insert(used_nonce) {
+            self.gap_count.fetch_add(1, Ordering::AcqRel);
         }
     }
 
@@ -331,6 +329,23 @@ impl ReservedNonce {
     /// not accepted by another endpoint. Chain reconciliation owns that nonce.
     pub fn release(&mut self) -> bool {
         if self.state != ReservedNonceState::Held {
+            return false;
+        }
+        self.tracker.release(self.nonce);
+        self.state = ReservedNonceState::Released;
+        true
+    }
+
+    /// Release a broadcasting nonce after every endpoint definitively rejected it.
+    ///
+    /// The released nonce becomes a reusable gap. If a HIGHER nonce is already
+    /// live in a pool it stays queued behind the gap until the next reservation
+    /// pops and broadcasts the gap nonce; the stall-replace path deliberately
+    /// does not cancel into a released gap (`gap_count > 0` gates the lossy
+    /// rewind), so the heal is "next fill reuses the gap" — strictly better
+    /// than the pre-fix behavior of burning the nonce.
+    pub fn release_rejected_broadcast(&mut self) -> bool {
+        if self.state != ReservedNonceState::Broadcasting {
             return false;
         }
         self.tracker.release(self.nonce);

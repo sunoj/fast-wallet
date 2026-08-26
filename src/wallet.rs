@@ -265,6 +265,15 @@ impl PreheatedContext {
         false
     }
 
+    fn release_rejected_broadcast(&self) -> bool {
+        self.used.store(true, Ordering::Release);
+        let mut reservation = self.reservation.lock();
+        if let Some(mut reservation) = reservation.take() {
+            return reservation.release_rejected_broadcast();
+        }
+        false
+    }
+
     fn reserved_nonce(&self) -> Option<u64> {
         self.reservation.lock().as_ref().map(|nonce| nonce.nonce())
     }
@@ -334,6 +343,70 @@ pub struct NonceHealth {
 /// the same nonce within this window is a no-op (avoids spamming replacements while
 /// a streak-driven caller polls each block).
 const STALL_REPLACE_WINDOW: Duration = Duration::from_secs(3);
+
+/// Minimum age of the head-of-line in-flight entry before `replace_stalled_nonce`
+/// will cancel it. Closes the check→cancel TOCTOU: a tx that went live inside
+/// this window is treated as alive (NotStalled), never RBF-killed; a genuinely
+/// stranded head has been sitting for the caller's sustain window (minutes).
+const STALL_REPLACE_MIN_HEAD_AGE: Duration = Duration::from_secs(30);
+
+/// True only when `error` proves the endpoint's tx pre-check rejected the raw
+/// bytes, i.e. the tx entered no pool on that endpoint. Deny-first: typed
+/// ambiguous variants and any message containing an ambiguous marker short-
+/// circuit to false, and an unknown message is NOT definitive. Multi-endpoint
+/// aggregates never reach the string path — `all_endpoint_errors` classifies
+/// each endpoint's error individually and emits a typed aggregate, so one
+/// definitive substring inside a mixed aggregate cannot leak through (a mixed
+/// outcome means some endpoint may hold the bytes).
+///
+/// The definitive list is deliberately narrow: only phrases that originate
+/// from node-side tx validation on geth / OP-stack / Nitro. Broad tokens like
+/// "malformed" or "rlp" are excluded — proxy/gateway errors ("malformed
+/// response from upstream") contain them while the bytes may be live upstream.
+pub(crate) fn is_definitive_precheck_rejection(error: &WalletError) -> bool {
+    match error {
+        WalletError::InsufficientFunds | WalletError::GasLimitExceeded => return true,
+        WalletError::AllEndpointsRejectedDefinitively(_) => return true,
+        WalletError::AmbiguousBroadcastFailure(_)
+        | WalletError::Timeout
+        | WalletError::NetworkError(_)
+        | WalletError::HttpError(_)
+        | WalletError::TransactionUnderpriced => return false,
+        _ => {}
+    }
+
+    let message = error.to_string().to_lowercase();
+    let ambiguous = [
+        "already known",
+        "known transaction",
+        "underpriced",
+        "fee too low",
+        "timeout",
+        "connection",
+        "network",
+        "temporarily",
+        "nonce too high",
+        "nonce too low",
+        "decoding response",
+        "bad gateway",
+        "upstream",
+    ];
+    if ambiguous.iter().any(|needle| message.contains(needle)) {
+        return false;
+    }
+
+    let definitive = [
+        "insufficient funds for gas",
+        "insufficient funds",
+        "exceeds block gas limit",
+        "exceed block gas limit",
+        "intrinsic gas too high",
+        "invalid sender",
+        "tx type not supported",
+        "transaction type not supported",
+    ];
+    definitive.iter().any(|needle| message.contains(needle))
+}
 
 /// Outcome of [`FastWallet::replace_stalled_nonce`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1488,6 +1561,20 @@ impl FastWallet {
         }
     }
 
+    async fn handle_preheat_broadcast_error(
+        &self,
+        ctx: &PreheatedContext,
+        tx: &Transaction,
+        error: &WalletError,
+    ) {
+        if is_definitive_precheck_rejection(error) && ctx.release_rejected_broadcast() {
+            self.inflight_nonces
+                .mark_released(tx.nonce(), "definitive_precheck_rejection");
+        } else {
+            self.recover_nonce_error(error).await;
+        }
+    }
+
     /// Send a pre-signed transaction
     ///
     /// Uses a timeout when acquiring the pending transaction permit to avoid
@@ -1723,8 +1810,12 @@ impl FastWallet {
             }
         }
 
-        // Pending-tag safety proof: the chain must agree `chain_next` is next, i.e.
-        // none of our in-flight txs at/above it are in the canonical pending set.
+        // Latest-tag safety check: nothing at/above `chain_next` has MINED. This
+        // is a confirmed-state read, NOT a pending-pool proof — a live pending tx
+        // at `chain_next` (e.g. underpriced-but-pooled) still passes, and
+        // replacing such a tx after the caller's sustained-stall window is the
+        // intended active-replace behavior. The freshness guard below is what
+        // protects a tx that only just went live.
         let chain_latest = self.rpc_client.get_nonce_latest(self.address()).await?;
         if chain_latest != chain_next {
             return Ok(ReplaceOutcome::NotStalled);
@@ -1741,6 +1832,15 @@ impl FastWallet {
             Some(snap) if snap.nonce == chain_next => snap,
             _ => return Ok(ReplaceOutcome::NoCandidate),
         };
+
+        // Freshness guard (audit): the caller's stall proof (sustained drift)
+        // was computed from a snapshot; a tx at `chain_next` that entered a pool
+        // AFTER that snapshot is alive, not stranded — cancelling it would RBF
+        // our own just-broadcast fill. A genuinely stranded head is minutes old;
+        // anything younger than the floor gets another observation window.
+        if stranded.age < STALL_REPLACE_MIN_HEAD_AGE {
+            return Ok(ReplaceOutcome::NotStalled);
+        }
 
         // Network fees fetched BEFORE the final guard so there is no `.await` between
         // the guard and signing (closes the check→sign race window).
@@ -1837,7 +1937,7 @@ impl FastWallet {
                     .mark_broadcast_accepted(tx.nonce(), *tx_hash);
             }
             Err(error) => {
-                self.recover_nonce_error(error).await;
+                self.handle_preheat_broadcast_error(ctx, &tx, error).await;
             }
         }
         result
@@ -1861,7 +1961,7 @@ impl FastWallet {
                     .mark_broadcast_accepted(tx.nonce(), tx.hash());
             }
             Err(error) => {
-                self.recover_nonce_error(error).await;
+                self.handle_preheat_broadcast_error(ctx, &tx, error).await;
             }
         }
         result
@@ -1968,7 +2068,7 @@ impl FastWallet {
                     .mark_broadcast_accepted(tx.nonce(), *tx_hash);
             }
             Err(error) => {
-                self.recover_nonce_error(error).await;
+                self.handle_preheat_broadcast_error(ctx, &tx, error).await;
             }
         }
         result
@@ -2490,6 +2590,30 @@ mod tests {
         format!("http://{addr}")
     }
 
+    async fn rpc_send_error_server(code: i64, message: &'static str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf)
+                .await
+                .unwrap();
+            let body = format!(
+                r#"{{"jsonrpc":"2.0","id":1,"error":{{"code":{code},"message":"{message}"}}}}"#
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes())
+                .await
+                .unwrap();
+        });
+        format!("http://{addr}")
+    }
+
     #[test]
     fn test_wallet_builder_sync() {
         let wallet = FastWalletBuilder::new(TEST_PRIVATE_KEY, "http://localhost:8545")
@@ -2916,6 +3040,125 @@ mod tests {
         assert_eq!(wallet.sign(test_request()).unwrap().nonce(), 1);
     }
 
+    #[tokio::test]
+    async fn definitive_insufficient_funds_preheat_rejection_reuses_nonce() {
+        let url = rpc_send_error_server(
+            -32003,
+            "insufficient funds for gas * price + value",
+        )
+        .await;
+        let wallet = FastWalletBuilder::new(TEST_PRIVATE_KEY, &url)
+            .chain_id(1)
+            .build_with_nonce(0)
+            .unwrap();
+        let ctx = PreheatedContext::new(wallet.nonce_manager.reserve());
+
+        let result = wallet.send_with_preheat(&ctx, test_request()).await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            wallet.nonce_manager.reserve().nonce(),
+            0,
+            "definitive -32003 rejection must recycle the preheated nonce"
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_definitive_insufficient_funds_rejections_reuse_nonce() {
+        let primary = rpc_send_error_server(
+            -32003,
+            "insufficient funds for gas * price + value",
+        )
+        .await;
+        let secondary = rpc_send_error_server(
+            -32003,
+            "insufficient funds for gas * price + value",
+        )
+        .await;
+        let wallet = FastWalletBuilder::new(TEST_PRIVATE_KEY, &primary)
+            .chain_id(1)
+            .broadcast_rpcs(vec![secondary])
+            .build_with_nonce(0)
+            .unwrap();
+        let ctx = PreheatedContext::new(wallet.nonce_manager.reserve());
+
+        let result = wallet.send_with_preheat(&ctx, test_request()).await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            wallet.nonce_manager.reserve().nonce(),
+            0,
+            "all-endpoint definitive rejection must recycle the preheated nonce"
+        );
+    }
+
+    /// Audit finding: one endpoint rejecting -32003 while another fails with an
+    /// unclassifiable error (its upstream may hold the bytes — hidden success)
+    /// must NOT recycle the nonce. Per-endpoint classification in
+    /// `all_endpoint_errors` yields AmbiguousBroadcastFailure for the mix.
+    #[tokio::test]
+    async fn mixed_endpoint_rejections_do_not_recycle_nonce() {
+        let primary = rpc_send_error_server(
+            -32003,
+            "insufficient funds for gas * price + value",
+        )
+        .await;
+        let secondary = rpc_send_error_server(-32700, "upstream proxy returned garbage").await;
+        let wallet = FastWalletBuilder::new(TEST_PRIVATE_KEY, &primary)
+            .chain_id(1)
+            .broadcast_rpcs(vec![secondary])
+            .build_with_nonce(0)
+            .unwrap();
+        let ctx = PreheatedContext::new(wallet.nonce_manager.reserve());
+
+        let result = wallet.send_with_preheat(&ctx, test_request()).await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            wallet.nonce_manager.reserve().nonce(),
+            1,
+            "a mixed endpoint outcome may hide an accepted tx; the nonce must stay consumed"
+        );
+    }
+
+    /// Audit finding: proxy/gateway noise containing broad tokens ("malformed",
+    /// "rlp") is NOT a definitive pre-check rejection — the bytes may be live
+    /// upstream. Such an error must leave the nonce for chain sync.
+    #[tokio::test]
+    async fn proxy_malformed_message_does_not_recycle_nonce() {
+        let url = rpc_send_error_server(-32603, "malformed response from upstream node").await;
+        let wallet = FastWalletBuilder::new(TEST_PRIVATE_KEY, &url)
+            .chain_id(1)
+            .build_with_nonce(0)
+            .unwrap();
+        let ctx = PreheatedContext::new(wallet.nonce_manager.reserve());
+
+        let result = wallet.send_with_preheat(&ctx, test_request()).await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            wallet.nonce_manager.reserve().nonce(),
+            1,
+            "proxy 'malformed' noise is not a node pre-check rejection; must not recycle"
+        );
+    }
+
+    #[test]
+    fn definitive_classifier_handles_typed_aggregates() {
+        assert!(is_definitive_precheck_rejection(
+            &WalletError::AllEndpointsRejectedDefinitively("a | b".into())
+        ));
+        assert!(!is_definitive_precheck_rejection(
+            &WalletError::AmbiguousBroadcastFailure("a | b".into())
+        ));
+        assert!(!is_definitive_precheck_rejection(&WalletError::RpcError(
+            "RPC error -32603: malformed response from upstream".into()
+        )));
+        assert!(!is_definitive_precheck_rejection(&WalletError::RpcError(
+            "All RPC endpoints failed: insufficient funds | error decoding response body".into()
+        )));
+    }
+
     #[test]
     fn test_eip1559_transaction() {
         let wallet = FastWalletBuilder::new(TEST_PRIVATE_KEY, "http://localhost:8545")
@@ -3280,6 +3523,9 @@ mod tests {
         // In-flight candidate at exactly nonce 50 (advances local high-water to 51).
         wallet.sign(test_request()).unwrap();
         assert!(wallet.current_nonce() >= 50);
+        wallet
+            .inflight_nonces
+            .backdate_first_seen_for_tests(50, Duration::from_secs(60));
 
         let outcome = wallet.replace_stalled_nonce(50, 0).await.unwrap();
         match outcome {
@@ -3321,6 +3567,9 @@ mod tests {
 
         let snap = wallet.lowest_unresolved_inflight(50).unwrap();
         assert_eq!(snap.max_priority_seen, Some(U256::from(100_000_000_000u64)));
+        wallet
+            .inflight_nonces
+            .backdate_first_seen_for_tests(50, Duration::from_secs(60));
 
         let outcome = wallet.replace_stalled_nonce(50, 0).await.unwrap();
         assert!(matches!(
@@ -3375,6 +3624,9 @@ mod tests {
         // high-water stays at 50 == chain_next.
         wallet.sign_with_nonce(test_request(), 50).unwrap();
         assert_eq!(wallet.current_nonce(), 50);
+        wallet
+            .inflight_nonces
+            .backdate_first_seen_for_tests(50, Duration::from_secs(60));
         assert_eq!(
             wallet.replace_stalled_nonce(50, 0).await.unwrap(),
             ReplaceOutcome::RaceAborted
@@ -3399,6 +3651,9 @@ mod tests {
             stranded.max_priority_fee_per_gas(),
         );
 
+        wallet
+            .inflight_nonces
+            .backdate_first_seen_for_tests(50, Duration::from_secs(60));
         // Broadcast fails → Err, and the ledger fee for nonce 50 stays the stranded
         // tx's fee (not the higher, unaccepted cancel fee).
         assert!(wallet.replace_stalled_nonce(50, 0).await.is_err());
@@ -3467,10 +3722,34 @@ mod tests {
         // sign_with_nonce records an in-flight at 50 without moving the counter.
         wallet.sign_with_nonce(test_request(), 50).unwrap();
         assert_eq!(wallet.current_nonce(), 42);
+        wallet
+            .inflight_nonces
+            .backdate_first_seen_for_tests(50, Duration::from_secs(60));
         assert_eq!(
             wallet.replace_stalled_nonce(50, 0).await.unwrap(),
             ReplaceOutcome::RaceAborted
         );
+    }
+
+    /// Audit (f1 nonce-health review): a head-of-line tx that went live only
+    /// moments ago must NOT be RBF-cancelled — the caller's stall proof predates
+    /// it. The freshness guard returns NotStalled and broadcasts nothing.
+    /// Reverted (guard removed), this test fails with a Cancelled outcome.
+    #[tokio::test]
+    async fn replace_stalled_nonce_refuses_fresh_head() {
+        let (url, sent) = mock_rpc_server(50, 1_000_000_000, 20_000_000_000, false).await;
+        let wallet = FastWalletBuilder::new(TEST_PRIVATE_KEY, &url)
+            .chain_id(1)
+            .build_with_nonce(50)
+            .unwrap();
+        // Fresh in-flight entry at the head (age ~0) — e.g. a fill broadcast
+        // between the caller's health snapshot and the cancel.
+        wallet.sign(test_request()).unwrap();
+        assert_eq!(
+            wallet.replace_stalled_nonce(50, 0).await.unwrap(),
+            ReplaceOutcome::NotStalled
+        );
+        assert_eq!(sent.lock().len(), 0, "fresh head must not be cancelled");
     }
 
     #[tokio::test]

@@ -575,7 +575,7 @@ impl BatchRpcClient {
             })
             .collect();
 
-        let mut last_err = None;
+        let mut errors = Vec::new();
         while !pending.is_empty() {
             let (result, _index, remaining) = select_all(pending).await;
             match result {
@@ -589,13 +589,13 @@ impl BatchRpcClient {
                     return Ok(hash);
                 }
                 Err(e) => {
-                    last_err = Some(e);
+                    errors.push(e);
                     pending = remaining;
                 }
             }
         }
 
-        Err(last_err.unwrap_or_else(|| WalletError::RpcError("No RPC endpoints".to_string())))
+        Err(all_endpoint_errors(errors))
     }
 
     /// Send transaction to all endpoints in parallel with first-success timing.
@@ -627,7 +627,7 @@ impl BatchRpcClient {
             })
             .collect();
 
-        let mut last_err = None;
+        let mut errors = Vec::new();
         let mut per_endpoint_ms = Vec::new();
         let mut failed_endpoints = 0usize;
         let mut slowest_endpoint_ms = 0u64;
@@ -660,14 +660,15 @@ impl BatchRpcClient {
                 }
                 Err(e) => {
                     failed_endpoints += 1;
-                    per_endpoint_ms.push((url, Err(e.to_string())));
-                    last_err = Some(e);
+                    let error = e.to_string();
+                    per_endpoint_ms.push((url, Err(error.clone())));
+                    errors.push(e);
                     pending = remaining;
                 }
             }
         }
 
-        Err(last_err.unwrap_or_else(|| WalletError::RpcError("No RPC endpoints".to_string())))
+        Err(all_endpoint_errors(errors))
     }
 
     /// Warm up HTTP connections to all endpoints
@@ -683,6 +684,38 @@ impl BatchRpcClient {
     /// Get the number of endpoints
     pub fn endpoint_count(&self) -> usize {
         self.clients.len()
+    }
+}
+
+/// Fold all-endpoints-failed errors into one, classifying each endpoint's
+/// error INDIVIDUALLY first. The aggregate is definitive only when every
+/// endpoint's own error is a definitive pre-check rejection; any mixed
+/// outcome (one endpoint rejected, another timed out / returned garbage)
+/// becomes a typed ambiguous error, so a definitive substring inside the
+/// joined message can never make a hidden-success aggregate look safe to
+/// recycle. Single-endpoint failures pass through unchanged.
+fn all_endpoint_errors(errors: Vec<WalletError>) -> WalletError {
+    if errors.is_empty() {
+        return WalletError::RpcError("No RPC endpoints".to_string());
+    }
+    if errors.len() == 1 {
+        return errors
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| WalletError::RpcError("No RPC endpoints".to_string()));
+    }
+    let all_definitive = errors
+        .iter()
+        .all(crate::wallet::is_definitive_precheck_rejection);
+    let joined = errors
+        .into_iter()
+        .map(|error| error.to_string())
+        .collect::<Vec<_>>()
+        .join(" | ");
+    if all_definitive {
+        WalletError::AllEndpointsRejectedDefinitively(joined)
+    } else {
+        WalletError::AmbiguousBroadcastFailure(joined)
     }
 }
 
