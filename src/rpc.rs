@@ -523,19 +523,23 @@ pub fn endpoint_host(url: &str) -> &str {
         .map_or(authority, |(_, host)| host)
 }
 
-/// Replace every URL inside a message with just its host.
+/// Replace HTTP(S) and WS(S) URLs, case-insensitively, with just their host.
 ///
 /// `reqwest::Error::to_string()` embeds the request URL — API key and all
 /// (`error sending request for url (https://host/v2/<key>)`), so error text
 /// from a broadcast attempt can never be logged verbatim.
 pub fn redact_urls(message: &str) -> String {
     let mut out = String::with_capacity(message.len());
+    let lowercase = message.to_ascii_lowercase();
     let mut rest = message;
     loop {
-        let start = match (rest.find("http://"), rest.find("https://")) {
-            (Some(plain), Some(tls)) => plain.min(tls),
-            (Some(only), None) | (None, Some(only)) => only,
-            (None, None) => break,
+        let searchable = &lowercase[message.len() - rest.len()..];
+        let Some(start) = ["http://", "https://", "ws://", "wss://"]
+            .iter()
+            .filter_map(|scheme| searchable.find(scheme))
+            .min()
+        else {
+            break;
         };
         out.push_str(&rest[..start]);
         let tail = &rest[start..];
