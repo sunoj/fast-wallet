@@ -265,9 +265,9 @@ pub struct BroadcastResult {
     pub success_count: usize,
     /// Number of failed submissions
     pub failure_count: usize,
-    /// Errors from failed submissions
+    /// Endpoint hosts and redacted errors from failed submissions
     pub errors: Vec<(String, WalletError)>,
-    /// Which endpoint succeeded first (if RaceAll strategy)
+    /// Host of the first successful endpoint
     pub first_success: Option<String>,
 }
 
@@ -295,7 +295,7 @@ impl TransactionBroadcaster {
             .http2_keep_alive_timeout(Duration::from_secs(20))
             .http2_keep_alive_while_idle(true)
             .build()
-            .map_err(|e| WalletError::NetworkError(e.to_string()))?;
+            .map_err(|e| WalletError::NetworkError(crate::redact_urls(&e.to_string())))?;
 
         Ok(Self {
             client,
@@ -397,13 +397,13 @@ impl TransactionBroadcaster {
         let response = timeout(timeout_duration, request.send())
             .await
             .map_err(|_| WalletError::Timeout)?
-            .map_err(|e| WalletError::NetworkError(e.to_string()))?;
+            .map_err(|e| WalletError::NetworkError(crate::redact_urls(&e.to_string())))?;
 
         // Just check that we got a valid response
         let _: RpcResponse = response
             .json()
             .await
-            .map_err(|e| WalletError::RpcError(e.to_string()))?;
+            .map_err(|e| WalletError::RpcError(crate::redact_urls(&e.to_string())))?;
 
         Ok(())
     }
@@ -452,12 +452,12 @@ impl TransactionBroadcaster {
         let response = timeout(timeout_duration, request.send())
             .await
             .map_err(|_| WalletError::Timeout)?
-            .map_err(|e| WalletError::NetworkError(e.to_string()))?;
+            .map_err(|e| WalletError::NetworkError(crate::redact_urls(&e.to_string())))?;
 
         let rpc_response: RpcResponse = response
             .json()
             .await
-            .map_err(|e| WalletError::RpcError(e.to_string()))?;
+            .map_err(|e| WalletError::RpcError(crate::redact_urls(&e.to_string())))?;
 
         if let Some(error) = rpc_response.error {
             return Err(WalletError::RpcError(format_rpc_error(&error)));
@@ -528,9 +528,9 @@ impl TransactionBroadcaster {
             .endpoints
             .iter()
             .map(|endpoint| {
-                let url = endpoint.url.clone();
+                let endpoint_host = crate::endpoint_host(&endpoint.url).to_string();
                 self.send_to_endpoint(endpoint, raw_tx)
-                    .map(move |result| (url, result))
+                    .map(move |result| (endpoint_host, result))
                     .boxed()
             })
             .collect();
@@ -543,17 +543,17 @@ impl TransactionBroadcaster {
             pending = remaining;
 
             match result {
-                (url, Ok(hash)) => {
+                (endpoint_host, Ok(hash)) => {
                     return BroadcastResult {
                         tx_hash: Some(hash),
                         success_count: 1,
                         failure_count: errors.len(),
                         errors,
-                        first_success: Some(url),
+                        first_success: Some(endpoint_host),
                     };
                 }
-                (url, Err(e)) => {
-                    errors.push((url, e));
+                (endpoint_host, Err(e)) => {
+                    errors.push((endpoint_host, e));
                 }
             }
         }
@@ -573,8 +573,8 @@ impl TransactionBroadcaster {
             .endpoints
             .iter()
             .map(|endpoint| {
-                let url = endpoint.url.clone();
-                async move { (url, self.send_to_endpoint(endpoint, raw_tx).await) }
+                let endpoint_host = crate::endpoint_host(&endpoint.url).to_string();
+                async move { (endpoint_host, self.send_to_endpoint(endpoint, raw_tx).await) }
             })
             .collect();
 
@@ -585,17 +585,17 @@ impl TransactionBroadcaster {
         let mut errors = Vec::new();
         let mut first_success = None;
 
-        for (url, result) in results {
+        for (endpoint_host, result) in results {
             match result {
                 Ok(hash) => {
                     if tx_hash.is_none() {
                         tx_hash = Some(hash);
-                        first_success = Some(url);
+                        first_success = Some(endpoint_host);
                     }
                     success_count += 1;
                 }
                 Err(e) => {
-                    errors.push((url, e));
+                    errors.push((endpoint_host, e));
                 }
             }
         }
@@ -621,11 +621,11 @@ impl TransactionBroadcaster {
                         success_count: 1,
                         failure_count: errors.len(),
                         errors,
-                        first_success: Some(endpoint.url.clone()),
+                        first_success: Some(crate::endpoint_host(&endpoint.url).to_string()),
                     };
                 }
                 Err(e) => {
-                    errors.push((endpoint.url.clone(), e));
+                    errors.push((crate::endpoint_host(&endpoint.url).to_string(), e));
                 }
             }
         }
@@ -648,9 +648,9 @@ impl TransactionBroadcaster {
             let futures: Vec<_> = private
                 .iter()
                 .map(|endpoint| {
-                    let url = endpoint.url.clone();
+                    let endpoint_host = crate::endpoint_host(&endpoint.url).to_string();
                     self.send_to_endpoint(endpoint, raw_tx)
-                        .map(move |result| (url, result))
+                        .map(move |result| (endpoint_host, result))
                         .boxed()
                 })
                 .collect();
@@ -663,17 +663,17 @@ impl TransactionBroadcaster {
                 pending = remaining;
 
                 match result {
-                    (url, Ok(hash)) => {
+                    (endpoint_host, Ok(hash)) => {
                         return BroadcastResult {
                             tx_hash: Some(hash),
                             success_count: 1,
                             failure_count: private_errors.len(),
                             errors: private_errors,
-                            first_success: Some(url),
+                            first_success: Some(endpoint_host),
                         };
                     }
-                    (url, Err(e)) => {
-                        private_errors.push((url, e));
+                    (endpoint_host, Err(e)) => {
+                        private_errors.push((endpoint_host, e));
                     }
                 }
             }
@@ -702,9 +702,9 @@ impl TransactionBroadcaster {
         let futures: Vec<_> = endpoints
             .iter()
             .map(|endpoint| {
-                let url = endpoint.url.clone();
+                let endpoint_host = crate::endpoint_host(&endpoint.url).to_string();
                 self.send_to_endpoint(endpoint, raw_tx)
-                    .map(move |result| (url, result))
+                    .map(move |result| (endpoint_host, result))
                     .boxed()
             })
             .collect();
@@ -717,17 +717,17 @@ impl TransactionBroadcaster {
             pending = remaining;
 
             match result {
-                (url, Ok(hash)) => {
+                (endpoint_host, Ok(hash)) => {
                     return BroadcastResult {
                         tx_hash: Some(hash),
                         success_count: 1,
                         failure_count: errors.len(),
                         errors,
-                        first_success: Some(url),
+                        first_success: Some(endpoint_host),
                     };
                 }
-                (url, Err(e)) => {
-                    errors.push((url, e));
+                (endpoint_host, Err(e)) => {
+                    errors.push((endpoint_host, e));
                 }
             }
         }
