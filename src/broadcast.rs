@@ -1259,8 +1259,7 @@ mod tests {
     #[tokio::test]
     async fn warmup_skips_probe_within_throttle_window() {
         let (url, hits) = counting_rpc_server("0x1").await;
-        let broadcaster =
-            TransactionBroadcaster::new(vec![RpcEndpoint::public(url)]).unwrap();
+        let broadcaster = TransactionBroadcaster::new(vec![RpcEndpoint::public(url)]).unwrap();
 
         assert_eq!(broadcaster.warmup().await, 1);
         assert_eq!(hits.load(Ordering::SeqCst), 1);
@@ -1286,8 +1285,7 @@ mod tests {
     async fn successful_broadcast_suppresses_warmup_probe() {
         let hash = "0x1111111111111111111111111111111111111111111111111111111111111111";
         let (url, hits) = counting_rpc_server(hash).await;
-        let broadcaster =
-            TransactionBroadcaster::new(vec![RpcEndpoint::public(url)]).unwrap();
+        let broadcaster = TransactionBroadcaster::new(vec![RpcEndpoint::public(url)]).unwrap();
 
         let result = broadcaster.broadcast_raw("0x01").await;
         assert!(result.tx_hash.is_some());

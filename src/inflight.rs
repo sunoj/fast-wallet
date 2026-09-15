@@ -106,9 +106,7 @@ impl InflightNonceLedger {
     pub fn backdate_first_seen_for_tests(&self, nonce: u64, age: std::time::Duration) {
         let mut records = self.records.lock();
         if let Some(record) = records.get_mut(&nonce) {
-            record.first_seen = Instant::now()
-                .checked_sub(age)
-                .unwrap_or_else(Instant::now);
+            record.first_seen = Instant::now().checked_sub(age).unwrap_or_else(Instant::now);
         }
     }
 

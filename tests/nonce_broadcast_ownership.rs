@@ -10,12 +10,14 @@ use std::sync::{Arc, Barrier};
 use std::thread::{self, JoinHandle};
 
 const INITIAL_NONCE: u64 = 9_169;
-const TEST_PRIVATE_KEY: &str =
-    "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+const TEST_PRIVATE_KEY: &str = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
 
 fn underpriced_rpc() -> (String, JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock RPC");
-    let url = format!("http://{}", listener.local_addr().expect("mock RPC address"));
+    let url = format!(
+        "http://{}",
+        listener.local_addr().expect("mock RPC address")
+    );
     let task = thread::spawn(move || {
         let (mut stream, _) = listener.accept().expect("accept wallet request");
         read_http_request(&mut stream);
@@ -24,7 +26,9 @@ fn underpriced_rpc() -> (String, JoinHandle<()>) {
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
             body.len(), body
         );
-        stream.write_all(response.as_bytes()).expect("write RPC response");
+        stream
+            .write_all(response.as_bytes())
+            .expect("write RPC response");
     });
     (url, task)
 }
@@ -56,7 +60,10 @@ fn reserve_concurrently(wallet: &Arc<FastWallet>) -> (ReservedNonce, ReservedNon
     let first = reserve(wallet.clone(), barrier.clone());
     let second = reserve(wallet.clone(), barrier.clone());
     barrier.wait();
-    (first.join().expect("first reservation"), second.join().expect("second reservation"))
+    (
+        first.join().expect("first reservation"),
+        second.join().expect("second reservation"),
+    )
 }
 
 fn sign_probe(wallet: &FastWallet, nonce: u64, marker: u8) -> fast_wallet::Transaction {
@@ -79,20 +86,42 @@ async fn failed_broadcast_never_recycles_nonce_into_concurrent_stream() {
             .expect("build wallet"),
     );
     let (a, b) = reserve_concurrently(&wallet);
-    let (mut failed, concurrent) = if a.nonce() < b.nonce() { (a, b) } else { (b, a) };
-    assert_eq!((failed.nonce(), concurrent.nonce()), (INITIAL_NONCE, INITIAL_NONCE + 1));
+    let (mut failed, concurrent) = if a.nonce() < b.nonce() {
+        (a, b)
+    } else {
+        (b, a)
+    };
+    assert_eq!(
+        (failed.nonce(), concurrent.nonce()),
+        (INITIAL_NONCE, INITIAL_NONCE + 1)
+    );
 
     let failed_tx = sign_probe(&wallet, failed.nonce(), 0xaa);
     let concurrent_tx = sign_probe(&wallet, concurrent.nonce(), 0xbb);
-    assert!(failed.mark_broadcasting(), "signed nonce must enter broadcast ownership");
-    let error = wallet.send_signed(&failed_tx).await.expect_err("mock rejects broadcast");
-    assert!(error.to_string().contains("replacement transaction underpriced"));
-    assert!(!failed.release(), "a broadcasting reservation cannot be manually recycled");
+    assert!(
+        failed.mark_broadcasting(),
+        "signed nonce must enter broadcast ownership"
+    );
+    let error = wallet
+        .send_signed(&failed_tx)
+        .await
+        .expect_err("mock rejects broadcast");
+    assert!(error
+        .to_string()
+        .contains("replacement transaction underpriced"));
+    assert!(
+        !failed.release(),
+        "a broadcasting reservation cannot be manually recycled"
+    );
     rpc_task.join().expect("mock RPC task");
 
     let later = wallet.reserve_nonce();
     let later_tx = sign_probe(&wallet, later.nonce(), 0xcc);
-    assert_ne!(later_tx.hash(), failed_tx.hash(), "later probe must be a different transaction");
+    assert_ne!(
+        later_tx.hash(),
+        failed_tx.hash(),
+        "later probe must be a different transaction"
+    );
     assert_eq!(concurrent_tx.nonce(), INITIAL_NONCE + 1);
     assert_eq!(
         later.nonce(),

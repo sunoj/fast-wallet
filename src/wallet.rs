@@ -408,7 +408,9 @@ pub(crate) fn is_definitive_precheck_rejection(error: &WalletError) -> bool {
             return !failure.endpoints.is_empty()
                 && failure.endpoints.iter().all(|verdict| {
                     verdict.class == crate::error::EndpointFailureClass::Rejection
-                        && is_definitive_precheck_rejection(&WalletError::RpcError(verdict.error.clone()))
+                        && is_definitive_precheck_rejection(&WalletError::RpcError(
+                            verdict.error.clone(),
+                        ))
                 });
         }
         WalletError::AmbiguousBroadcastFailure(_)
@@ -2310,7 +2312,11 @@ pub struct FastWalletBuilder {
 /// `exclusive` is set, in which case `broadcast_rpcs` is used as-is. Shared
 /// by `FastWalletBuilder::build()`/`build_with_nonce()` so the two callers
 /// can't drift on this logic.
-fn resolve_broadcast_rpcs(primary_rpc: &str, broadcast_rpcs: Vec<String>, exclusive: bool) -> Vec<String> {
+fn resolve_broadcast_rpcs(
+    primary_rpc: &str,
+    broadcast_rpcs: Vec<String>,
+    exclusive: bool,
+) -> Vec<String> {
     if exclusive {
         broadcast_rpcs
     } else {
@@ -2530,19 +2536,25 @@ impl FastWalletBuilder {
                 self.config,
             )?;
             if !self.broadcast_rpcs.is_empty() {
-                let all_rpcs =
-                    resolve_broadcast_rpcs(&self.primary_rpc, self.broadcast_rpcs, self.exclusive_broadcast);
+                let all_rpcs = resolve_broadcast_rpcs(
+                    &self.primary_rpc,
+                    self.broadcast_rpcs,
+                    self.exclusive_broadcast,
+                );
                 wallet.batch_client = Some(Arc::new(
-                BatchRpcClient::new(all_rpcs)?
-                    .with_send_timeout(wallet.config.broadcast_send_timeout),
-            ));
+                    BatchRpcClient::new(all_rpcs)?
+                        .with_send_timeout(wallet.config.broadcast_send_timeout),
+                ));
             }
             wallet
         } else if !self.broadcast_rpcs.is_empty() {
             let mut wallet =
                 FastWallet::new(&self.private_key, &self.primary_rpc, self.config).await?;
-            let all_rpcs =
-                resolve_broadcast_rpcs(&self.primary_rpc, self.broadcast_rpcs, self.exclusive_broadcast);
+            let all_rpcs = resolve_broadcast_rpcs(
+                &self.primary_rpc,
+                self.broadcast_rpcs,
+                self.exclusive_broadcast,
+            );
             wallet.batch_client = Some(Arc::new(
                 BatchRpcClient::new(all_rpcs)?
                     .with_send_timeout(wallet.config.broadcast_send_timeout),
@@ -2570,8 +2582,11 @@ impl FastWalletBuilder {
             FastWallet::with_known_nonce(&self.private_key, &self.primary_rpc, nonce, self.config)?;
 
         if !self.broadcast_rpcs.is_empty() {
-            let all_rpcs =
-                resolve_broadcast_rpcs(&self.primary_rpc, self.broadcast_rpcs, self.exclusive_broadcast);
+            let all_rpcs = resolve_broadcast_rpcs(
+                &self.primary_rpc,
+                self.broadcast_rpcs,
+                self.exclusive_broadcast,
+            );
             wallet.batch_client = Some(Arc::new(
                 BatchRpcClient::new(all_rpcs)?
                     .with_send_timeout(wallet.config.broadcast_send_timeout),
@@ -2667,7 +2682,10 @@ mod tests {
     fn resolve_broadcast_rpcs_default_includes_primary() {
         let rpcs = resolve_broadcast_rpcs(
             "https://primary.example.com",
-            vec!["https://a.example.com".into(), "https://b.example.com".into()],
+            vec![
+                "https://a.example.com".into(),
+                "https://b.example.com".into(),
+            ],
             false,
         );
         assert_eq!(
@@ -2690,7 +2708,10 @@ mod tests {
         let primary = "https://primary.example.com";
         let rpcs = resolve_broadcast_rpcs(
             primary,
-            vec!["https://relay.flashbots.net".into(), "https://rpc.mevblocker.io/fullprivacy".into()],
+            vec![
+                "https://relay.flashbots.net".into(),
+                "https://rpc.mevblocker.io/fullprivacy".into(),
+            ],
             true,
         );
         assert_eq!(
@@ -2700,7 +2721,10 @@ mod tests {
                 "https://rpc.mevblocker.io/fullprivacy".to_string(),
             ]
         );
-        assert!(!rpcs.iter().any(|url| url == primary), "primary_rpc leaked into an exclusive broadcast set");
+        assert!(
+            !rpcs.iter().any(|url| url == primary),
+            "primary_rpc leaked into an exclusive broadcast set"
+        );
     }
 
     /// `broadcast_rpcs_exclusive` builder method actually sets the flag the
@@ -3076,11 +3100,7 @@ mod tests {
 
     #[tokio::test]
     async fn definitive_insufficient_funds_preheat_rejection_reuses_nonce() {
-        let url = rpc_send_error_server(
-            -32003,
-            "insufficient funds for gas * price + value",
-        )
-        .await;
+        let url = rpc_send_error_server(-32003, "insufficient funds for gas * price + value").await;
         let wallet = FastWalletBuilder::new(TEST_PRIVATE_KEY, &url)
             .chain_id(1)
             .build_with_nonce(0)
@@ -3099,16 +3119,10 @@ mod tests {
 
     #[tokio::test]
     async fn batch_definitive_insufficient_funds_rejections_reuse_nonce() {
-        let primary = rpc_send_error_server(
-            -32003,
-            "insufficient funds for gas * price + value",
-        )
-        .await;
-        let secondary = rpc_send_error_server(
-            -32003,
-            "insufficient funds for gas * price + value",
-        )
-        .await;
+        let primary =
+            rpc_send_error_server(-32003, "insufficient funds for gas * price + value").await;
+        let secondary =
+            rpc_send_error_server(-32003, "insufficient funds for gas * price + value").await;
         let wallet = FastWalletBuilder::new(TEST_PRIVATE_KEY, &primary)
             .chain_id(1)
             .broadcast_rpcs(vec![secondary])
@@ -3132,11 +3146,8 @@ mod tests {
     /// `BroadcastFailed` preserves the ambiguous verdict in the mix.
     #[tokio::test]
     async fn mixed_endpoint_rejections_do_not_recycle_nonce() {
-        let primary = rpc_send_error_server(
-            -32003,
-            "insufficient funds for gas * price + value",
-        )
-        .await;
+        let primary =
+            rpc_send_error_server(-32003, "insufficient funds for gas * price + value").await;
         let secondary = rpc_send_error_server(-32700, "upstream proxy returned garbage").await;
         let wallet = FastWalletBuilder::new(TEST_PRIVATE_KEY, &primary)
             .chain_id(1)
