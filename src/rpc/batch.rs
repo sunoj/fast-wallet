@@ -4,6 +4,8 @@ use super::*;
 use crate::error::{BroadcastFailure, EndpointVerdict};
 use futures_util::future::BoxFuture;
 
+pub const DEFAULT_BROADCAST_SEND_TIMEOUT: Duration = Duration::from_secs(6);
+
 type EndpointFuture = BoxFuture<'static, (usize, String, WalletResult<(B256, bool)>, u64)>;
 
 impl BatchRpcClient {
@@ -15,9 +17,16 @@ impl BatchRpcClient {
             .collect();
 
         Ok(Self {
+            send_timeout: DEFAULT_BROADCAST_SEND_TIMEOUT,
             clients: clients?,
             current: AtomicU64::new(0),
         })
+    }
+
+    /// Bound only transaction sends; read RPCs retain their shared client timeout.
+    pub fn with_send_timeout(mut self, timeout: Duration) -> Self {
+        self.send_timeout = timeout;
+        self
     }
 
     /// Get the next client (round-robin)
@@ -47,9 +56,20 @@ impl BatchRpcClient {
                 let client = client.clone();
                 let url = client.url().to_string();
                 let tx = raw_tx.to_string();
+                let timeout = self.send_timeout;
                 async move {
                     let started = Instant::now();
-                    let result = client.send_raw_transaction_with_connection_hint(&tx).await;
+                    let result = match tokio::time::timeout(
+                        timeout,
+                        client.send_raw_transaction_with_connection_hint(&tx),
+                    )
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(_) => Err(WalletError::SendTimeout {
+                            elapsed_ms: timeout.as_millis() as u64,
+                        }),
+                    };
                     (
                         endpoint_index,
                         url,

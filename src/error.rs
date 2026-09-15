@@ -57,6 +57,9 @@ pub enum WalletError {
     #[error("Gas limit exceeded")]
     GasLimitExceeded,
 
+    #[error("timeout after {elapsed_ms} ms")]
+    SendTimeout { elapsed_ms: u64 },
+
     #[error("Transaction timeout")]
     Timeout,
 }

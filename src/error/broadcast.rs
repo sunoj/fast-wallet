@@ -25,7 +25,9 @@ pub struct EndpointVerdict {
 impl EndpointVerdict {
     pub(crate) fn new(url: &str, error: &WalletError, elapsed_ms: u64) -> Self {
         let class = match error {
-            WalletError::NetworkError(_) | WalletError::Timeout => EndpointFailureClass::Transport,
+            WalletError::NetworkError(_)
+            | WalletError::Timeout
+            | WalletError::SendTimeout { .. } => EndpointFailureClass::Transport,
             _ => EndpointFailureClass::Rejection,
         };
         Self {

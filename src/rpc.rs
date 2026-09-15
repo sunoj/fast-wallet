@@ -487,6 +487,7 @@ fn parse_b256_hex(s: &str) -> WalletResult<B256> {
 
 /// Batch RPC client for sending multiple requests in parallel
 pub struct BatchRpcClient {
+    send_timeout: Duration,
     clients: Vec<Arc<RpcClient>>,
     current: AtomicU64,
 }
@@ -556,6 +557,7 @@ pub fn redact_urls(message: &str) -> String {
 }
 
 mod batch;
+pub use batch::DEFAULT_BROADCAST_SEND_TIMEOUT;
 
 #[cfg(test)]
 mod tests {

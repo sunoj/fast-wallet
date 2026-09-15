@@ -50,6 +50,8 @@ pub struct WalletConfig {
     pub default_gas_limit: u64,
     /// Maximum concurrent pending transactions
     pub max_pending_txs: usize,
+    /// Per-endpoint fan-out send bound; allows the forwarding nodes their ~5s verdict.
+    pub broadcast_send_timeout: Duration,
     /// Transaction confirmation timeout
     pub confirmation_timeout: Duration,
     /// Poll interval for receipt checking
@@ -96,6 +98,7 @@ impl std::fmt::Debug for WalletConfig {
             .field("chain_id", &self.chain_id)
             .field("default_gas_limit", &self.default_gas_limit)
             .field("max_pending_txs", &self.max_pending_txs)
+            .field("broadcast_send_timeout", &self.broadcast_send_timeout)
             .field("confirmation_timeout", &self.confirmation_timeout)
             .field("poll_interval", &self.poll_interval)
             .field("use_eip1559", &self.use_eip1559)
@@ -145,6 +148,7 @@ impl Default for WalletConfig {
             chain_id: 1,
             default_gas_limit: 21000,
             max_pending_txs: 100,
+            broadcast_send_timeout: crate::rpc::DEFAULT_BROADCAST_SEND_TIMEOUT,
             confirmation_timeout: Duration::from_secs(120),
             poll_interval: Duration::from_millis(500),
             use_eip1559: true,
@@ -489,7 +493,10 @@ impl FastWallet {
         if !broadcast_rpcs.is_empty() {
             let mut all_rpcs = vec![primary_rpc.to_string()];
             all_rpcs.extend(broadcast_rpcs);
-            wallet.batch_client = Some(Arc::new(BatchRpcClient::new(all_rpcs)?));
+            wallet.batch_client = Some(Arc::new(
+                BatchRpcClient::new(all_rpcs)?
+                    .with_send_timeout(wallet.config.broadcast_send_timeout),
+            ));
         }
 
         Ok(wallet)
@@ -2386,7 +2393,10 @@ impl FastWalletBuilder {
             if !self.broadcast_rpcs.is_empty() {
                 let mut all_rpcs = vec![self.primary_rpc.clone()];
                 all_rpcs.extend(self.broadcast_rpcs);
-                wallet.batch_client = Some(Arc::new(BatchRpcClient::new(all_rpcs)?));
+                wallet.batch_client = Some(Arc::new(
+                    BatchRpcClient::new(all_rpcs)?
+                        .with_send_timeout(wallet.config.broadcast_send_timeout),
+                ));
             }
 
             if let Some(url) = gas_rpc_url {
@@ -2428,7 +2438,10 @@ impl FastWalletBuilder {
         if !self.broadcast_rpcs.is_empty() {
             let mut all_rpcs = vec![self.primary_rpc.clone()];
             all_rpcs.extend(self.broadcast_rpcs);
-            wallet.batch_client = Some(Arc::new(BatchRpcClient::new(all_rpcs)?));
+            wallet.batch_client = Some(Arc::new(
+                BatchRpcClient::new(all_rpcs)?
+                    .with_send_timeout(wallet.config.broadcast_send_timeout),
+            ));
         }
 
         if let Some(url) = self.gas_rpc_url {
