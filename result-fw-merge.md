@@ -123,5 +123,68 @@ test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 148 filtered out; fi
 
 ### Consumer
 
-Pending verification of the committed merge.
+Detached consumer worktree: `/private/tmp/fw-merge-consumer-t895357ad`, from bot
+`main` at `e36acb8662a96599fb3e626e36e1ea71e782e2b7`. Submodules were initialized
+with `git -c protocol.file.allow=always submodule update --init`. In that worktree
+only, fast-wallet fetched this branch and checked out merge commit
+`093e9b14a7beeaf28f850d8a4a3243120af6ef10` (parents `d1608b7`, `15e8df0`).
 
+The sole consumer source edit is in
+`uniswapx-filler-rs/crates/filler-wallet/src/manager.rs:861`:
+`builder.send_rpcs_exclusive(urls.clone())` →
+`builder.broadcast_rpcs_exclusive(urls.clone())`. No KeySource/signer migration.
+
+Commands issued from the detached `uniswapx-filler-rs` directory:
+
+```sh
+aid build check -p filler-wallet -- -p filler-bot -p filler-provider -p filler-executor --all-targets
+FW_CONSUMER_TEST=1 aid test -p filler-wallet
+```
+
+The temporary test adapter adds `-p filler-config` and `--no-fail-fast`, producing:
+
+```sh
+cargo check --message-format=json -p filler-wallet -p filler-bot -p filler-provider -p filler-executor --all-targets
+cargo test --no-fail-fast -p filler-config --message-format=json -p filler-wallet
+```
+
+Consumer compile check **passed: 0 errors, 48 warnings**. All four requested
+packages and all targets compiled against the merge. No additional consumer code
+changes are required by this compile check; no compiler errors were emitted.
+Remote check job: `bed696e6f41f48f399efeece23158d86`.
+
+```text
+succeeded: 0 errors, 48 warnings; command: cargo check -p filler-wallet -p filler-bot -p filler-provider -p filler-executor --all-targets; elapsed: 170.9s
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1m 54s
+```
+
+Consumer tests **passed: 130 passed, 0 failed, 0 ignored**. Remote job:
+`9857e1317b9d43aba6f610ee2314bddd`. No consumer compiler errors were emitted.
+The four-package all-target compile check covers additional test targets; only
+`filler-wallet` and `filler-config` tests were executed, as requested.
+
+```text
+     Running unittests src/lib.rs (/home/builder/.rbox/target/uniswapx-filler/debug/deps/filler_config-c55446ff17ef9aa8)
+test result: ok. 95 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+     Running unittests src/lib.rs (/home/builder/.rbox/target/uniswapx-filler/debug/deps/filler_wallet-5c2c30d2660584fb)
+test result: ok. 35 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+   Doc-tests filler_config
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+   Doc-tests filler_wallet
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+```
+
+## Delivery and cleanup
+
+- Removed the detached consumer worktree with `git worktree remove --force` and
+  verified the directory no longer exists. Temporary verification adapters/log
+  copies were removed with it; remote job logs remain at the paths above.
+- Verified the real bot `main` checkout is clean and its real `lib/fast-wallet`
+  remains at `15e8df07d88c151f12a8141611336267d0f63f7c`.
+- The final evidence commit changes only this report; the source/dependency tree
+  is identical to merge commit `093e9b1` compiled by the consumer.
+- The staged credential scan passed before the merge commit; normal Git security
+  hooks remain enabled. No public artifact was packaged or deployed.
+- No push or tag was created. The boss retains release/tag control.
+- HiBoss delivery was unavailable because `hiboss panel doctor` found no resolved
+  session. Progress and results were delivered in the conversation and this file.
