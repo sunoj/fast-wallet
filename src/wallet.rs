@@ -2213,6 +2213,7 @@ pub struct FastWalletBuilder {
     primary_rpc: String,
     gas_rpc_url: Option<String>,
     broadcast_rpcs: Vec<String>,
+    send_rpcs_exclusive: Vec<String>,
     config: WalletConfig,
     initial_nonce: Option<u64>,
 }
@@ -2224,6 +2225,7 @@ impl FastWalletBuilder {
             primary_rpc: primary_rpc.into(),
             gas_rpc_url: None,
             broadcast_rpcs: Vec::new(),
+            send_rpcs_exclusive: Vec::new(),
             config: WalletConfig::default(),
             initial_nonce: None,
         }
@@ -2250,6 +2252,7 @@ impl FastWalletBuilder {
             primary_rpc: format!("https://eth.blinklabs.xyz/v1/{}", api_key),
             gas_rpc_url: None,
             broadcast_rpcs: Vec::new(),
+            send_rpcs_exclusive: Vec::new(),
             config: WalletConfig::default(),
             initial_nonce: None,
         }
@@ -2269,6 +2272,7 @@ impl FastWalletBuilder {
             primary_rpc: format!("https://{}.blinklabs.xyz/v1/{}", chain, api_key),
             gas_rpc_url: None,
             broadcast_rpcs: Vec::new(),
+            send_rpcs_exclusive: Vec::new(),
             config: WalletConfig::default(),
             initial_nonce: None,
         }
@@ -2278,6 +2282,27 @@ impl FastWalletBuilder {
     pub fn broadcast_rpcs(mut self, rpcs: Vec<String>) -> Self {
         self.broadcast_rpcs = rpcs;
         self
+    }
+
+    /// Send only to these endpoints, excluding the primary read RPC.
+    pub fn send_rpcs_exclusive(mut self, rpcs: Vec<String>) -> Self {
+        self.send_rpcs_exclusive = rpcs;
+        self
+    }
+
+    fn exclusive_batch_client(&self) -> WalletResult<Option<Arc<BatchRpcClient>>> {
+        if self.send_rpcs_exclusive.is_empty() {
+            return Ok(None);
+        }
+        if !self.broadcast_rpcs.is_empty() {
+            return Err(WalletError::RpcError(
+                "broadcast_rpcs and send_rpcs_exclusive are mutually exclusive".into(),
+            ));
+        }
+        Ok(Some(Arc::new(
+            BatchRpcClient::new(self.send_rpcs_exclusive.clone())?
+                .with_send_timeout(self.config.broadcast_send_timeout),
+        )))
     }
 
     pub fn gas_rpc_url(mut self, url: impl Into<String>) -> Self {
@@ -2380,16 +2405,15 @@ impl FastWalletBuilder {
 
     /// Build the wallet (async - fetches nonce from chain if not provided)
     pub async fn build(self) -> WalletResult<FastWallet> {
+        let exclusive_batch_client = self.exclusive_batch_client()?;
         let gas_rpc_url = self.gas_rpc_url;
-
-        if let Some(nonce) = self.initial_nonce {
+        let mut wallet = if let Some(nonce) = self.initial_nonce {
             let mut wallet = FastWallet::with_known_nonce(
                 &self.private_key,
                 &self.primary_rpc,
                 nonce,
                 self.config,
             )?;
-
             if !self.broadcast_rpcs.is_empty() {
                 let mut all_rpcs = vec![self.primary_rpc.clone()];
                 all_rpcs.extend(self.broadcast_rpcs);
@@ -2398,40 +2422,30 @@ impl FastWalletBuilder {
                         .with_send_timeout(wallet.config.broadcast_send_timeout),
                 ));
             }
-
-            if let Some(url) = gas_rpc_url {
-                wallet.gas_rpc_client = Some(Arc::new(RpcClient::new(&url)?));
-            }
-
-            Ok(wallet)
+            wallet
         } else if !self.broadcast_rpcs.is_empty() {
-            let mut wallet = FastWallet::with_multiple_rpcs(
+            FastWallet::with_multiple_rpcs(
                 &self.private_key,
                 &self.primary_rpc,
                 self.broadcast_rpcs,
                 self.config,
             )
-            .await?;
-
-            if let Some(url) = gas_rpc_url {
-                wallet.gas_rpc_client = Some(Arc::new(RpcClient::new(&url)?));
-            }
-
-            Ok(wallet)
+            .await?
         } else {
-            let mut wallet =
-                FastWallet::new(&self.private_key, &self.primary_rpc, self.config).await?;
-
-            if let Some(url) = gas_rpc_url {
-                wallet.gas_rpc_client = Some(Arc::new(RpcClient::new(&url)?));
-            }
-
-            Ok(wallet)
+            FastWallet::new(&self.private_key, &self.primary_rpc, self.config).await?
+        };
+        if let Some(client) = exclusive_batch_client {
+            wallet.batch_client = Some(client);
         }
+        if let Some(url) = gas_rpc_url {
+            wallet.gas_rpc_client = Some(Arc::new(RpcClient::new(&url)?));
+        }
+        Ok(wallet)
     }
 
     /// Build with known nonce (synchronous - no RPC call)
     pub fn build_with_nonce(self, nonce: u64) -> WalletResult<FastWallet> {
+        let exclusive_batch_client = self.exclusive_batch_client()?;
         let mut wallet =
             FastWallet::with_known_nonce(&self.private_key, &self.primary_rpc, nonce, self.config)?;
 
@@ -2444,6 +2458,9 @@ impl FastWalletBuilder {
             ));
         }
 
+        if let Some(client) = exclusive_batch_client {
+            wallet.batch_client = Some(client);
+        }
         if let Some(url) = self.gas_rpc_url {
             wallet.gas_rpc_client = Some(Arc::new(RpcClient::new(&url)?));
         }
@@ -2455,6 +2472,7 @@ impl FastWalletBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    include!("wallet_exclusive_send_tests.rs");
 
     const TEST_PRIVATE_KEY: &str =
         "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
@@ -3081,6 +3099,25 @@ mod tests {
         tx_found: bool,
         send_fails: bool,
     ) -> (String, Arc<Mutex<Vec<String>>>) {
+        mock_rpc_server_counted(
+            latest_nonce,
+            tip_wei,
+            gas_price_wei,
+            tx_found,
+            send_fails,
+            Arc::new(Mutex::new(Vec::new())),
+        )
+        .await
+    }
+
+    async fn mock_rpc_server_counted(
+        latest_nonce: u64,
+        tip_wei: u64,
+        gas_price_wei: u64,
+        tx_found: bool,
+        send_fails: bool,
+        methods: Arc<Mutex<Vec<String>>>,
+    ) -> (String, Arc<Mutex<Vec<String>>>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -3093,6 +3130,7 @@ mod tests {
                     Err(_) => break,
                 };
                 let sent_conn = sent_srv.clone();
+                let methods = methods.clone();
                 tokio::spawn(async move {
                     let mut buf = vec![0u8; 8192];
                     let n = match stream.read(&mut buf).await {
@@ -3100,9 +3138,17 @@ mod tests {
                         _ => return,
                     };
                     let req = String::from_utf8_lossy(&buf[..n]);
+                    if let Some(body) = req.split("\r\n\r\n").nth(1) {
+                        let body: serde_json::Value = serde_json::from_str(body).unwrap();
+                        methods
+                            .lock()
+                            .push(body["method"].as_str().unwrap().to_string());
+                    }
                     let mut error_body = false;
                     let result = if req.contains("eth_getTransactionCount") {
                         format!("\"0x{latest_nonce:x}\"")
+                    } else if req.contains("eth_getBalance") {
+                        "\"0x100\"".to_string()
                     } else if req.contains("eth_maxPriorityFeePerGas") {
                         format!("\"0x{tip_wei:x}\"")
                     } else if req.contains("eth_gasPrice") {
