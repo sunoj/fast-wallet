@@ -28,6 +28,9 @@ impl EndpointVerdict {
             WalletError::NetworkError(_)
             | WalletError::Timeout
             | WalletError::SendTimeout { .. } => EndpointFailureClass::Transport,
+            WalletError::RpcError(message) if is_forwarder_transport_error(message) => {
+                EndpointFailureClass::Transport
+            }
             _ => EndpointFailureClass::Rejection,
         };
         Self {
@@ -37,6 +40,46 @@ impl EndpointVerdict {
             class,
         }
     }
+}
+
+const FORWARDER_TRANSPORT_PHRASES: &[&str] = &[
+    "context deadline exceeded",
+    "client.timeout exceeded",
+    "dial tcp",
+    "connection refused",
+    "i/o timeout",
+    "failsafe timeout policy exceeded",
+    "upstreams exhausted",
+];
+const NODE_REJECTION_PHRASES: &[&str] = &[
+    "max fee per gas less than block base fee",
+    "fee cap less than block base fee",
+    "max fee per gas too low",
+    "gas price below minimum",
+    "gas required exceeds allowance",
+    "insufficient funds",
+    "nonce",
+    "already known",
+    "already-known",
+    "known transaction",
+];
+
+fn is_forwarder_transport_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    if NODE_REJECTION_PHRASES
+        .iter()
+        .any(|phrase| lower.contains(phrase))
+    {
+        return false;
+    }
+    let body = lower
+        .strip_prefix("rpc error ")
+        .and_then(|rest| rest.split_once(": "))
+        .map_or(lower.as_str(), |(_, body)| body);
+    body.starts_with("post \"")
+        || FORWARDER_TRANSPORT_PHRASES
+            .iter()
+            .any(|phrase| lower.contains(phrase))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -113,11 +156,62 @@ mod tests {
     }
 
     #[test]
-    fn rpc_forwarder_timeout_is_not_a_transport_verdict() {
-        let error = WalletError::RpcError("Post https://sequencer.test/key: timeout".into());
+    fn rpc_forwarder_timeout_is_a_transport_verdict() {
+        let error = WalletError::RpcError(
+            "Post \"https://sequencer.test/key\": context deadline exceeded".into(),
+        );
         let verdict = EndpointVerdict::new("https://user:pass@rpc.test/key", &error, 5005);
         assert_eq!(verdict.host, "rpc.test");
-        assert_eq!(verdict.class, EndpointFailureClass::Rejection);
+        assert_eq!(verdict.class, EndpointFailureClass::Transport);
         assert!(!verdict.error.contains("/key"));
+    }
+
+    #[test]
+    fn explicit_forwarder_transport_phrases_survive_rpc_redaction() {
+        let fixtures = [
+            "Post \"https://sequencer.test/key\": EOF",
+            "context deadline exceeded",
+            "Client.Timeout exceeded while awaiting headers",
+            "dial tcp: lookup sequencer.test: no such host",
+            "connect: connection refused",
+            "read tcp: i/o timeout",
+            "failsafe timeout policy exceeded on network-level after 10.000s",
+            "upstreams exhausted",
+        ];
+        for fixture in fixtures {
+            for message in [fixture.to_string(), fixture.to_uppercase()] {
+                let error =
+                    WalletError::RpcError(redact_urls(&format!("RPC error -32000: {message}")));
+                let verdict = EndpointVerdict::new("https://rpc.test/key", &error, 5005);
+                assert_eq!(verdict.class, EndpointFailureClass::Transport, "{fixture}");
+            }
+        }
+    }
+
+    #[test]
+    fn node_rejections_outrank_forwarder_phrases_in_the_same_error() {
+        for rejection in NODE_REJECTION_PHRASES {
+            for suffix in FORWARDER_TRANSPORT_PHRASES {
+                let error = WalletError::RpcError(format!(
+                    "RPC error -32000: Post \"https://sequencer.test\": {rejection}; {suffix}"
+                ));
+                let verdict = EndpointVerdict::new("https://rpc.test", &error, 5005);
+                assert_eq!(verdict.class, EndpointFailureClass::Rejection, "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn unrecognized_rpc_errors_remain_rejections() {
+        for message in [
+            "execution reverted",
+            "timeout",
+            "network error: error sending request",
+            "transaction underpriced",
+        ] {
+            let error = WalletError::RpcError(message.into());
+            let verdict = EndpointVerdict::new("https://rpc.test", &error, 5);
+            assert_eq!(verdict.class, EndpointFailureClass::Rejection, "{message}");
+        }
     }
 }
