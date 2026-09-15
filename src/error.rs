@@ -1,10 +1,17 @@
-//! Error types for the fast wallet
+//! Error types for the fast wallet.
+//! Exports WalletError and endpoint verdicts; depends on thiserror and serde.
 
 use thiserror::Error;
+
+mod broadcast;
+pub use broadcast::{BroadcastFailure, EndpointFailureClass, EndpointVerdict};
 
 /// Custom error type for wallet operations
 #[derive(Debug, Error)]
 pub enum WalletError {
+    #[error("{0}")]
+    BroadcastFailed(BroadcastFailure),
+
     #[error("Invalid private key: {0}")]
     InvalidPrivateKey(String),
 

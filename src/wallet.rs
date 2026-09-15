@@ -1503,11 +1503,13 @@ impl FastWallet {
     }
 
     async fn recover_nonce_error(&self, error: &WalletError) {
-        let err_str = error.to_string().to_lowercase();
-        if err_str.contains("nonce too high") {
-            let _ = self.sync_nonce_latest().await;
-        } else if err_str.contains("nonce too low") {
-            let _ = self.sync_nonce().await;
+        let result = match error.nonce_sync_block() {
+            Some("pending") => self.sync_nonce().await,
+            Some("latest") => self.sync_nonce_latest().await,
+            _ => return,
+        };
+        if let Err(sync_error) = result {
+            tracing::warn!(%sync_error, "broadcast nonce recovery failed");
         }
     }
 
