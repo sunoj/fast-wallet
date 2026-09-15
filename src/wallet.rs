@@ -50,6 +50,8 @@ pub struct WalletConfig {
     pub default_gas_limit: u64,
     /// Maximum concurrent pending transactions
     pub max_pending_txs: usize,
+    /// Per-endpoint fan-out send bound; allows the forwarding nodes their ~5s verdict.
+    pub broadcast_send_timeout: Duration,
     /// Transaction confirmation timeout
     pub confirmation_timeout: Duration,
     /// Poll interval for receipt checking
@@ -96,6 +98,7 @@ impl std::fmt::Debug for WalletConfig {
             .field("chain_id", &self.chain_id)
             .field("default_gas_limit", &self.default_gas_limit)
             .field("max_pending_txs", &self.max_pending_txs)
+            .field("broadcast_send_timeout", &self.broadcast_send_timeout)
             .field("confirmation_timeout", &self.confirmation_timeout)
             .field("poll_interval", &self.poll_interval)
             .field("use_eip1559", &self.use_eip1559)
@@ -145,6 +148,7 @@ impl Default for WalletConfig {
             chain_id: 1,
             default_gas_limit: 21000,
             max_pending_txs: 100,
+            broadcast_send_timeout: crate::rpc::DEFAULT_BROADCAST_SEND_TIMEOUT,
             confirmation_timeout: Duration::from_secs(120),
             poll_interval: Duration::from_millis(500),
             use_eip1559: true,
@@ -335,8 +339,41 @@ pub struct NonceHealth {
     pub inflight_count: usize,
     /// Lowest unresolved local ledger entry at or above `chain_next`.
     pub lowest_unresolved: Option<InflightNonceSnapshot>,
-    /// Whether effective next nonce is far ahead of chain.
+    /// Whether the local nonce is ahead of chain with a stranded entry behind it.
     pub stalled: bool,
+}
+
+/// How long the lowest unresolved in-flight nonce may sit unmined before
+/// [`FastWallet::nonce_health_check`] calls the lane stalled.
+///
+/// The local counter only advances when a new transaction is dispatched, so a
+/// distance-only rule is flow-driven: a lane that strands and then goes quiet
+/// never reports, and a single stranded nonce on a fan-out wallet (gap of 1)
+/// can never reach any distance threshold at all. Age does not depend on flow.
+///
+/// Detection is not action. Every rewind proof lives in the caller (sustained
+/// stall streak, `pending == latest`, its own minimum unresolved age, the
+/// independent-RPC liveness probe) and is unchanged by this constant.
+const STALL_MIN_UNRESOLVED_AGE: Duration = Duration::from_secs(30);
+
+/// Decide whether a lane is stalled, given the local counter, the chain's next
+/// nonce, and the lowest unresolved ledger entry at or above it.
+///
+/// Two independent triggers, both requiring the local counter to be ahead:
+/// - **age** — the stranded entry has sat past [`STALL_MIN_UNRESOLVED_AGE`].
+///   This is the one that fires on a gap of 1 and on a lane that has gone quiet.
+/// - **distance** — local has run more than 2 ahead. The original rule, kept so
+///   a stall the ledger has no entry for still reports.
+fn nonce_stalled(
+    effective_next: u64,
+    chain_next: u64,
+    lowest_unresolved: Option<&InflightNonceSnapshot>,
+) -> bool {
+    if effective_next <= chain_next {
+        return false;
+    }
+    let aged_out = lowest_unresolved.is_some_and(|entry| entry.age >= STALL_MIN_UNRESOLVED_AGE);
+    aged_out || effective_next > chain_next + 2
 }
 
 /// Idempotency window for [`FastWallet::replace_stalled_nonce`]: a second call for
@@ -354,8 +391,8 @@ const STALL_REPLACE_MIN_HEAD_AGE: Duration = Duration::from_secs(30);
 /// bytes, i.e. the tx entered no pool on that endpoint. Deny-first: typed
 /// ambiguous variants and any message containing an ambiguous marker short-
 /// circuit to false, and an unknown message is NOT definitive. Multi-endpoint
-/// aggregates never reach the string path — `all_endpoint_errors` classifies
-/// each endpoint's error individually and emits a typed aggregate, so one
+/// aggregates never reach the string path — `BroadcastFailed` classifies
+/// each endpoint's verdict individually, so one
 /// definitive substring inside a mixed aggregate cannot leak through (a mixed
 /// outcome means some endpoint may hold the bytes).
 ///
@@ -367,6 +404,13 @@ pub(crate) fn is_definitive_precheck_rejection(error: &WalletError) -> bool {
     match error {
         WalletError::InsufficientFunds | WalletError::GasLimitExceeded => return true,
         WalletError::AllEndpointsRejectedDefinitively(_) => return true,
+        WalletError::BroadcastFailed(failure) => {
+            return !failure.endpoints.is_empty()
+                && failure.endpoints.iter().all(|verdict| {
+                    verdict.class == crate::error::EndpointFailureClass::Rejection
+                        && is_definitive_precheck_rejection(&WalletError::RpcError(verdict.error.clone()))
+                });
+        }
         WalletError::AmbiguousBroadcastFailure(_)
         | WalletError::Timeout
         | WalletError::NetworkError(_)
@@ -530,7 +574,10 @@ impl FastWallet {
         if !broadcast_rpcs.is_empty() {
             let mut all_rpcs = vec![primary_rpc.to_string()];
             all_rpcs.extend(broadcast_rpcs);
-            wallet.batch_client = Some(Arc::new(BatchRpcClient::new(all_rpcs)?));
+            wallet.batch_client = Some(Arc::new(
+                BatchRpcClient::new(all_rpcs)?
+                    .with_send_timeout(wallet.config.broadcast_send_timeout),
+            ));
         }
 
         Ok(wallet)
@@ -1553,11 +1600,13 @@ impl FastWallet {
     }
 
     async fn recover_nonce_error(&self, error: &WalletError) {
-        let err_str = error.to_string().to_lowercase();
-        if err_str.contains("nonce too high") {
-            let _ = self.sync_nonce_latest().await;
-        } else if err_str.contains("nonce too low") {
-            let _ = self.sync_nonce().await;
+        let result = match error.nonce_sync_block() {
+            Some("pending") => self.sync_nonce().await,
+            Some("latest") => self.sync_nonce_latest().await,
+            _ => return,
+        };
+        if let Err(sync_error) = result {
+            tracing::warn!(%sync_error, "broadcast nonce recovery failed");
         }
     }
 
@@ -1748,8 +1797,7 @@ impl FastWallet {
             .inflight_nonces
             .lowest_unresolved_at_or_above(chain_next);
         let inflight_count = self.inflight_nonces.unresolved_count();
-        // If local is >2 ahead of chain, nonces are stuck in-flight
-        let stalled = effective_next > chain_next + 2;
+        let stalled = nonce_stalled(effective_next, chain_next, lowest_unresolved.as_ref());
         Ok(NonceHealth {
             current,
             effective_next,
@@ -2474,57 +2522,39 @@ impl FastWalletBuilder {
             ));
         }
         let gas_rpc_url = self.gas_rpc_url;
-
-        if let Some(nonce) = self.initial_nonce {
+        let mut wallet = if let Some(nonce) = self.initial_nonce {
             let mut wallet = FastWallet::with_known_nonce(
                 &self.private_key,
                 &self.primary_rpc,
                 nonce,
                 self.config,
             )?;
-
             if !self.broadcast_rpcs.is_empty() {
                 let all_rpcs =
                     resolve_broadcast_rpcs(&self.primary_rpc, self.broadcast_rpcs, self.exclusive_broadcast);
-                wallet.batch_client = Some(Arc::new(BatchRpcClient::new(all_rpcs)?));
+                wallet.batch_client = Some(Arc::new(
+                BatchRpcClient::new(all_rpcs)?
+                    .with_send_timeout(wallet.config.broadcast_send_timeout),
+            ));
             }
-
-            if let Some(url) = gas_rpc_url {
-                wallet.gas_rpc_client = Some(Arc::new(RpcClient::new(&url)?));
-            }
-
-            Ok(wallet)
+            wallet
         } else if !self.broadcast_rpcs.is_empty() {
-            let mut wallet = if self.exclusive_broadcast {
-                let mut wallet =
-                    FastWallet::new(&self.private_key, &self.primary_rpc, self.config).await?;
-                wallet.batch_client = Some(Arc::new(BatchRpcClient::new(self.broadcast_rpcs)?));
-                wallet
-            } else {
-                FastWallet::with_multiple_rpcs(
-                    &self.private_key,
-                    &self.primary_rpc,
-                    self.broadcast_rpcs,
-                    self.config,
-                )
-                .await?
-            };
-
-            if let Some(url) = gas_rpc_url {
-                wallet.gas_rpc_client = Some(Arc::new(RpcClient::new(&url)?));
-            }
-
-            Ok(wallet)
-        } else {
             let mut wallet =
                 FastWallet::new(&self.private_key, &self.primary_rpc, self.config).await?;
-
-            if let Some(url) = gas_rpc_url {
-                wallet.gas_rpc_client = Some(Arc::new(RpcClient::new(&url)?));
-            }
-
-            Ok(wallet)
+            let all_rpcs =
+                resolve_broadcast_rpcs(&self.primary_rpc, self.broadcast_rpcs, self.exclusive_broadcast);
+            wallet.batch_client = Some(Arc::new(
+                BatchRpcClient::new(all_rpcs)?
+                    .with_send_timeout(wallet.config.broadcast_send_timeout),
+            ));
+            wallet
+        } else {
+            FastWallet::new(&self.private_key, &self.primary_rpc, self.config).await?
+        };
+        if let Some(url) = gas_rpc_url {
+            wallet.gas_rpc_client = Some(Arc::new(RpcClient::new(&url)?));
         }
+        Ok(wallet)
     }
 
     /// Build with known nonce (synchronous - no RPC call)
@@ -2542,7 +2572,10 @@ impl FastWalletBuilder {
         if !self.broadcast_rpcs.is_empty() {
             let all_rpcs =
                 resolve_broadcast_rpcs(&self.primary_rpc, self.broadcast_rpcs, self.exclusive_broadcast);
-            wallet.batch_client = Some(Arc::new(BatchRpcClient::new(all_rpcs)?));
+            wallet.batch_client = Some(Arc::new(
+                BatchRpcClient::new(all_rpcs)?
+                    .with_send_timeout(wallet.config.broadcast_send_timeout),
+            ));
         }
 
         if let Some(url) = self.gas_rpc_url {
@@ -2556,6 +2589,7 @@ impl FastWalletBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    include!("wallet_exclusive_send_tests.rs");
 
     const TEST_PRIVATE_KEY: &str =
         "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
@@ -3095,7 +3129,7 @@ mod tests {
     /// Audit finding: one endpoint rejecting -32003 while another fails with an
     /// unclassifiable error (its upstream may hold the bytes — hidden success)
     /// must NOT recycle the nonce. Per-endpoint classification in
-    /// `all_endpoint_errors` yields AmbiguousBroadcastFailure for the mix.
+    /// `BroadcastFailed` preserves the ambiguous verdict in the mix.
     #[tokio::test]
     async fn mixed_endpoint_rejections_do_not_recycle_nonce() {
         let primary = rpc_send_error_server(
@@ -3430,6 +3464,25 @@ mod tests {
         tx_found: bool,
         send_fails: bool,
     ) -> (String, Arc<Mutex<Vec<String>>>) {
+        mock_rpc_server_counted(
+            latest_nonce,
+            tip_wei,
+            gas_price_wei,
+            tx_found,
+            send_fails,
+            Arc::new(Mutex::new(Vec::new())),
+        )
+        .await
+    }
+
+    async fn mock_rpc_server_counted(
+        latest_nonce: u64,
+        tip_wei: u64,
+        gas_price_wei: u64,
+        tx_found: bool,
+        send_fails: bool,
+        methods: Arc<Mutex<Vec<String>>>,
+    ) -> (String, Arc<Mutex<Vec<String>>>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -3442,6 +3495,7 @@ mod tests {
                     Err(_) => break,
                 };
                 let sent_conn = sent_srv.clone();
+                let methods = methods.clone();
                 tokio::spawn(async move {
                     let mut buf = vec![0u8; 8192];
                     let n = match stream.read(&mut buf).await {
@@ -3449,9 +3503,17 @@ mod tests {
                         _ => return,
                     };
                     let req = String::from_utf8_lossy(&buf[..n]);
+                    if let Some(body) = req.split("\r\n\r\n").nth(1) {
+                        let body: serde_json::Value = serde_json::from_str(body).unwrap();
+                        methods
+                            .lock()
+                            .push(body["method"].as_str().unwrap().to_string());
+                    }
                     let mut error_body = false;
                     let result = if req.contains("eth_getTransactionCount") {
                         format!("\"0x{latest_nonce:x}\"")
+                    } else if req.contains("eth_getBalance") {
+                        "\"0x100\"".to_string()
                     } else if req.contains("eth_maxPriorityFeePerGas") {
                         format!("\"0x{tip_wei:x}\"")
                     } else if req.contains("eth_gasPrice") {
@@ -3821,5 +3883,54 @@ mod tests {
         assert!(sent.lock().is_empty(), "check_only must NOT re-broadcast");
         // nonce 0 stays consumed (not released) → next sign advances to nonce 1.
         assert_eq!(wallet.sign(test_request()).unwrap().nonce(), 1);
+    }
+
+    use crate::inflight::InflightNonceStatus;
+
+    fn unresolved(nonce: u64, age: Duration) -> InflightNonceSnapshot {
+        InflightNonceSnapshot {
+            nonce,
+            tx_hashes: vec![B256::repeat_byte(9)],
+            status: InflightNonceStatus::BroadcastAccepted,
+            age,
+            accepted_broadcasts: 1,
+            release_reason: None,
+            max_fee_seen: None,
+            max_priority_seen: None,
+        }
+    }
+
+    #[test]
+    fn stall_is_detected_at_a_gap_of_one_once_the_entry_ages() {
+        // The case a distance-only rule can never see: one stranded nonce on a
+        // fan-out wallet. `effective_next` is 1 ahead and stays there, so
+        // `> chain_next + 2` is false forever no matter how long it sits.
+        let aged = unresolved(100, Duration::from_secs(31));
+        assert!(nonce_stalled(101, 100, Some(&aged)));
+        assert!(
+            !(101 > 100 + 2),
+            "guard: the distance rule alone would miss this"
+        );
+    }
+
+    #[test]
+    fn young_unresolved_entry_is_not_yet_a_stall() {
+        // Base/preconf propagation lag: a tx we just broadcast may not be
+        // visible on this RPC view yet. Do not call that stranded.
+        let young = unresolved(100, Duration::from_secs(5));
+        assert!(!nonce_stalled(101, 100, Some(&young)));
+    }
+
+    #[test]
+    fn distance_rule_still_fires_without_a_ledger_entry() {
+        assert!(nonce_stalled(103, 100, None));
+        assert!(!nonce_stalled(102, 100, None));
+    }
+
+    #[test]
+    fn never_stalled_when_local_is_not_ahead_of_chain() {
+        let aged = unresolved(100, Duration::from_secs(600));
+        assert!(!nonce_stalled(100, 100, Some(&aged)));
+        assert!(!nonce_stalled(99, 100, Some(&aged)));
     }
 }

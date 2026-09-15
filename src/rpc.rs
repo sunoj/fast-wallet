@@ -61,7 +61,7 @@ fn format_rpc_error(error: &RpcError) -> String {
             .unwrap_or_else(|| data.to_string());
         msg.push_str(&format!(" data={data_str}"));
     }
-    msg
+    redact_urls(&msg)
 }
 
 /// High-performance RPC client
@@ -186,18 +186,23 @@ impl RpcClient {
             id: self.next_id(),
         };
 
+        // Redact where the error is BUILT, not where it is logged: a reqwest
+        // error embeds the keyed request URL, and this error is returned to
+        // callers that log it verbatim, wrap it in `format!("{e}")`, or hand it
+        // to per-endpoint telemetry. Sanitising downstream means one missed
+        // call site is a leaked API key.
         let response = self
             .client
             .post(&self.url)
             .json(&req)
             .send()
             .await
-            .map_err(|e| WalletError::NetworkError(e.to_string()))?;
+            .map_err(|e| WalletError::NetworkError(redact_urls(&e.to_string())))?;
 
         let rpc_response: RpcResponse<T> = response
             .json()
             .await
-            .map_err(|e| WalletError::RpcError(e.to_string()))?;
+            .map_err(|e| WalletError::RpcError(redact_urls(&e.to_string())))?;
 
         if let Some(error) = rpc_response.error {
             return Err(WalletError::RpcError(format_rpc_error(&error)));
@@ -329,12 +334,12 @@ impl RpcClient {
             semaphore_wait_ms: 0,
             broadcast_fanout_ms: endpoint_ms,
             fastest_endpoint_ms: endpoint_ms,
-            fastest_endpoint_url: self.url.clone(),
+            fastest_endpoint_host: endpoint_host(&self.url).to_string(),
             slowest_endpoint_ms: endpoint_ms,
             first_success_endpoint_index: 0,
             failed_endpoints: 0,
             connection_reused,
-            per_endpoint_ms: vec![(self.url.clone(), Ok(endpoint_ms))],
+            per_endpoint_ms: vec![(endpoint_host(&self.url).to_string(), Ok(endpoint_ms))],
         })
     }
 
@@ -519,6 +524,7 @@ fn parse_b256_hex(s: &str) -> WalletResult<B256> {
 
 /// Batch RPC client for sending multiple requests in parallel
 pub struct BatchRpcClient {
+    send_timeout: Duration,
     clients: Vec<Arc<RpcClient>>,
     current: AtomicU64,
 }
@@ -531,192 +537,15 @@ pub struct SendResult {
     pub semaphore_wait_ms: u64,
     pub broadcast_fanout_ms: u64,
     pub fastest_endpoint_ms: u64,
-    pub fastest_endpoint_url: String,
+    /// Host of the endpoint that answered first. Host, never the URL:
+    /// consumers log this field, and RPC URLs carry API keys.
+    pub fastest_endpoint_host: String,
     pub slowest_endpoint_ms: u64,
     pub first_success_endpoint_index: usize,
     pub failed_endpoints: usize,
     pub connection_reused: bool,
+    /// Per-endpoint verdict as `(host, ms | redacted error)`.
     pub per_endpoint_ms: Vec<(String, Result<u64, String>)>,
-}
-
-impl BatchRpcClient {
-    /// Create a new batch client with multiple RPC endpoints
-    pub fn new(urls: Vec<String>) -> WalletResult<Self> {
-        let clients: WalletResult<Vec<_>> = urls
-            .into_iter()
-            .map(|url| RpcClient::new(url).map(Arc::new))
-            .collect();
-
-        Ok(Self {
-            clients: clients?,
-            current: AtomicU64::new(0),
-        })
-    }
-
-    /// Get the next client (round-robin)
-    pub fn next_client(&self) -> Arc<RpcClient> {
-        let idx = self.current.fetch_add(1, Ordering::Relaxed) as usize;
-        self.clients[idx % self.clients.len()].clone()
-    }
-
-    /// Send transaction to all endpoints in parallel, return on first success
-    pub async fn broadcast_transaction(&self, raw_tx: &str) -> WalletResult<B256> {
-        if self.clients.is_empty() {
-            return Err(WalletError::RpcError("No RPC endpoints".to_string()));
-        }
-
-        let mut pending: Vec<_> = self
-            .clients
-            .iter()
-            .map(|client| {
-                let client = client.clone();
-                let tx = raw_tx.to_string();
-                async move { client.send_raw_transaction(&tx).await }.boxed()
-            })
-            .collect();
-
-        let mut errors = Vec::new();
-        while !pending.is_empty() {
-            let (result, _index, remaining) = select_all(pending).await;
-            match result {
-                Ok(hash) => {
-                    // First success — spawn remaining sends in background (fire-and-forget)
-                    if !remaining.is_empty() {
-                        tokio::spawn(async move {
-                            join_all(remaining).await;
-                        });
-                    }
-                    return Ok(hash);
-                }
-                Err(e) => {
-                    errors.push(e);
-                    pending = remaining;
-                }
-            }
-        }
-
-        Err(all_endpoint_errors(errors))
-    }
-
-    /// Send transaction to all endpoints in parallel with first-success timing.
-    pub async fn broadcast_transaction_detailed(&self, raw_tx: &str) -> WalletResult<SendResult> {
-        if self.clients.is_empty() {
-            return Err(WalletError::RpcError("No RPC endpoints".to_string()));
-        }
-
-        let fanout_started = Instant::now();
-        let mut pending: Vec<_> = self
-            .clients
-            .iter()
-            .enumerate()
-            .map(|(endpoint_index, client)| {
-                let client = client.clone();
-                let url = client.url().to_string();
-                let tx = raw_tx.to_string();
-                async move {
-                    let started = Instant::now();
-                    let result = client.send_raw_transaction_with_connection_hint(&tx).await;
-                    (
-                        endpoint_index,
-                        url,
-                        result,
-                        started.elapsed().as_millis() as u64,
-                    )
-                }
-                .boxed()
-            })
-            .collect();
-
-        let mut errors = Vec::new();
-        let mut per_endpoint_ms = Vec::new();
-        let mut failed_endpoints = 0usize;
-        let mut slowest_endpoint_ms = 0u64;
-
-        while !pending.is_empty() {
-            let ((endpoint_index, url, result, endpoint_ms), _select_index, remaining) =
-                select_all(pending).await;
-            slowest_endpoint_ms = slowest_endpoint_ms.max(endpoint_ms);
-            match result {
-                Ok((hash, connection_reused)) => {
-                    per_endpoint_ms.push((url.clone(), Ok(endpoint_ms)));
-                    if !remaining.is_empty() {
-                        tokio::spawn(async move {
-                            join_all(remaining).await;
-                        });
-                    }
-                    return Ok(SendResult {
-                        tx_hash: format!("{hash:?}"),
-                        sign_ms: 0.0,
-                        semaphore_wait_ms: 0,
-                        broadcast_fanout_ms: fanout_started.elapsed().as_millis() as u64,
-                        fastest_endpoint_ms: endpoint_ms,
-                        fastest_endpoint_url: url,
-                        slowest_endpoint_ms,
-                        first_success_endpoint_index: endpoint_index,
-                        failed_endpoints,
-                        connection_reused,
-                        per_endpoint_ms,
-                    });
-                }
-                Err(e) => {
-                    failed_endpoints += 1;
-                    let error = e.to_string();
-                    per_endpoint_ms.push((url, Err(error.clone())));
-                    errors.push(e);
-                    pending = remaining;
-                }
-            }
-        }
-
-        Err(all_endpoint_errors(errors))
-    }
-
-    /// Warm up HTTP connections to all endpoints
-    ///
-    /// Establishes TCP/TLS connections by sending lightweight requests.
-    /// Returns the number of successfully warmed connections.
-    pub async fn warmup(&self) -> usize {
-        let futures: Vec<_> = self.clients.iter().map(|c| c.warmup()).collect();
-        let results = join_all(futures).await;
-        results.into_iter().filter(|r| r.is_ok()).count()
-    }
-
-    /// Get the number of endpoints
-    pub fn endpoint_count(&self) -> usize {
-        self.clients.len()
-    }
-}
-
-/// Fold all-endpoints-failed errors into one, classifying each endpoint's
-/// error INDIVIDUALLY first. The aggregate is definitive only when every
-/// endpoint's own error is a definitive pre-check rejection; any mixed
-/// outcome (one endpoint rejected, another timed out / returned garbage)
-/// becomes a typed ambiguous error, so a definitive substring inside the
-/// joined message can never make a hidden-success aggregate look safe to
-/// recycle. Single-endpoint failures pass through unchanged.
-fn all_endpoint_errors(errors: Vec<WalletError>) -> WalletError {
-    if errors.is_empty() {
-        return WalletError::RpcError("No RPC endpoints".to_string());
-    }
-    if errors.len() == 1 {
-        return errors
-            .into_iter()
-            .next()
-            .unwrap_or_else(|| WalletError::RpcError("No RPC endpoints".to_string()));
-    }
-    let all_definitive = errors
-        .iter()
-        .all(crate::wallet::is_definitive_precheck_rejection);
-    let joined = errors
-        .into_iter()
-        .map(|error| error.to_string())
-        .collect::<Vec<_>>()
-        .join(" | ");
-    if all_definitive {
-        WalletError::AllEndpointsRejectedDefinitively(joined)
-    } else {
-        WalletError::AmbiguousBroadcastFailure(joined)
-    }
 }
 
 #[cfg(test)]
@@ -726,6 +555,54 @@ pub(crate) fn expired_warmup_instant() -> Instant {
         .expect("monotonic clock origin is older than the warmup throttle window")
 }
 
+/// Host portion of an endpoint URL, for logs.
+///
+/// RPC URLs carry API keys in the path or the query string, so the host is the
+/// only part that is ever safe to emit.
+pub fn endpoint_host(url: &str) -> &str {
+    let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
+    // `user:pass@host` — userinfo is a credential, keep only what follows it.
+    authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host)
+}
+
+/// Replace HTTP(S) and WS(S) URLs, case-insensitively, with just their host.
+///
+/// `reqwest::Error::to_string()` embeds the request URL — API key and all
+/// (`error sending request for url (https://host/v2/<key>)`), so error text
+/// from a broadcast attempt can never be logged verbatim.
+pub fn redact_urls(message: &str) -> String {
+    let mut out = String::with_capacity(message.len());
+    let lowercase = message.to_ascii_lowercase();
+    let mut rest = message;
+    loop {
+        let searchable = &lowercase[message.len() - rest.len()..];
+        let Some(start) = ["http://", "https://", "ws://", "wss://"]
+            .iter()
+            .filter_map(|scheme| searchable.find(scheme))
+            .min()
+        else {
+            break;
+        };
+        out.push_str(&rest[..start]);
+        let tail = &rest[start..];
+        // Consume to the next whitespace, never to a punctuation delimiter: a
+        // key may legitimately contain `,`, `)` or a quote, and stopping early
+        // would leave the remainder of it in the message. Losing a trailing
+        // `)` from `url (https://...)` is the right trade.
+        let end = tail.find(char::is_whitespace).unwrap_or(tail.len());
+        out.push_str(endpoint_host(&tail[..end]));
+        rest = &tail[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+mod batch;
+pub use batch::DEFAULT_BROADCAST_SEND_TIMEOUT;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -733,6 +610,55 @@ mod tests {
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    #[test]
+    fn endpoint_host_drops_the_key_bearing_parts() {
+        assert_eq!(
+            endpoint_host("https://base-mainnet.infura.io/v3/deadbeefdeadbeef"),
+            "base-mainnet.infura.io"
+        );
+        assert_eq!(
+            endpoint_host("https://sleek-vineyard.base-mainnet.quiknode.pro/abc123/"),
+            "sleek-vineyard.base-mainnet.quiknode.pro"
+        );
+        assert_eq!(
+            endpoint_host("http://162.250.127.74:8545"),
+            "162.250.127.74:8545"
+        );
+        assert_eq!(
+            endpoint_host("https://user:secret@rpc.example.com/x"),
+            "rpc.example.com"
+        );
+        assert_eq!(
+            endpoint_host("https://host.example.com/?key=secret"),
+            "host.example.com"
+        );
+    }
+
+    #[test]
+    fn redact_urls_strips_keys_out_of_error_text() {
+        // The exact shape reqwest produces, which is what reaches per_endpoint.
+        let raw = "error sending request for url (https://base-mainnet.g.alchemy.com/v2/SECRETKEY)";
+        let clean = redact_urls(raw);
+        assert!(!clean.contains("SECRETKEY"), "{clean}");
+        assert!(!clean.contains("/v2/"), "{clean}");
+        assert!(clean.contains("base-mainnet.g.alchemy.com"), "{clean}");
+
+        // Several URLs in one message, and text after the last one.
+        let many = redact_urls("https://a.io/k1 then https://b.io/k2 done");
+        assert_eq!(many, "a.io then b.io done");
+
+        // Punctuation inside the key must not end the redaction early.
+        let punctuated = redact_urls("failed for url (https://host.io/k,SECRET) retrying");
+        assert!(!punctuated.contains("SECRET"), "{punctuated}");
+        assert_eq!(punctuated, "failed for url (host.io retrying");
+
+        // Nothing to redact must round-trip untouched.
+        assert_eq!(
+            redact_urls("replacement transaction underpriced"),
+            "replacement transaction underpriced"
+        );
+    }
 
     #[test]
     fn test_parse_u64_hex() {
@@ -860,7 +786,7 @@ mod tests {
             .expect("broadcast should succeed");
 
         assert_eq!(result.first_success_endpoint_index, 1);
-        assert_eq!(result.fastest_endpoint_url, fast);
+        assert_eq!(result.fastest_endpoint_host, endpoint_host(&fast));
         assert_eq!(
             result.tx_hash,
             "0x2222222222222222222222222222222222222222222222222222222222222222"

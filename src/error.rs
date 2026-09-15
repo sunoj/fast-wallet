@@ -1,6 +1,10 @@
-//! Error types for the fast wallet
+//! Error types for the fast wallet.
+//! Exports WalletError and endpoint verdicts; depends on thiserror and serde.
 
 use thiserror::Error;
+
+mod broadcast;
+pub use broadcast::{BroadcastFailure, EndpointFailureClass, EndpointVerdict};
 
 /// Parse the authoritative next nonce from a recognized nonce-too-low error.
 ///
@@ -50,6 +54,9 @@ fn parse_decimal(value: &str) -> Option<u64> {
 /// Custom error type for wallet operations
 #[derive(Debug, Error)]
 pub enum WalletError {
+    #[error("{0}")]
+    BroadcastFailed(BroadcastFailure),
+
     #[error("Invalid private key: {0}")]
     InvalidPrivateKey(String),
 
@@ -94,6 +101,9 @@ pub enum WalletError {
 
     #[error("Gas limit exceeded")]
     GasLimitExceeded,
+
+    #[error("timeout after {elapsed_ms} ms")]
+    SendTimeout { elapsed_ms: u64 },
 
     #[error("Transaction timeout")]
     Timeout,

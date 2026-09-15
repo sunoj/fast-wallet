@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Started at 0.2.1; earlier releases are recorded only in git tags and commit messages.
 
+## [0.2.7] - 2026-09-15
+
+### Added
+
+- Public `endpoint_host` and `redact_urls` helpers and structured per-endpoint broadcast
+  verdicts, including next-hop transport classification and error-text parsing.
+
+### Changed
+
+- Merge the 0.1.x maintenance line, including untagged 0.1.45–0.1.47 changes.
+- Keep `broadcast_rpcs_exclusive` as the exclusive-send API; maintenance consumers must
+  rename `send_rpcs_exclusive`. Empty exclusive lists remain invalid.
+- Broadcast results expose endpoint hosts instead of credential-bearing URLs.
+
+### Fixed
+
+- Bound each batch broadcast endpoint to six seconds (configurable), preserve every
+  failure verdict, and recycle nonces only when every endpoint definitively rejects.
+- Detect aged nonce stalls even at a gap of one and reset ledger age on nonce reuse,
+  while retaining the head-cancel freshness guard and authoritative nonce parsing.
+- Redact HTTP(S) and WS(S) URLs case-insensitively at RPC error construction.
+
 ## [0.2.1] - 2026-07-26
 
 ### Changed

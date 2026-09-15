@@ -57,7 +57,7 @@ pub use error::{parse_nonce_too_low, WalletError, WalletResult};
 pub use gas_provider::GasPriceProvider;
 pub use inflight::{InflightNonceLedger, InflightNonceSnapshot, InflightNonceStatus};
 pub use nonce::{NonceManager, ReservedNonce};
-pub use rpc::SendResult;
+pub use rpc::{endpoint_host, redact_urls, SendResult};
 pub use signer::{FastSigner, KeySource};
 pub use transaction::{Transaction, TransactionRequest, TypedTransaction};
 pub use wallet::{
