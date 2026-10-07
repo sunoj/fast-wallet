@@ -1591,6 +1591,7 @@ impl FastWallet {
         &self,
         tx: &Transaction,
         sign_ms: f64,
+        before_broadcast: impl FnOnce(&Transaction) -> WalletResult<()>,
     ) -> WalletResult<SendResult> {
         let semaphore_started = Instant::now();
         let _permit = tokio::time::timeout(
@@ -1603,6 +1604,7 @@ impl FastWallet {
         let semaphore_wait_ms = semaphore_started.elapsed().as_millis() as u64;
 
         let hex_tx = tx.to_hex();
+        before_broadcast(tx)?;
         let result = if let Some(batch_client) = &self.batch_client {
             batch_client.broadcast_transaction_detailed(&hex_tx).await
         } else {
@@ -1696,8 +1698,20 @@ impl FastWallet {
         tx: &Transaction,
         sign_ms: f64,
     ) -> WalletResult<SendResult> {
+        self.send_signed_detailed_guarded(tx, sign_ms, |_| Ok(()))
+            .await
+    }
+
+    pub async fn send_signed_detailed_guarded(
+        &self,
+        tx: &Transaction,
+        sign_ms: f64,
+        before_broadcast: impl FnOnce(&Transaction) -> WalletResult<()>,
+    ) -> WalletResult<SendResult> {
         self.record_broadcast_candidate(tx);
-        let result = self.broadcast_signed_result(tx, sign_ms).await;
+        let result = self
+            .broadcast_signed_result(tx, sign_ms, before_broadcast)
+            .await;
 
         match &result {
             Ok(_) => {
@@ -2058,14 +2072,10 @@ impl FastWallet {
         let sign_start = Instant::now();
         let tx = self.sign_with_preheat(ctx, request)?;
         let sign_ms = sign_start.elapsed().as_secs_f64() * 1000.0;
-        if let Err(error) = before_broadcast(&tx) {
-            ctx.release_reservation();
-            self.inflight_nonces
-                .mark_released(tx.nonce(), "preheat_admission_refused");
-            return Err(error);
-        }
         ctx.mark_broadcasting()?;
-        let result = self.broadcast_signed_result(&tx, sign_ms).await;
+        let result = self
+            .broadcast_signed_result(&tx, sign_ms, before_broadcast)
+            .await;
         match &result {
             Ok(_) => {
                 ctx.commit_reservation();
@@ -3731,6 +3741,48 @@ mod tests {
         assert!(sent.lock().is_empty());
         assert!(wallet.lowest_unresolved_inflight(50).is_none());
         drop(ctx);
+        assert_eq!(wallet.sign(test_request()).unwrap().nonce(), 50);
+    }
+
+    #[tokio::test]
+    async fn admission_rechecks_after_semaphore_wait_and_releases_refused_nonce() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (url, sent) = mock_rpc_server(50, 1_000_000_000, 20_000_000_000, false).await;
+        let wallet = FastWalletBuilder::new(TEST_PRIVATE_KEY, &url)
+            .chain_id(1)
+            .build_with_nonce(50)
+            .unwrap();
+        let tx = wallet.sign(test_request()).unwrap();
+        let permit = wallet
+            .pending_semaphore
+            .acquire_many(wallet.config.max_pending_txs as u32)
+            .await
+            .unwrap();
+        let paused = AtomicBool::new(false);
+        let checked = AtomicBool::new(false);
+        let mut send = Box::pin(wallet.send_signed_detailed_guarded(&tx, 0.0, |_| {
+            checked.store(true, Ordering::Relaxed);
+            if paused.load(Ordering::Relaxed) {
+                Err(WalletError::NonceError(
+                    "GAS_REVERT_STREAK:lane:dpcp".into(),
+                ))
+            } else {
+                Ok(())
+            }
+        }));
+        assert!(tokio::time::timeout(Duration::from_millis(10), &mut send)
+            .await
+            .is_err());
+        assert!(!checked.load(Ordering::Relaxed));
+        paused.store(true, Ordering::Relaxed);
+        drop(permit);
+        assert!(send
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("GAS_REVERT_STREAK"));
+        assert!(checked.load(Ordering::Relaxed));
+        assert!(sent.lock().is_empty());
         assert_eq!(wallet.sign(test_request()).unwrap().nonce(), 50);
     }
 
