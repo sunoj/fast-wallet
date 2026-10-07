@@ -1649,6 +1649,9 @@ impl FastWallet {
     /// As with the preheated path, a concurrent nonce sync can make this release
     /// stale: the tracker reuses the gap and nonce-too-low recovery resyncs.
     /// This is narrower than the release-on-every-error policy in 0.2.6 and earlier.
+    /// Recycling assumes this is the nonce's first broadcast: a definitively rejected
+    /// replacement at a nonce whose original was accepted would recycle a live nonce,
+    /// so send replacements through `replace_stalled_nonce`, not this method.
     pub async fn send_signed(&self, tx: &Transaction) -> WalletResult<B256> {
         self.record_broadcast_candidate(tx);
         let result = self.broadcast_signed_hash(tx).await;

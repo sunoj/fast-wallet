@@ -19,6 +19,9 @@ Started at 0.2.1; earlier releases are recorded only in git tags and commit mess
   error can make the release stale. The tracker reuses the gap and nonce-too-low recovery
   resyncs. This is narrower than presigned sends' release-on-every-error policy in 0.2.6
   and earlier; it does not add reservation identity checks.
+- Recycling assumes a first broadcast of the nonce. A definitively rejected replacement
+  at a nonce whose original was accepted would recycle a live nonce; send replacements
+  through `replace_stalled_nonce`.
 
 ## [0.2.8] - 2026-10-07
 
