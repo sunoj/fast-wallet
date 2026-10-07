@@ -3736,7 +3736,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_admission_observes_hash_before_failed_broadcast() {
-        let (url, sent) = mock_rpc_server(50, 1_000_000_000, 20_000_000_000, true).await;
+        let (url, sent) = mock_rpc_server_cfg(50, 1_000_000_000, 20_000_000_000, false, true).await;
         let wallet = FastWalletBuilder::new(TEST_PRIVATE_KEY, &url)
             .chain_id(1)
             .build_with_nonce(50)
