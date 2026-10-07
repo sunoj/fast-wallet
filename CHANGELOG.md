@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Started at 0.2.1; earlier releases are recorded only in git tags and commit messages.
 
+## [0.2.9] - 2026-10-07
+
+### Fixed
+
+- `send_signed` and `send_signed_detailed` now recycle the nonce when every endpoint
+  definitively rejects the transaction during pre-check. Mixed, ambiguous, transport,
+  and timeout errors retain the nonce and use the existing nonce recovery; rejection
+  of a `verify_broadcast` rebroadcast also retains it because an earlier send may be live.
+- Recycling matches the preheated path's plain release: a nonce sync between send and
+  error can make the release stale. The tracker reuses the gap and nonce-too-low recovery
+  resyncs. This is narrower than presigned sends' release-on-every-error policy in 0.2.6
+  and earlier; it does not add reservation identity checks.
+
 ## [0.2.8] - 2026-10-07
 
 ### Added
