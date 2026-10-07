@@ -1647,6 +1647,8 @@ impl FastWallet {
     /// blocking indefinitely when many transactions are in-flight. An all-definitive
     /// pre-check rejection recycles the nonce; other errors retain it for chain
     /// reconciliation because a racing endpoint may have accepted the signed bytes.
+    /// [`WalletError::is_definitive_rejection`] on the returned error tells the caller
+    /// which happened.
     /// As with the preheated path, a concurrent nonce sync can make this release
     /// stale: the tracker reuses the gap and nonce-too-low recovery resyncs.
     /// This is narrower than the release-on-every-error policy in 0.2.6 and earlier.

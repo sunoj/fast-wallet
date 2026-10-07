@@ -27,7 +27,8 @@ async fn rejected_send(detailed: bool, second_reply: Option<Reply>, recycled: bo
     if let Some(reply) = second_reply {
         assert!(second.next_send().await.send(reply).is_ok());
     }
-    assert!(sending.await.unwrap().is_err());
+    let error = sending.await.unwrap().unwrap_err();
+    assert_eq!(error.is_definitive_rejection(), recycled, "{error}");
     assert_eq!(wallet.inflight_count(), usize::from(!recycled));
     assert_eq!(
         wallet.sign(request()).unwrap().nonce(),
