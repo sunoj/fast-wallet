@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Started at 0.2.1; earlier releases are recorded only in git tags and commit messages.
 
+## [0.2.10] - 2026-10-07
+
+### Added
+
+- `WalletError::is_definitive_rejection()`. `send_signed` and `send_signed_detailed`
+  release the nonce exactly when the returned error satisfies it; release recycles only a
+  nonce this wallet reserved that is still above the synced nonce. On `false` the reservation
+  is retained and the caller settles it with a bounded receipt check plus reconciliation:
+  `false` does not mean any endpoint received the bytes (a permit timeout or connect failure
+  also returns it). It is the same predicate the send paths use, so callers no longer need to
+  infer the outcome from error variants. A variant-only mapping
+  misreads a single-endpoint `RpcError` whose text is definitive, and an aggregate
+  `BroadcastFailed` whose every verdict is a definitive rejection.
+
 ## [0.2.9] - 2026-10-07
 
 ### Fixed

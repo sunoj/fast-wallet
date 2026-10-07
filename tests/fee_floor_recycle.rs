@@ -38,7 +38,8 @@ async fn rejected_send(message: &'static str, batch: bool, ambiguous: Option<&'s
             .send(Reply::Error(ambiguous.unwrap_or(message)))
             .is_ok());
     }
-    assert!(sending.await.unwrap().is_err());
+    let error = sending.await.unwrap().unwrap_err();
+    assert_eq!(error.is_definitive_rejection(), ambiguous.is_none(), "{error}");
     assert_eq!(
         wallet.inflight_count(),
         usize::from(ambiguous.is_some()),
