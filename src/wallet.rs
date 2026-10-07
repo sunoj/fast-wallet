@@ -2045,9 +2045,25 @@ impl FastWallet {
         ctx: &PreheatedContext,
         request: TransactionRequest,
     ) -> WalletResult<SendResult> {
+        self.send_with_preheat_detailed_guarded(ctx, request, |_| Ok(()))
+            .await
+    }
+
+    pub async fn send_with_preheat_detailed_guarded(
+        &self,
+        ctx: &PreheatedContext,
+        request: TransactionRequest,
+        before_broadcast: impl FnOnce(&Transaction) -> WalletResult<()>,
+    ) -> WalletResult<SendResult> {
         let sign_start = Instant::now();
         let tx = self.sign_with_preheat(ctx, request)?;
         let sign_ms = sign_start.elapsed().as_secs_f64() * 1000.0;
+        if let Err(error) = before_broadcast(&tx) {
+            ctx.release_reservation();
+            self.inflight_nonces
+                .mark_released(tx.nonce(), "preheat_admission_refused");
+            return Err(error);
+        }
         ctx.mark_broadcasting()?;
         let result = self.broadcast_signed_result(&tx, sign_ms).await;
         match &result {
@@ -3693,6 +3709,29 @@ mod tests {
         let after = wallet.lowest_unresolved_inflight(50).unwrap();
         assert_eq!(after.max_fee_seen, before.max_fee_seen);
         assert_eq!(after.max_priority_seen, before.max_priority_seen);
+    }
+
+    #[tokio::test]
+    async fn preheat_admission_refusal_releases_only_the_unsent_reservation() {
+        let (url, sent) = mock_rpc_server(50, 1_000_000_000, 20_000_000_000, false).await;
+        let wallet = FastWalletBuilder::new(TEST_PRIVATE_KEY, &url)
+            .chain_id(1)
+            .build_with_nonce(50)
+            .unwrap();
+        let ctx = wallet.preheat(true).await.unwrap();
+        let result = wallet
+            .send_with_preheat_detailed_guarded(&ctx, test_request(), |_| {
+                Err(WalletError::NonceError("GAS_BREAKER_LANE:executor".into()))
+            })
+            .await;
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("GAS_BREAKER_LANE:executor"));
+        assert!(sent.lock().is_empty());
+        assert!(wallet.lowest_unresolved_inflight(50).is_none());
+        drop(ctx);
+        assert_eq!(wallet.sign(test_request()).unwrap().nonce(), 50);
     }
 
     #[tokio::test]
