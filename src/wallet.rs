@@ -1678,16 +1678,22 @@ impl FastWallet {
     ///
     /// `before_broadcast` runs after the pending-slot wait, while the permit is held,
     /// and immediately before the raw bytes go to any endpoint. It is synchronous and
-    /// must be cheap and non-blocking. On `Err` nothing is sent, no broadcast candidate
-    /// is recorded, the nonce is released, and the call returns
-    /// [`WalletError::BroadcastRefused`] wrapping the hook's error, for which
-    /// [`WalletError::is_definitive_rejection`] is true.
+    /// must be cheap and non-blocking, and must not panic: a panic unwinds past the
+    /// release and leaves the nonce reserved. On `Err` nothing is sent, no broadcast
+    /// candidate is recorded, and the call returns [`WalletError::BroadcastRefused`]
+    /// wrapping the hook's error, for which [`WalletError::is_definitive_rejection`]
+    /// is true. The nonce is released only when the in-flight ledger holds no accepted
+    /// broadcast at it; a refused replacement of an accepted transaction leaves the
+    /// nonce and its ledger record untouched.
     ///
     /// Guarded forms exist for `send`, `send_signed`, `send_signed_detailed`,
     /// `send_with_preheat`, `send_with_preheat_detailed` and `replace_stalled_nonce`.
     /// The convenience senders (`send_optimistic*`, `send_quick_liquidation`,
-    /// `send_eth`, `send_contract_call*`, `send_batch`) and the fee-bump rebroadcast
-    /// in `verify_broadcast` run no hook; sign and call a guarded form instead.
+    /// `send_eth`, `send_contract_call*`, `send_batch`) run no hook; sign and call a
+    /// guarded form instead. The fee-bump rebroadcast in `verify_broadcast` runs no
+    /// hook and has no guarded equivalent: sending a replacement through this method
+    /// is safe on refusal, but a definitive endpoint rejection of it still recycles
+    /// the live nonce, as in `send_signed`. Use `replace_stalled_nonce_guarded`.
     pub async fn send_signed_guarded(
         &self,
         tx: &Transaction,
@@ -1719,6 +1725,9 @@ impl FastWallet {
 
     async fn handle_signed_broadcast_error(&self, tx: &Transaction, error: &WalletError) {
         match error {
+            // A refused replacement leaves the accepted original live at this nonce.
+            WalletError::BroadcastRefused(_)
+                if self.inflight_nonces.has_accepted_broadcast(tx.nonce()) => {}
             WalletError::BroadcastRefused(_) => {
                 self.nonce_manager.release(tx.nonce());
                 self.inflight_nonces

@@ -110,6 +110,16 @@ impl InflightNonceLedger {
         }
     }
 
+    /// Test-only: the record at `nonce`, whatever its status.
+    #[cfg(test)]
+    pub fn snapshot_for_tests(&self, nonce: u64) -> Option<InflightNonceSnapshot> {
+        let now = Instant::now();
+        self.records
+            .lock()
+            .get(&nonce)
+            .map(|record| record.snapshot(now))
+    }
+
     pub fn record_signed(
         &self,
         nonce: u64,
@@ -214,6 +224,13 @@ impl InflightNonceLedger {
             .range(chain_next..)
             .find(|(_, record)| is_unresolved(record.status))
             .map(|(_, record)| record.snapshot(now))
+    }
+
+    /// True when an unreleased record at `nonce` has an accepted broadcast.
+    pub fn has_accepted_broadcast(&self, nonce: u64) -> bool {
+        self.records.lock().get(&nonce).is_some_and(|record| {
+            record.status != InflightNonceStatus::Released && record.accepted_broadcasts > 0
+        })
     }
 
     pub fn unresolved_count(&self) -> usize {

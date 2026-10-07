@@ -149,6 +149,8 @@ impl WalletError {
     /// Release frees the pending slot and recycles the nonce only if this wallet
     /// reserved it and it is still above the synced nonce. Recycling assumes a first
     /// broadcast: a rejected replacement does not prove the original is gone.
+    /// A `BroadcastRefused` from `replace_stalled_nonce_guarded` also satisfies this,
+    /// but the stalled original still owns the nonce: the caller must not release it.
     ///
     /// `false` means the reservation is retained and the caller settles it. It does
     /// not mean any endpoint received the bytes: a permit timeout or a connect failure

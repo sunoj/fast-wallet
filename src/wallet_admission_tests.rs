@@ -37,6 +37,9 @@ mod admission {
         assert_eq!(wallet.pending_count(), 0);
         assert_eq!(wallet.inflight_count(), 0);
         assert!(wallet.lowest_unresolved_inflight(50).is_none());
+        if let Some(record) = wallet.inflight_nonces.snapshot_for_tests(50) {
+            assert_eq!(record.release_reason.as_deref(), Some("admission_refused"));
+        }
         let next = wallet.sign(test_request()).unwrap();
         assert_eq!(next.nonce(), 50);
         wallet.send_signed_detailed(&next, 0.0).await.unwrap();
@@ -209,6 +212,39 @@ mod admission {
                     assert_eq!(wallet.sign(test_request()).unwrap().nonce(), 51);
                 }
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn refused_replacement_keeps_accepted_nonce() {
+        for detailed in [false, true] {
+            let (wallet, methods) = fixture(false).await;
+            let original = wallet.sign(test_request()).unwrap();
+            wallet.send_signed(&original).await.unwrap();
+            methods.lock().clear();
+            let bump = signed_1559_at(&wallet, 50, 2, 40);
+            let error = if detailed {
+                wallet
+                    .send_signed_detailed_guarded(&bump, 0.0, |_| refusal())
+                    .await
+                    .map(|_| ())
+            } else {
+                wallet
+                    .send_signed_guarded(&bump, |_| refusal())
+                    .await
+                    .map(|_| ())
+            };
+            assert_refused(error.unwrap_err());
+            assert!(methods.lock().is_empty(), "refusal must not call any RPC");
+            assert_eq!(wallet.pending_count(), 1);
+            let record = wallet.lowest_unresolved_inflight(50).unwrap();
+            assert_eq!(record.nonce, 50);
+            assert!(record.tx_hashes.contains(&original.hash()));
+            assert!(!record.tx_hashes.contains(&bump.hash()));
+            assert_eq!(record.status, crate::InflightNonceStatus::BroadcastAccepted);
+            assert_eq!(record.accepted_broadcasts, 1);
+            assert_eq!(record.release_reason, None);
+            assert_eq!(wallet.sign(test_request()).unwrap().nonce(), 51);
         }
     }
 
