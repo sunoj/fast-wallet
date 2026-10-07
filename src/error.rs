@@ -141,11 +141,19 @@ impl WalletError {
 
     /// True when every endpoint definitively rejected the transaction at pre-check.
     ///
-    /// `send_signed` and `send_signed_detailed` recycle the nonce exactly when the
-    /// error they return satisfies this. Otherwise the reservation is retained and
-    /// the caller must settle it (receipt poll or nonce reconciler). Use this
-    /// instead of matching variants: a single-endpoint send returns `RpcError`
-    /// text that may be definitive.
+    /// This is the release policy of `send_signed` and `send_signed_detailed`: they
+    /// call `release` on the nonce exactly when the error they return satisfies this.
+    /// Release frees the pending slot and recycles the nonce only if this wallet
+    /// reserved it and it is still above the synced nonce. Recycling assumes a first
+    /// broadcast: a rejected replacement does not prove the original is gone.
+    ///
+    /// `false` means the reservation is retained and the caller settles it. It does
+    /// not mean any endpoint received the bytes: a permit timeout or a connect failure
+    /// also returns `false`. Settle with a bounded receipt check plus nonce
+    /// reconciliation, not by waiting for a receipt.
+    ///
+    /// Use this instead of matching variants: a single-endpoint send returns
+    /// `RpcError` text that may be definitive.
     pub fn is_definitive_rejection(&self) -> bool {
         crate::wallet::is_definitive_precheck_rejection(self)
     }
