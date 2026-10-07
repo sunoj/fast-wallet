@@ -1888,6 +1888,16 @@ impl FastWallet {
         chain_next: u64,
         tip_bump_bps: u32,
     ) -> WalletResult<ReplaceOutcome> {
+        self.replace_stalled_nonce_guarded(chain_next, tip_bump_bps, |_| Ok(()))
+            .await
+    }
+
+    pub async fn replace_stalled_nonce_guarded(
+        &self,
+        chain_next: u64,
+        tip_bump_bps: u32,
+        before_broadcast: impl FnOnce(&Transaction) -> WalletResult<()>,
+    ) -> WalletResult<ReplaceOutcome> {
         // Idempotency: skip a repeat replacement of the same nonce within the window.
         if let Some((nonce, at)) = *self.last_stall_replace.lock() {
             if nonce == chain_next && at.elapsed() < STALL_REPLACE_WINDOW {
@@ -1968,6 +1978,7 @@ impl FastWallet {
         let tx_hash = tx.hash();
         let hex_tx = tx.to_hex();
 
+        before_broadcast(&tx)?;
         let result = if let Some(batch_client) = &self.batch_client {
             batch_client.broadcast_transaction(&hex_tx).await
         } else {
@@ -3650,6 +3661,59 @@ mod tests {
             &sent[0][..6.min(sent[0].len())]
         );
         assert_eq!(wallet.last_stall_replace.lock().map(|(n, _)| n), Some(50));
+    }
+
+    #[tokio::test]
+    async fn cancel_admission_refuses_without_broadcast_or_nonce_release() {
+        let (url, sent) = mock_rpc_server(50, 1_000_000_000, 20_000_000_000, false).await;
+        let wallet = FastWalletBuilder::new(TEST_PRIVATE_KEY, &url)
+            .chain_id(1)
+            .build_with_nonce(50)
+            .unwrap();
+        wallet.sign(test_request()).unwrap();
+        let before = wallet.lowest_unresolved_inflight(50).unwrap();
+        let result = wallet
+            .replace_stalled_nonce_guarded(50, 0, |tx| {
+                assert_eq!(tx.nonce(), 50);
+                let crate::TypedTransaction::Eip1559(cancel) = &tx.typed_tx else {
+                    panic!("cancel must use EIP-1559");
+                };
+                assert_eq!(cancel.gas_limit, 21_000);
+                Err(WalletError::NonceError(
+                    "DAILY_GAS_LOSS_LIMIT:cancel".into(),
+                ))
+            })
+            .await;
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("DAILY_GAS_LOSS_LIMIT:cancel"));
+        assert!(sent.lock().is_empty());
+        assert_eq!(wallet.current_nonce(), 51);
+        let after = wallet.lowest_unresolved_inflight(50).unwrap();
+        assert_eq!(after.max_fee_seen, before.max_fee_seen);
+        assert_eq!(after.max_priority_seen, before.max_priority_seen);
+    }
+
+    #[tokio::test]
+    async fn cancel_admission_observes_hash_before_failed_broadcast() {
+        let (url, sent) = mock_rpc_server(50, 1_000_000_000, 20_000_000_000, true).await;
+        let wallet = FastWalletBuilder::new(TEST_PRIVATE_KEY, &url)
+            .chain_id(1)
+            .build_with_nonce(50)
+            .unwrap();
+        wallet.sign(test_request()).unwrap();
+        let mut observed = None;
+        let result = wallet
+            .replace_stalled_nonce_guarded(50, 0, |tx| {
+                observed = Some(tx.hash());
+                Ok(())
+            })
+            .await;
+        assert!(result.is_err());
+        assert!(observed.is_some());
+        assert_eq!(sent.lock().len(), 1);
+        assert_eq!(wallet.current_nonce(), 51);
     }
 
     #[tokio::test]
