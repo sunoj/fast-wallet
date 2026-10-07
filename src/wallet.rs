@@ -11,7 +11,7 @@ use crate::error::{WalletError, WalletResult};
 use crate::gas_provider::GasPriceProvider;
 use crate::inflight::{InflightNonceLedger, InflightNonceSnapshot};
 use crate::nonce::{ReservedNonce, SingleAddressNonceManager};
-use crate::rpc::{BatchRpcClient, RpcClient, SendResult};
+use crate::rpc::{normalized_url, BatchRpcClient, RpcClient, SendResult};
 use crate::signer::FastSigner;
 use crate::transaction::{bump_u256, Transaction, TransactionRequest, RBF_MIN_BUMP_BPS};
 use alloy::primitives::{Address, Bytes, B256, U256};
@@ -577,7 +577,7 @@ impl FastWallet {
             let mut all_rpcs = vec![primary_rpc.to_string()];
             all_rpcs.extend(broadcast_rpcs);
             wallet.batch_client = Some(Arc::new(
-                BatchRpcClient::new(all_rpcs)?
+                BatchRpcClient::sharing_primary(&wallet.rpc_client, all_rpcs)?
                     .with_send_timeout(wallet.config.broadcast_send_timeout),
             ));
         }
@@ -680,6 +680,20 @@ impl FastWallet {
 
     fn gas_rpc(&self) -> &Arc<RpcClient> {
         self.gas_rpc_client.as_ref().unwrap_or(&self.rpc_client)
+    }
+
+    /// This wallet's client for `url`: the primary or a broadcast client when the
+    /// normalized URL matches, so one endpoint never gets a second pool.
+    fn client_for(&self, url: &str) -> WalletResult<Arc<RpcClient>> {
+        let key = normalized_url(url);
+        let broadcast = self.batch_client.iter().flat_map(|b| b.clients());
+        match std::iter::once(&self.rpc_client)
+            .chain(broadcast)
+            .find(|c| normalized_url(c.url()) == key)
+        {
+            Some(client) => Ok(client.clone()),
+            None => Ok(Arc::new(RpcClient::new(url)?)),
+        }
     }
 
     /// Get config reference
@@ -2542,7 +2556,7 @@ impl FastWalletBuilder {
                     self.exclusive_broadcast,
                 );
                 wallet.batch_client = Some(Arc::new(
-                    BatchRpcClient::new(all_rpcs)?
+                    BatchRpcClient::sharing_primary(&wallet.rpc_client, all_rpcs)?
                         .with_send_timeout(wallet.config.broadcast_send_timeout),
                 ));
             }
@@ -2556,7 +2570,7 @@ impl FastWalletBuilder {
                 self.exclusive_broadcast,
             );
             wallet.batch_client = Some(Arc::new(
-                BatchRpcClient::new(all_rpcs)?
+                BatchRpcClient::sharing_primary(&wallet.rpc_client, all_rpcs)?
                     .with_send_timeout(wallet.config.broadcast_send_timeout),
             ));
             wallet
@@ -2564,7 +2578,7 @@ impl FastWalletBuilder {
             FastWallet::new(&self.private_key, &self.primary_rpc, self.config).await?
         };
         if let Some(url) = gas_rpc_url {
-            wallet.gas_rpc_client = Some(Arc::new(RpcClient::new(&url)?));
+            wallet.gas_rpc_client = Some(wallet.client_for(&url)?);
         }
         Ok(wallet)
     }
@@ -2588,13 +2602,13 @@ impl FastWalletBuilder {
                 self.exclusive_broadcast,
             );
             wallet.batch_client = Some(Arc::new(
-                BatchRpcClient::new(all_rpcs)?
+                BatchRpcClient::sharing_primary(&wallet.rpc_client, all_rpcs)?
                     .with_send_timeout(wallet.config.broadcast_send_timeout),
             ));
         }
 
         if let Some(url) = self.gas_rpc_url {
-            wallet.gas_rpc_client = Some(Arc::new(RpcClient::new(&url)?));
+            wallet.gas_rpc_client = Some(wallet.client_for(&url)?);
         }
 
         Ok(wallet)

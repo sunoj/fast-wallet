@@ -51,6 +51,7 @@ pub mod signer;
 pub mod tls;
 pub mod transaction;
 pub mod wallet;
+mod warm;
 
 pub use broadcast::{BroadcastStrategy, BroadcasterBuilder, RpcEndpoint, TransactionBroadcaster};
 pub use error::{parse_nonce_too_low, WalletError, WalletResult};

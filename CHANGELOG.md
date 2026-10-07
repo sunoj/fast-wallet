@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Started at 0.2.1; earlier releases are recorded only in git tags and commit messages.
 
+## [0.2.8] - 2026-10-07
+
+### Added
+
+- `examples/h2_idle_probe.rs`: measures whether a pooled connection survives idle gaps
+  (reused vs newly dialled, warm vs cold latency) for URLs from arguments or `PROBE_URLS`.
+
+### Changed
+
+- `RpcClient` and `TransactionBroadcaster` pools no longer evict idle connections
+  (`pool_idle_timeout(None)`); the unchanged HTTP/2 keep-alive pings (10 s interval,
+  20 s timeout, while idle) still drop a connection whose peer stops answering.
+- The warmup throttle window runs on tokio's clock and depends on the URL scheme:
+  4 minutes for `https://` endpoints (HTTP/2 with keep-alive pings), 60 s as before for
+  every other URL (plain `http://` speaks HTTP/1.1, has no pings, and an idle close by
+  the server goes unseen). The `https://` window sits below the shortest idle survival
+  measured with `examples/h2_idle_probe.rs`: QuickNode closes idle HTTP/2 connections
+  between 5 and 10 minutes despite pings (four keyless public RPCs kept them for 30
+  minutes); a warmup per `https://` endpoint now runs at most 15 times an hour instead
+  of 60. The endpoint's warm state is cleared, so the next warmup probes again, whenever
+  a request ends without its whole answer: a transport error, a response body cut short
+  after its headers, an `RpcClient` request its caller drops (the caller's own timeout,
+  a lost race, a batch send abandoned at its timeout), or a `TransactionBroadcaster`
+  send dropped as a `RaceAll` / `PrivateFirst` race loser.
+- A wallet holds one `RpcClient` per endpoint URL: a broadcast entry for the primary URL
+  reuses the primary's client, a URL repeated in the broadcast list is sent once, and a
+  gas RPC URL reuses a matching client. URLs match when they parse to the same request
+  target (scheme and host case, default port, empty path). Nothing is trimmed beyond what
+  URL parsing itself strips (leading and trailing ASCII spaces and control characters), so
+  a URL with a trailing NBSP is a distinct endpoint.
+- Deduplication shifts broadcast endpoint indexes and counts: a dropped duplicate no
+  longer occupies a slot, so `SendResult::first_success_endpoint_index`,
+  `BatchRpcClient::endpoint_count()`, the `batch_count` returned by
+  `FastWallet::warmup_connections()` and the entries of `SendResult::per_endpoint_ms`
+  count each endpoint once. Callers that map an endpoint index to a label will see later
+  indexes shift down by one per removed duplicate.
+
 ## [0.2.7] - 2026-09-15
 
 ### Added

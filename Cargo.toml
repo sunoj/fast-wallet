@@ -5,7 +5,7 @@
 
 [package]
 name = "fast-wallet"
-version = "0.2.7"
+version = "0.2.8"
 edition = "2021"
 description = "High-performance EVM wallet optimized for liquidation bots and MEV"
 authors = ["Ming <ming@xinxiao.tech>"]
@@ -40,6 +40,10 @@ path = "examples/anvil_benchmark.rs"
 [[example]]
 name = "liquidation_bot"
 path = "examples/liquidation_bot.rs"
+
+[[example]]
+name = "h2_idle_probe"
+path = "examples/h2_idle_probe.rs"
 
 [features]
 default = []
@@ -101,6 +105,9 @@ async-trait = "0.1"
 [dev-dependencies]
 # Benchmarking
 criterion = { version = "0.5", features = ["async_tokio"] }
+
+# Paused, advanceable clock for the warmup-throttle tests
+tokio = { version = "1.35", features = ["test-util"] }
 
 [profile.release]
 opt-level = 3

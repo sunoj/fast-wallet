@@ -7,8 +7,8 @@
 //! - Configurable retry strategies
 
 use crate::error::{WalletError, WalletResult};
-use crate::rpc::WARMUP_THROTTLE_WINDOW;
 use crate::transaction::Transaction;
+use crate::warm::WarmState;
 use alloy::primitives::B256;
 use dashmap::DashMap;
 use futures_util::future::{join_all, select_all};
@@ -17,6 +17,7 @@ use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
@@ -282,7 +283,8 @@ pub struct TransactionBroadcaster {
     pub strategy: BroadcastStrategy,
     default_timeout: Duration,
     request_id: AtomicU64,
-    last_success: DashMap<String, Instant>,
+    /// Warmup bookkeeping per endpoint URL.
+    warm: DashMap<String, Arc<WarmState>>,
 }
 
 impl TransactionBroadcaster {
@@ -291,7 +293,9 @@ impl TransactionBroadcaster {
         crate::tls::ensure_provider();
         let client = Client::builder()
             .pool_max_idle_per_host(20)
-            .pool_idle_timeout(Duration::from_secs(300))
+            // Never evict an idle connection: the HTTP/2 pings below keep it
+            // alive and drop it if the peer stops answering.
+            .pool_idle_timeout(None)
             .timeout(Duration::from_secs(10))
             .tcp_nodelay(true)
             .tcp_keepalive(Duration::from_secs(15))
@@ -307,7 +311,7 @@ impl TransactionBroadcaster {
             strategy: BroadcastStrategy::RaceAll,
             default_timeout: Duration::from_secs(5),
             request_id: AtomicU64::new(1),
-            last_success: DashMap::new(),
+            warm: DashMap::new(),
         })
     }
 
@@ -383,20 +387,37 @@ impl TransactionBroadcaster {
     }
 
     fn should_skip_warmup(&self, url: &str) -> bool {
-        self.last_success
-            .get(url)
-            .map(|t| Instant::now().saturating_duration_since(*t) < WARMUP_THROTTLE_WINDOW)
-            .unwrap_or(false)
+        self.warm.get(url).is_some_and(|w| !w.probe_due())
     }
 
-    fn mark_last_success(&self, url: &str) {
-        self.last_success.insert(url.to_string(), Instant::now());
+    fn warm_state(&self, url: &str) -> Arc<WarmState> {
+        let entry = self.warm.entry(url.to_string());
+        let state = entry.or_insert_with(|| Arc::new(WarmState::for_url(url)));
+        Arc::clone(&state)
     }
 
-    #[cfg(test)]
-    fn expire_warmup_throttle(&self, url: &str) {
-        self.last_success
-            .insert(url.to_string(), crate::rpc::expired_warmup_instant());
+    /// POST a JSON-RPC `body` to `endpoint` and read its answer. Unless the
+    /// whole answer arrives, `endpoint` loses its warm state: an error, the
+    /// timeout, a body cut short or a send dropped as a race loser may each
+    /// leave no usable pooled connection.
+    async fn call(&self, endpoint: &RpcEndpoint, body: &Value) -> WalletResult<RpcResponse> {
+        let warm = self.warm_state(&endpoint.url);
+        let guard = warm.loss_guard();
+        let mut request = self.client.post(&endpoint.url).json(body);
+        if let Some((key, value)) = &endpoint.auth_header {
+            request = request.header(key, value);
+        }
+        let limit = endpoint.timeout.unwrap_or(self.default_timeout);
+        let response = timeout(limit, request.send())
+            .await
+            .map_err(|_| WalletError::Timeout)?
+            .map_err(|e| WalletError::NetworkError(crate::redact_urls(&e.to_string())))?;
+        let answer = response
+            .json()
+            .await
+            .map_err(|e| WalletError::RpcError(crate::redact_urls(&e.to_string())))?;
+        guard.disarm();
+        Ok(answer)
     }
 
     /// Warm up a single endpoint
@@ -411,24 +432,7 @@ impl TransactionBroadcaster {
             "params": [],
             "id": self.next_id(),
         });
-
-        let mut request = self.client.post(&endpoint.url).json(&request_body);
-
-        if let Some((key, value)) = &endpoint.auth_header {
-            request = request.header(key, value);
-        }
-
-        let timeout_duration = endpoint.timeout.unwrap_or(self.default_timeout);
-
-        let response = timeout(timeout_duration, request.send())
-            .await
-            .map_err(|_| WalletError::Timeout)?
-            .map_err(|e| WalletError::NetworkError(crate::redact_urls(&e.to_string())))?;
-
-        let rpc_response: RpcResponse = response
-            .json()
-            .await
-            .map_err(|e| WalletError::RpcError(crate::redact_urls(&e.to_string())))?;
+        let rpc_response = self.call(endpoint, &request_body).await?;
 
         // A JSON-RPC error means the host is reachable but not serving, so it
         // must not earn a throttle window — see the same guard in RpcClient.
@@ -443,7 +447,7 @@ impl TransactionBroadcaster {
             return Err(WalletError::RpcError("Empty response".to_string()));
         }
 
-        self.mark_last_success(&endpoint.url);
+        self.warm_state(&endpoint.url).mark_success();
         Ok(())
     }
 
@@ -478,25 +482,7 @@ impl TransactionBroadcaster {
             "params": [raw_tx],
             "id": self.next_id(),
         });
-
-        let mut request = self.client.post(&endpoint.url).json(&request_body);
-
-        // Add auth header if present
-        if let Some((key, value)) = &endpoint.auth_header {
-            request = request.header(key, value);
-        }
-
-        let timeout_duration = endpoint.timeout.unwrap_or(self.default_timeout);
-
-        let response = timeout(timeout_duration, request.send())
-            .await
-            .map_err(|_| WalletError::Timeout)?
-            .map_err(|e| WalletError::NetworkError(crate::redact_urls(&e.to_string())))?;
-
-        let rpc_response: RpcResponse = response
-            .json()
-            .await
-            .map_err(|e| WalletError::RpcError(crate::redact_urls(&e.to_string())))?;
+        let rpc_response = self.call(endpoint, &request_body).await?;
 
         if let Some(error) = rpc_response.error {
             return Err(WalletError::RpcError(format_rpc_error(&error)));
@@ -504,7 +490,7 @@ impl TransactionBroadcaster {
 
         // Clean result only — a rejected send leaves the endpoint eligible for
         // the next warmup probe.
-        self.mark_last_success(&endpoint.url);
+        self.warm_state(&endpoint.url).mark_success();
 
         match rpc_response.result {
             Some(s) => parse_b256_hex(&s),
@@ -1276,7 +1262,7 @@ mod tests {
         assert_eq!(broadcaster.warmup().await, 1);
         assert_eq!(hits.load(Ordering::SeqCst), 1);
 
-        broadcaster.expire_warmup_throttle(&url);
+        crate::warm::idle_for(crate::warm::HTTP_WARMUP_WINDOW).await;
         assert_eq!(broadcaster.warmup().await, 1);
         assert_eq!(hits.load(Ordering::SeqCst), 2);
     }

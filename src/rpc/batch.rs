@@ -1,5 +1,5 @@
-// Parallel transaction fan-out and complete all-fail verdict collection.
-// Exports BatchRpcClient methods; depends on RpcClient, futures, and error verdicts.
+// Parallel transaction fan-out, complete all-fail verdict collection, one client per endpoint.
+// Exports BatchRpcClient methods and normalized_url; depends on RpcClient, futures, verdicts.
 use super::*;
 use crate::error::{BroadcastFailure, EndpointVerdict};
 use futures_util::future::BoxFuture;
@@ -21,6 +21,38 @@ impl BatchRpcClient {
             clients: clients?,
             current: AtomicU64::new(0),
         })
+    }
+
+    /// Batch over `urls` holding one client per endpoint: a URL equal to
+    /// `primary`'s (by [`normalized_url`]) reuses that client and its pool, a
+    /// repeated URL is dropped, and first-seen order is kept. Sending the same
+    /// signed transaction twice to one endpoint adds nothing but a request.
+    pub(crate) fn sharing_primary(
+        primary: &Arc<RpcClient>,
+        urls: Vec<String>,
+    ) -> WalletResult<Self> {
+        let mut clients: Vec<Arc<RpcClient>> = Vec::with_capacity(urls.len());
+        for url in urls {
+            let key = normalized_url(&url);
+            if clients.iter().any(|c| normalized_url(c.url()) == key) {
+                continue;
+            }
+            if normalized_url(primary.url()) == key {
+                clients.push(primary.clone());
+            } else {
+                clients.push(Arc::new(RpcClient::new(url)?));
+            }
+        }
+        Ok(Self {
+            send_timeout: DEFAULT_BROADCAST_SEND_TIMEOUT,
+            clients,
+            current: AtomicU64::new(0),
+        })
+    }
+
+    /// Clients in broadcast order, one per endpoint.
+    pub(crate) fn clients(&self) -> &[Arc<RpcClient>] {
+        &self.clients
     }
 
     /// Bound only transaction sends; read RPCs retain their shared client timeout.
@@ -136,6 +168,15 @@ impl BatchRpcClient {
     pub fn endpoint_count(&self) -> usize {
         self.clients.len()
     }
+}
+
+/// Endpoint identity for deduplication: the URL exactly as a request parses it
+/// (scheme and host case-folded, default port and empty path dropped), so only
+/// two spellings of one request target compare equal. Nothing is trimmed first:
+/// a trailing NBSP is part of the path, another endpoint. Text that does not
+/// parse compares verbatim.
+pub(crate) fn normalized_url(url: &str) -> String {
+    reqwest::Url::parse(url).map_or_else(|_| url.to_string(), String::from)
 }
 
 fn log_remaining(remaining: Vec<EndpointFuture>, hash: B256) {

@@ -6,22 +6,16 @@
 //! - Minimal serialization overhead
 
 use crate::error::{WalletError, WalletResult};
+use crate::warm::WarmState;
 use alloy::primitives::{Address, B256, U256};
 use futures_util::future::{join_all, select_all};
 use futures_util::FutureExt;
-use parking_lot::Mutex;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-
-/// Skip `warmup()` when this endpoint completed a request within this window.
-/// 60s is well under the 300s reqwest `pool_idle_timeout` on RpcClient and
-/// TransactionBroadcaster, so a skipped probe still finds a live pooled
-/// connection. Call gaps longer than this always probe; gaps inside it skip.
-pub(crate) const WARMUP_THROTTLE_WINDOW: Duration = Duration::from_secs(60);
 
 /// JSON-RPC request
 #[derive(Debug, Serialize)]
@@ -70,7 +64,7 @@ pub struct RpcClient {
     url: String,
     request_id: AtomicU64,
     request_seen: AtomicBool,
-    last_success: Mutex<Option<Instant>>,
+    warm: WarmState,
 }
 
 impl RpcClient {
@@ -79,7 +73,9 @@ impl RpcClient {
         crate::tls::ensure_provider();
         let client = Client::builder()
             .pool_max_idle_per_host(10)
-            .pool_idle_timeout(Duration::from_secs(300))
+            // Never evict an idle connection: the HTTP/2 pings below keep it
+            // alive and drop it if the peer stops answering.
+            .pool_idle_timeout(None)
             .timeout(Duration::from_secs(30))
             .tcp_nodelay(true)
             .tcp_keepalive(Duration::from_secs(15))
@@ -89,23 +85,25 @@ impl RpcClient {
             .build()
             .map_err(|e| WalletError::NetworkError(e.to_string()))?;
 
+        let url = url.into();
         Ok(Self {
             client,
-            url: url.into(),
+            warm: WarmState::for_url(&url),
+            url,
             request_id: AtomicU64::new(1),
             request_seen: AtomicBool::new(false),
-            last_success: Mutex::new(None),
         })
     }
 
     /// Create with custom client configuration
     pub fn with_client(client: Client, url: impl Into<String>) -> Self {
+        let url = url.into();
         Self {
             client,
-            url: url.into(),
+            warm: WarmState::for_url(&url),
+            url,
             request_id: AtomicU64::new(1),
             request_seen: AtomicBool::new(false),
-            last_success: Mutex::new(None),
         }
     }
 
@@ -118,6 +116,9 @@ impl RpcClient {
     ///
     /// This establishes TCP/TLS connections ahead of time, saving 5-20ms
     /// on subsequent requests. Use this before time-critical operations.
+    /// Sends nothing while this endpoint answered within the warmup window
+    /// (4 min for `https://`, 60 s otherwise) and no transport error has
+    /// been seen since.
     pub async fn warmup(&self) -> WalletResult<()> {
         if self.should_skip_warmup() {
             return Ok(());
@@ -157,19 +158,7 @@ impl RpcClient {
     }
 
     fn should_skip_warmup(&self) -> bool {
-        match *self.last_success.lock() {
-            Some(t) => Instant::now().saturating_duration_since(t) < WARMUP_THROTTLE_WINDOW,
-            None => false,
-        }
-    }
-
-    fn mark_last_success(&self) {
-        *self.last_success.lock() = Some(Instant::now());
-    }
-
-    #[cfg(test)]
-    fn expire_warmup_throttle(&self) {
-        *self.last_success.lock() = Some(expired_warmup_instant());
+        !self.warm.probe_due()
     }
 
     /// Execute a raw JSON-RPC request
@@ -191,6 +180,12 @@ impl RpcClient {
         // callers that log it verbatim, wrap it in `format!("{e}")`, or hand it
         // to per-endpoint telemetry. Sanitising downstream means one missed
         // call site is a leaked API key.
+        //
+        // Unless the whole answer arrives, the pooled connection may be gone and
+        // the next warmup must re-dial: a transport error, a body cut short, or
+        // a caller that drops this future (its own timeout, a lost race) each
+        // drop the armed guard.
+        let guard = self.warm.loss_guard();
         let response = self
             .client
             .post(&self.url)
@@ -203,6 +198,7 @@ impl RpcClient {
             .json()
             .await
             .map_err(|e| WalletError::RpcError(redact_urls(&e.to_string())))?;
+        guard.disarm();
 
         if let Some(error) = rpc_response.error {
             return Err(WalletError::RpcError(format_rpc_error(&error)));
@@ -216,7 +212,7 @@ impl RpcClient {
         // every call with a JSON-RPC error — or with neither result nor error —
         // is not warm in any useful sense, and marking it here would suppress
         // the next probe for a whole throttle window.
-        self.mark_last_success();
+        self.warm.mark_success();
         Ok(result)
     }
 
@@ -548,13 +544,6 @@ pub struct SendResult {
     pub per_endpoint_ms: Vec<(String, Result<u64, String>)>,
 }
 
-#[cfg(test)]
-pub(crate) fn expired_warmup_instant() -> Instant {
-    Instant::now()
-        .checked_sub(WARMUP_THROTTLE_WINDOW + Duration::from_millis(1))
-        .expect("monotonic clock origin is older than the warmup throttle window")
-}
-
 /// Host portion of an endpoint URL, for logs.
 ///
 /// RPC URLs carry API keys in the path or the query string, so the host is the
@@ -601,6 +590,7 @@ pub fn redact_urls(message: &str) -> String {
 }
 
 mod batch;
+pub(crate) use batch::normalized_url;
 pub use batch::DEFAULT_BROADCAST_SEND_TIMEOUT;
 
 #[cfg(test)]
@@ -962,7 +952,7 @@ mod tests {
         client.warmup().await.unwrap();
         assert_eq!(hits.load(Ordering::SeqCst), 1);
 
-        client.expire_warmup_throttle();
+        crate::warm::idle_for(crate::warm::HTTP_WARMUP_WINDOW).await;
         client.warmup().await.unwrap();
         assert_eq!(hits.load(Ordering::SeqCst), 2);
     }
