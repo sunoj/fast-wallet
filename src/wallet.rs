@@ -1688,6 +1688,9 @@ impl FastWallet {
     }
 
     /// Send a pre-signed transaction and return broadcast timing details.
+    ///
+    /// Nonce handling on error matches [`send_signed`](Self::send_signed); see
+    /// [`WalletError::is_definitive_rejection`].
     pub async fn send_signed_detailed(
         &self,
         tx: &Transaction,
