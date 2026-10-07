@@ -452,6 +452,7 @@ pub(crate) fn is_definitive_precheck_rejection(error: &WalletError) -> bool {
         "transaction type not supported",
     ];
     definitive.iter().any(|needle| message.contains(needle))
+        || crate::error::matches_fee_or_gas_precheck(&message)
 }
 
 /// Outcome of [`FastWallet::replace_stalled_nonce`].

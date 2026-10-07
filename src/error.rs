@@ -4,6 +4,7 @@
 use thiserror::Error;
 
 mod broadcast;
+pub(crate) use broadcast::matches_fee_or_gas_precheck;
 pub use broadcast::{BroadcastFailure, EndpointFailureClass, EndpointVerdict};
 
 /// Parse the authoritative next nonce from a recognized nonce-too-low error.
