@@ -51,11 +51,14 @@ const FORWARDER_TRANSPORT_PHRASES: &[&str] = &[
     "failsafe timeout policy exceeded",
     "upstreams exhausted",
 ];
-const NODE_REJECTION_PHRASES: &[&str] = &[
+// Shared with nonce recycling; other node rejections can still be ambiguous.
+const FEE_FLOOR_REJECTION_PHRASES: &[&str] = &[
     "max fee per gas less than block base fee",
     "fee cap less than block base fee",
     "max fee per gas too low",
     "gas price below minimum",
+];
+const NODE_REJECTION_PHRASES: &[&str] = &[
     "gas required exceeds allowance",
     "insufficient funds",
     "nonce",
@@ -64,10 +67,27 @@ const NODE_REJECTION_PHRASES: &[&str] = &[
     "known transaction",
 ];
 
+/// Match additional pre-check failures after the caller's ambiguous-message deny list.
+/// Input is lowercase; forwarder failures must not become definitive via a new match.
+pub(crate) fn matches_fee_or_gas_precheck(message: &str) -> bool {
+    if message.contains("post \"")
+        || FORWARDER_TRANSPORT_PHRASES
+            .iter()
+            .any(|needle| message.contains(needle))
+    {
+        return false;
+    }
+    ["intrinsic gas too low", "exceeds the configured cap"]
+        .iter()
+        .chain(FEE_FLOOR_REJECTION_PHRASES)
+        .any(|needle| message.contains(needle))
+}
+
 fn is_forwarder_transport_error(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
     if NODE_REJECTION_PHRASES
         .iter()
+        .chain(FEE_FLOOR_REJECTION_PHRASES)
         .any(|phrase| lower.contains(phrase))
     {
         return false;
@@ -190,7 +210,10 @@ mod tests {
 
     #[test]
     fn node_rejections_outrank_forwarder_phrases_in_the_same_error() {
-        for rejection in NODE_REJECTION_PHRASES {
+        for rejection in NODE_REJECTION_PHRASES
+            .iter()
+            .chain(FEE_FLOOR_REJECTION_PHRASES)
+        {
             for suffix in FORWARDER_TRANSPORT_PHRASES {
                 let error = WalletError::RpcError(format!(
                     "RPC error -32000: Post \"https://sequencer.test\": {rejection}; {suffix}"

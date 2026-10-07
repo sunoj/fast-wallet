@@ -11,6 +11,7 @@ Started at 0.2.1; earlier releases are recorded only in git tags and commit mess
 
 ### Fixed
 
+- Node fee-floor, intrinsic-gas-too-low, and configured fee-cap pre-check rejections now recycle nonces when every endpoint definitively rejects the transaction.
 - `send_signed` and `send_signed_detailed` now recycle the nonce when every endpoint
   definitively rejects the transaction during pre-check. Mixed, ambiguous, transport,
   and timeout errors retain the nonce and use the existing nonce recovery; rejection
