@@ -128,6 +128,7 @@ impl WalletError {
     /// A low verdict wins disagreements: pending sync avoids rewinding to a stale node's latest.
     pub(crate) fn nonce_sync_block(&self) -> Option<&'static str> {
         let text = match self {
+            Self::BroadcastRefused(_) => return None,
             Self::BroadcastFailed(failure) => failure
                 .endpoints
                 .iter()

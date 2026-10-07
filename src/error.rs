@@ -58,6 +58,9 @@ pub enum WalletError {
     #[error("{0}")]
     BroadcastFailed(BroadcastFailure),
 
+    #[error("Broadcast refused locally (never sent): {0}")]
+    BroadcastRefused(#[source] Box<WalletError>),
+
     #[error("Invalid private key: {0}")]
     InvalidPrivateKey(String),
 
@@ -139,7 +142,7 @@ impl WalletError {
         }
     }
 
-    /// True when every endpoint definitively rejected the transaction at pre-check.
+    /// True when broadcast was refused locally or every endpoint rejected at pre-check.
     ///
     /// This is the release policy of `send_signed` and `send_signed_detailed`: they
     /// call `release` on the nonce exactly when the error they return satisfies this.

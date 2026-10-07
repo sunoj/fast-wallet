@@ -403,7 +403,9 @@ const STALL_REPLACE_MIN_HEAD_AGE: Duration = Duration::from_secs(30);
 pub(crate) fn is_definitive_precheck_rejection(error: &WalletError) -> bool {
     match error {
         WalletError::InsufficientFunds | WalletError::GasLimitExceeded => return true,
-        WalletError::AllEndpointsRejectedDefinitively(_) => return true,
+        WalletError::AllEndpointsRejectedDefinitively(_) | WalletError::BroadcastRefused(_) => {
+            return true;
+        }
         WalletError::BroadcastFailed(failure) => {
             return !failure.endpoints.is_empty()
                 && failure.endpoints.iter().all(|verdict| {
@@ -1570,7 +1572,11 @@ impl FastWallet {
         );
     }
 
-    async fn broadcast_signed_hash(&self, tx: &Transaction) -> WalletResult<B256> {
+    async fn broadcast_signed_hash(
+        &self,
+        tx: &Transaction,
+        before_broadcast: impl FnOnce(&Transaction) -> WalletResult<()>,
+    ) -> WalletResult<B256> {
         let _permit = tokio::time::timeout(
             self.config.pending_acquire_timeout,
             self.pending_semaphore.acquire(),
@@ -1579,6 +1585,7 @@ impl FastWallet {
         .map_err(|_| WalletError::Timeout)?
         .map_err(|_| WalletError::RpcError("Semaphore closed".to_string()))?;
 
+        before_broadcast(tx).map_err(|error| WalletError::BroadcastRefused(Box::new(error)))?;
         let hex_tx = tx.to_hex();
         if let Some(batch_client) = &self.batch_client {
             batch_client.broadcast_transaction(&hex_tx).await
@@ -1603,8 +1610,8 @@ impl FastWallet {
         .map_err(|_| WalletError::RpcError("Semaphore closed".to_string()))?;
         let semaphore_wait_ms = semaphore_started.elapsed().as_millis() as u64;
 
+        before_broadcast(tx).map_err(|error| WalletError::BroadcastRefused(Box::new(error)))?;
         let hex_tx = tx.to_hex();
-        before_broadcast(tx)?;
         let result = if let Some(batch_client) = &self.batch_client {
             batch_client.broadcast_transaction_detailed(&hex_tx).await
         } else {
@@ -1635,7 +1642,12 @@ impl FastWallet {
         tx: &Transaction,
         error: &WalletError,
     ) {
-        if is_definitive_precheck_rejection(error) && ctx.release_rejected_broadcast() {
+        if matches!(error, WalletError::BroadcastRefused(_)) {
+            if ctx.release_rejected_broadcast() {
+                self.inflight_nonces
+                    .mark_released(tx.nonce(), "admission_refused");
+            }
+        } else if is_definitive_precheck_rejection(error) && ctx.release_rejected_broadcast() {
             self.inflight_nonces
                 .mark_released(tx.nonce(), "definitive_precheck_rejection");
         } else {
@@ -1659,19 +1671,65 @@ impl FastWallet {
     /// so send replacements through `replace_stalled_nonce`, not this method.
     pub async fn send_signed(&self, tx: &Transaction) -> WalletResult<B256> {
         self.record_broadcast_candidate(tx);
-        let result = self.broadcast_signed_hash(tx).await;
+        self.send_signed_inner(tx, |_| Ok(())).await
+    }
 
+    /// [`send_signed`](Self::send_signed) with an admission hook run before broadcast.
+    ///
+    /// `before_broadcast` runs after the pending-slot wait, while the permit is held,
+    /// and immediately before the raw bytes go to any endpoint. It is synchronous and
+    /// must be cheap and non-blocking. On `Err` nothing is sent, no broadcast candidate
+    /// is recorded, the nonce is released, and the call returns
+    /// [`WalletError::BroadcastRefused`] wrapping the hook's error, for which
+    /// [`WalletError::is_definitive_rejection`] is true.
+    ///
+    /// Guarded forms exist for `send`, `send_signed`, `send_signed_detailed`,
+    /// `send_with_preheat`, `send_with_preheat_detailed` and `replace_stalled_nonce`.
+    /// The convenience senders (`send_optimistic*`, `send_quick_liquidation`,
+    /// `send_eth`, `send_contract_call*`, `send_batch`) and the fee-bump rebroadcast
+    /// in `verify_broadcast` run no hook; sign and call a guarded form instead.
+    pub async fn send_signed_guarded(
+        &self,
+        tx: &Transaction,
+        before_broadcast: impl FnOnce(&Transaction) -> WalletResult<()>,
+    ) -> WalletResult<B256> {
+        self.send_signed_inner(tx, |tx| {
+            before_broadcast(tx)?;
+            self.record_broadcast_candidate(tx);
+            Ok(())
+        })
+        .await
+    }
+
+    async fn send_signed_inner(
+        &self,
+        tx: &Transaction,
+        before_broadcast: impl FnOnce(&Transaction) -> WalletResult<()>,
+    ) -> WalletResult<B256> {
+        let result = self.broadcast_signed_hash(tx, before_broadcast).await;
         match &result {
             Ok(tx_hash) => {
                 self.inflight_nonces
                     .mark_broadcast_accepted(tx.nonce(), *tx_hash);
             }
-            Err(e) if is_definitive_precheck_rejection(e) => {
+            Err(e) => self.handle_signed_broadcast_error(tx, e).await,
+        }
+        result
+    }
+
+    async fn handle_signed_broadcast_error(&self, tx: &Transaction, error: &WalletError) {
+        match error {
+            WalletError::BroadcastRefused(_) => {
+                self.nonce_manager.release(tx.nonce());
+                self.inflight_nonces
+                    .mark_released(tx.nonce(), "admission_refused");
+            }
+            e if is_definitive_precheck_rejection(e) => {
                 self.nonce_manager.release(tx.nonce());
                 self.inflight_nonces
                     .mark_released(tx.nonce(), "definitive_precheck_rejection");
             }
-            Err(e) => {
+            e => {
                 // Nonce-drift recovery. Both "too low" (we replayed an already-mined
                 // nonce) and "too high" (local counter skipped ahead of chain) indicate
                 // the local tracker has diverged from the chain, so force an RPC resync.
@@ -1685,8 +1743,6 @@ impl FastWallet {
                 self.recover_nonce_error(e).await;
             }
         }
-
-        result
     }
 
     /// Send a pre-signed transaction and return broadcast timing details.
@@ -1698,17 +1754,33 @@ impl FastWallet {
         tx: &Transaction,
         sign_ms: f64,
     ) -> WalletResult<SendResult> {
-        self.send_signed_detailed_guarded(tx, sign_ms, |_| Ok(()))
+        self.record_broadcast_candidate(tx);
+        self.send_signed_detailed_inner(tx, sign_ms, |_| Ok(()))
             .await
     }
 
+    /// [`send_signed_detailed`](Self::send_signed_detailed) with an admission hook;
+    /// hook contract as in [`send_signed_guarded`](Self::send_signed_guarded).
     pub async fn send_signed_detailed_guarded(
         &self,
         tx: &Transaction,
         sign_ms: f64,
         before_broadcast: impl FnOnce(&Transaction) -> WalletResult<()>,
     ) -> WalletResult<SendResult> {
-        self.record_broadcast_candidate(tx);
+        self.send_signed_detailed_inner(tx, sign_ms, |tx| {
+            before_broadcast(tx)?;
+            self.record_broadcast_candidate(tx);
+            Ok(())
+        })
+        .await
+    }
+
+    async fn send_signed_detailed_inner(
+        &self,
+        tx: &Transaction,
+        sign_ms: f64,
+        before_broadcast: impl FnOnce(&Transaction) -> WalletResult<()>,
+    ) -> WalletResult<SendResult> {
         let result = self
             .broadcast_signed_result(tx, sign_ms, before_broadcast)
             .await;
@@ -1718,14 +1790,7 @@ impl FastWallet {
                 self.inflight_nonces
                     .mark_broadcast_accepted(tx.nonce(), tx.hash());
             }
-            Err(e) if is_definitive_precheck_rejection(e) => {
-                self.nonce_manager.release(tx.nonce());
-                self.inflight_nonces
-                    .mark_released(tx.nonce(), "definitive_precheck_rejection");
-            }
-            Err(e) => {
-                self.recover_nonce_error(e).await;
-            }
+            Err(e) => self.handle_signed_broadcast_error(tx, e).await,
         }
 
         result
@@ -1906,6 +1971,10 @@ impl FastWallet {
             .await
     }
 
+    /// [`replace_stalled_nonce`](Self::replace_stalled_nonce) with an admission hook
+    /// run on the signed cancel before it is broadcast. The cancel reserves no nonce,
+    /// so a refusal returns [`WalletError::BroadcastRefused`] and leaves the stalled
+    /// nonce, the fee ledger and the replace idempotency window untouched.
     pub async fn replace_stalled_nonce_guarded(
         &self,
         chain_next: u64,
@@ -1990,9 +2059,8 @@ impl FastWallet {
         request.chain_id = self.config.chain_id;
         let tx = request.build_and_sign(&self.signer)?;
         let tx_hash = tx.hash();
+        before_broadcast(&tx).map_err(|error| WalletError::BroadcastRefused(Box::new(error)))?;
         let hex_tx = tx.to_hex();
-
-        before_broadcast(&tx)?;
         let result = if let Some(batch_client) = &self.batch_client {
             batch_client.broadcast_transaction(&hex_tx).await
         } else {
@@ -2031,15 +2099,38 @@ impl FastWallet {
         self.send_signed(&tx).await
     }
 
+    /// [`send`](Self::send) with an admission hook; hook contract as in
+    /// [`send_signed_guarded`](Self::send_signed_guarded).
+    pub async fn send_guarded(
+        &self,
+        request: TransactionRequest,
+        before_broadcast: impl FnOnce(&Transaction) -> WalletResult<()>,
+    ) -> WalletResult<B256> {
+        let tx = self.sign(request)?;
+        self.send_signed_guarded(&tx, before_broadcast).await
+    }
+
     /// Sign and send using preheated context
     pub async fn send_with_preheat(
         &self,
         ctx: &PreheatedContext,
         request: TransactionRequest,
     ) -> WalletResult<B256> {
+        self.send_with_preheat_guarded(ctx, request, |_| Ok(()))
+            .await
+    }
+
+    /// [`send_with_preheat`](Self::send_with_preheat) with an admission hook; hook
+    /// contract as in [`send_signed_guarded`](Self::send_signed_guarded).
+    pub async fn send_with_preheat_guarded(
+        &self,
+        ctx: &PreheatedContext,
+        request: TransactionRequest,
+        before_broadcast: impl FnOnce(&Transaction) -> WalletResult<()>,
+    ) -> WalletResult<B256> {
         let tx = self.sign_with_preheat(ctx, request)?;
         ctx.mark_broadcasting()?;
-        let result = self.broadcast_signed_hash(&tx).await;
+        let result = self.broadcast_signed_hash(&tx, before_broadcast).await;
         match &result {
             Ok(tx_hash) => {
                 ctx.commit_reservation();
@@ -2063,6 +2154,9 @@ impl FastWallet {
             .await
     }
 
+    /// [`send_with_preheat_detailed`](Self::send_with_preheat_detailed) with an
+    /// admission hook; hook contract as in
+    /// [`send_signed_guarded`](Self::send_signed_guarded).
     pub async fn send_with_preheat_detailed_guarded(
         &self,
         ctx: &PreheatedContext,
@@ -2180,20 +2274,7 @@ impl FastWallet {
             .gas_limit(gas_limit)
             .gas_price(gas_price);
 
-        let tx = self.sign_with_preheat(ctx, request)?;
-        ctx.mark_broadcasting()?;
-        let result = self.broadcast_signed_hash(&tx).await;
-        match &result {
-            Ok(tx_hash) => {
-                ctx.commit_reservation();
-                self.inflight_nonces
-                    .mark_broadcast_accepted(tx.nonce(), *tx_hash);
-            }
-            Err(error) => {
-                self.handle_preheat_broadcast_error(ctx, &tx, error).await;
-            }
-        }
-        result
+        self.send_with_preheat(ctx, request).await
     }
 
     /// Quick liquidation with minimal parameters (uses config defaults)
@@ -2677,6 +2758,7 @@ impl FastWalletBuilder {
 mod tests {
     use super::*;
     include!("wallet_exclusive_send_tests.rs");
+    include!("wallet_admission_tests.rs");
 
     const TEST_PRIVATE_KEY: &str =
         "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
@@ -3697,6 +3779,9 @@ mod tests {
             .build_with_nonce(50)
             .unwrap();
         wallet.sign(test_request()).unwrap();
+        wallet
+            .inflight_nonces
+            .backdate_first_seen_for_tests(50, Duration::from_secs(60));
         let before = wallet.lowest_unresolved_inflight(50).unwrap();
         let result = wallet
             .replace_stalled_nonce_guarded(50, 0, |tx| {
@@ -3705,15 +3790,10 @@ mod tests {
                     panic!("cancel must use EIP-1559");
                 };
                 assert_eq!(cancel.gas_limit, 21_000);
-                Err(WalletError::NonceError(
-                    "DAILY_GAS_LOSS_LIMIT:cancel".into(),
-                ))
+                Err(WalletError::NonceError("cancel refused".into()))
             })
             .await;
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("DAILY_GAS_LOSS_LIMIT:cancel"));
+        assert!(result.unwrap_err().to_string().contains("cancel refused"));
         assert!(sent.lock().is_empty());
         assert_eq!(wallet.current_nonce(), 51);
         let after = wallet.lowest_unresolved_inflight(50).unwrap();
@@ -3731,13 +3811,10 @@ mod tests {
         let ctx = wallet.preheat(true).await.unwrap();
         let result = wallet
             .send_with_preheat_detailed_guarded(&ctx, test_request(), |_| {
-                Err(WalletError::NonceError("GAS_BREAKER_LANE:executor".into()))
+                Err(WalletError::NonceError("send refused".into()))
             })
             .await;
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("GAS_BREAKER_LANE:executor"));
+        assert!(result.unwrap_err().to_string().contains("send refused"));
         assert!(sent.lock().is_empty());
         assert!(wallet.lowest_unresolved_inflight(50).is_none());
         drop(ctx);
@@ -3763,9 +3840,7 @@ mod tests {
         let mut send = Box::pin(wallet.send_signed_detailed_guarded(&tx, 0.0, |_| {
             checked.store(true, Ordering::Relaxed);
             if paused.load(Ordering::Relaxed) {
-                Err(WalletError::NonceError(
-                    "GAS_REVERT_STREAK:lane:dpcp".into(),
-                ))
+                Err(WalletError::NonceError("send paused".into()))
             } else {
                 Ok(())
             }
@@ -3776,11 +3851,7 @@ mod tests {
         assert!(!checked.load(Ordering::Relaxed));
         paused.store(true, Ordering::Relaxed);
         drop(permit);
-        assert!(send
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("GAS_REVERT_STREAK"));
+        assert!(send.await.unwrap_err().to_string().contains("send paused"));
         assert!(checked.load(Ordering::Relaxed));
         assert!(sent.lock().is_empty());
         assert_eq!(wallet.sign(test_request()).unwrap().nonce(), 50);
@@ -3794,6 +3865,9 @@ mod tests {
             .build_with_nonce(50)
             .unwrap();
         wallet.sign(test_request()).unwrap();
+        wallet
+            .inflight_nonces
+            .backdate_first_seen_for_tests(50, Duration::from_secs(60));
         let mut observed = None;
         let result = wallet
             .replace_stalled_nonce_guarded(50, 0, |tx| {
