@@ -138,6 +138,17 @@ impl WalletError {
             _ => None,
         }
     }
+
+    /// True when every endpoint definitively rejected the transaction at pre-check.
+    ///
+    /// `send_signed` and `send_signed_detailed` recycle the nonce exactly when the
+    /// error they return satisfies this. Otherwise the reservation is retained and
+    /// the caller must settle it (receipt poll or nonce reconciler). Use this
+    /// instead of matching variants: a single-endpoint send returns `RpcError`
+    /// text that may be definitive.
+    pub fn is_definitive_rejection(&self) -> bool {
+        crate::wallet::is_definitive_precheck_rejection(self)
+    }
 }
 
 #[cfg(test)]
