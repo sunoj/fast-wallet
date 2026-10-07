@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Started at 0.2.1; earlier releases are recorded only in git tags and commit messages.
 
+## [0.2.11] - 2026-10-07
+
+### Added
+
+- Admission hooks: `send_guarded`, `send_signed_guarded`, `send_signed_detailed_guarded`,
+  `send_with_preheat_guarded`, `send_with_preheat_detailed_guarded` and
+  `replace_stalled_nonce_guarded` take a synchronous `before_broadcast` hook that runs after
+  the pending-slot wait and immediately before the raw bytes go to any endpoint. The hook must
+  be cheap, non-blocking and must not panic (a panic leaves the nonce reserved). Unguarded
+  methods behave as before.
+- `WalletError::BroadcastRefused`, returned when the hook refuses; nothing was sent and
+  `is_definitive_rejection()` is true. `WalletError` is not `#[non_exhaustive]`, so this is a
+  source-breaking addition for exhaustive matches.
+
+### Changed
+
+- Release rule on refusal: a refused send or preheated send releases its nonce and marks the
+  ledger record `admission_refused`, unless the in-flight ledger holds an accepted broadcast at
+  that nonce (a replacement); then the nonce and its ledger record are left untouched. A refused
+  cancel from `replace_stalled_nonce_guarded` reserves no nonce and releases nothing; callers
+  must not release the stalled nonce on that error either.
+- The `verify_broadcast` fee-bump rebroadcast runs no hook and has no guarded equivalent: a
+  definitive endpoint rejection of a replacement sent through `send_signed*_guarded` still
+  recycles the nonce. Use `replace_stalled_nonce_guarded` for replacements.
+
 ## [0.2.10] - 2026-10-07
 
 ### Added
