@@ -1643,10 +1643,15 @@ impl FastWallet {
     /// Send a pre-signed transaction
     ///
     /// Uses a timeout when acquiring the pending transaction permit to avoid
-    /// blocking indefinitely when many transactions are in-flight. Once this
-    /// method is called, an error leaves the nonce for chain reconciliation:
-    /// a racing endpoint may have accepted the signed bytes without returning
-    /// a successful response.
+    /// blocking indefinitely when many transactions are in-flight. An all-definitive
+    /// pre-check rejection recycles the nonce; other errors retain it for chain
+    /// reconciliation because a racing endpoint may have accepted the signed bytes.
+    /// As with the preheated path, a concurrent nonce sync can make this release
+    /// stale: the tracker reuses the gap and nonce-too-low recovery resyncs.
+    /// This is narrower than the release-on-every-error policy in 0.2.6 and earlier.
+    /// Recycling assumes this is the nonce's first broadcast: a definitively rejected
+    /// replacement at a nonce whose original was accepted would recycle a live nonce,
+    /// so send replacements through `replace_stalled_nonce`, not this method.
     pub async fn send_signed(&self, tx: &Transaction) -> WalletResult<B256> {
         self.record_broadcast_candidate(tx);
         let result = self.broadcast_signed_hash(tx).await;
@@ -1655,6 +1660,11 @@ impl FastWallet {
             Ok(tx_hash) => {
                 self.inflight_nonces
                     .mark_broadcast_accepted(tx.nonce(), *tx_hash);
+            }
+            Err(e) if is_definitive_precheck_rejection(e) => {
+                self.nonce_manager.release(tx.nonce());
+                self.inflight_nonces
+                    .mark_released(tx.nonce(), "definitive_precheck_rejection");
             }
             Err(e) => {
                 // Nonce-drift recovery. Both "too low" (we replayed an already-mined
@@ -1687,6 +1697,11 @@ impl FastWallet {
             Ok(_) => {
                 self.inflight_nonces
                     .mark_broadcast_accepted(tx.nonce(), tx.hash());
+            }
+            Err(e) if is_definitive_precheck_rejection(e) => {
+                self.nonce_manager.release(tx.nonce());
+                self.inflight_nonces
+                    .mark_released(tx.nonce(), "definitive_precheck_rejection");
             }
             Err(e) => {
                 self.recover_nonce_error(e).await;
