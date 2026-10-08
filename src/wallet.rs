@@ -2689,37 +2689,7 @@ mod tests {
     use super::*;
     include!("wallet_exclusive_send_tests.rs");
 
-    #[test]
-    fn default_rpc_request_timeout_is_thirty_seconds() {
-        assert_eq!(
-            WalletConfig::default().rpc_request_timeout,
-            Duration::from_secs(30)
-        );
-    }
-
-    #[cfg(feature = "test-util")]
-    #[test]
-    fn ledger_clock_advance_is_per_wallet_and_covers_stall_window() {
-        let first = FastWalletBuilder::new(TEST_PRIVATE_KEY, "http://localhost:8545")
-            .build_with_nonce(0)
-            .unwrap();
-        let second = FastWalletBuilder::new(TEST_PRIVATE_KEY, "http://localhost:8545")
-            .build_with_nonce(0)
-            .unwrap();
-        first.sign(test_request()).unwrap();
-        second.sign(test_request()).unwrap();
-        *first.last_stall_replace.lock() = Some((0, first.inflight_nonces.ledger_now()));
-        first.advance_ledger_clock(Duration::from_secs(31));
-        assert!(first.lowest_unresolved_inflight(0).unwrap().age >= Duration::from_secs(30));
-        assert!(second.lowest_unresolved_inflight(0).unwrap().age < Duration::from_secs(30));
-        assert!(
-            first
-                .inflight_nonces
-                .ledger_now()
-                .saturating_duration_since(first.last_stall_replace.lock().unwrap().1)
-                >= STALL_REPLACE_WINDOW
-        );
-    }
+    include!("wallet_ledger_clock_tests.rs");
 
     const TEST_PRIVATE_KEY: &str =
         "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";

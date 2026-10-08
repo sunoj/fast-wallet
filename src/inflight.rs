@@ -127,7 +127,7 @@ impl InflightNonceLedger {
             record.first_seen = self
                 .ledger_now()
                 .checked_sub(age)
-                .unwrap_or_else(Instant::now);
+                .unwrap_or_else(|| self.ledger_now());
         }
     }
 
