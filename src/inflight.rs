@@ -96,9 +96,27 @@ impl InflightNonceRecord {
 #[derive(Debug, Default)]
 pub struct InflightNonceLedger {
     records: Mutex<BTreeMap<u64, InflightNonceRecord>>,
+    #[cfg(feature = "test-util")]
+    clock_offset: Mutex<Duration>,
 }
 
 impl InflightNonceLedger {
+    pub(crate) fn ledger_now(&self) -> Instant {
+        #[cfg(feature = "test-util")]
+        {
+            return Instant::now() + *self.clock_offset.lock();
+        }
+        #[cfg(not(feature = "test-util"))]
+        {
+            Instant::now()
+        }
+    }
+
+    #[cfg(feature = "test-util")]
+    pub(crate) fn advance_ledger_clock(&self, by: Duration) {
+        *self.clock_offset.lock() += by;
+    }
+
     /// Test-only: rewind a record's `first_seen` so age-gated paths
     /// (`replace_stalled_nonce`'s freshness guard) can be exercised without
     /// sleeping. `Instant` is not tokio-pausable, so tests backdate instead.
@@ -106,7 +124,10 @@ impl InflightNonceLedger {
     pub fn backdate_first_seen_for_tests(&self, nonce: u64, age: std::time::Duration) {
         let mut records = self.records.lock();
         if let Some(record) = records.get_mut(&nonce) {
-            record.first_seen = Instant::now().checked_sub(age).unwrap_or_else(Instant::now);
+            record.first_seen = self
+                .ledger_now()
+                .checked_sub(age)
+                .unwrap_or_else(Instant::now);
         }
     }
 
@@ -118,7 +139,7 @@ impl InflightNonceLedger {
         max_priority: Option<U256>,
     ) {
         let mut records = self.records.lock();
-        let now = Instant::now();
+        let now = self.ledger_now();
         records
             .entry(nonce)
             .and_modify(|record| {
@@ -166,7 +187,7 @@ impl InflightNonceLedger {
     pub fn mark_released(&self, nonce: u64, reason: impl Into<String>) {
         let reason = reason.into();
         let mut records = self.records.lock();
-        let now = Instant::now();
+        let now = self.ledger_now();
         records
             .entry(nonce)
             .and_modify(|record| {
@@ -184,7 +205,7 @@ impl InflightNonceLedger {
 
     pub fn mark_committed(&self, nonce: u64) {
         let mut records = self.records.lock();
-        let now = Instant::now();
+        let now = self.ledger_now();
         records
             .entry(nonce)
             .and_modify(|record| {
@@ -209,7 +230,7 @@ impl InflightNonceLedger {
 
     pub fn lowest_unresolved_at_or_above(&self, chain_next: u64) -> Option<InflightNonceSnapshot> {
         let records = self.records.lock();
-        let now = Instant::now();
+        let now = self.ledger_now();
         records
             .range(chain_next..)
             .find(|(_, record)| is_unresolved(record.status))
@@ -232,7 +253,7 @@ impl InflightNonceLedger {
         release_reason: Option<String>,
     ) {
         let mut records = self.records.lock();
-        let now = Instant::now();
+        let now = self.ledger_now();
         records
             .entry(nonce)
             .and_modify(|record| {

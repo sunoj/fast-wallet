@@ -70,13 +70,20 @@ pub struct RpcClient {
 impl RpcClient {
     /// Create a new RPC client with optimized settings
     pub fn new(url: impl Into<String>) -> WalletResult<Self> {
+        Self::with_request_timeout(url, Duration::from_secs(30))
+    }
+
+    pub(crate) fn with_request_timeout(
+        url: impl Into<String>,
+        request_timeout: Duration,
+    ) -> WalletResult<Self> {
         crate::tls::ensure_provider();
         let client = Client::builder()
             .pool_max_idle_per_host(10)
             // Never evict an idle connection: the HTTP/2 pings below keep it
             // alive and drop it if the peer stops answering.
             .pool_idle_timeout(None)
-            .timeout(Duration::from_secs(30))
+            .timeout(request_timeout)
             .tcp_nodelay(true)
             .tcp_keepalive(Duration::from_secs(15))
             .http2_keep_alive_interval(Duration::from_secs(10))

@@ -30,6 +30,7 @@ impl BatchRpcClient {
     pub(crate) fn sharing_primary(
         primary: &Arc<RpcClient>,
         urls: Vec<String>,
+        request_timeout: Duration,
     ) -> WalletResult<Self> {
         let mut clients: Vec<Arc<RpcClient>> = Vec::with_capacity(urls.len());
         for url in urls {
@@ -40,7 +41,10 @@ impl BatchRpcClient {
             if normalized_url(primary.url()) == key {
                 clients.push(primary.clone());
             } else {
-                clients.push(Arc::new(RpcClient::new(url)?));
+                clients.push(Arc::new(RpcClient::with_request_timeout(
+                    url,
+                    request_timeout,
+                )?));
             }
         }
         Ok(Self {

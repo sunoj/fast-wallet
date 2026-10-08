@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Started at 0.2.1; earlier releases are recorded only in git tags and commit messages.
 
+## [0.2.11] - 2026-10-08
+
+### Added
+
+- An opt-in `test-util` feature provides a per-wallet advanceable nonce-ledger clock
+  for age-gated recovery tests; normal wallet timing remains unchanged.
+- Configurable wallet RPC request timeout, defaulting to 30 seconds.
+
 ## [0.2.10] - 2026-10-07
 
 ### Added

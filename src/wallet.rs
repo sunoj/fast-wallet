@@ -52,6 +52,8 @@ pub struct WalletConfig {
     pub max_pending_txs: usize,
     /// Per-endpoint fan-out send bound; allows the forwarding nodes their ~5s verdict.
     pub broadcast_send_timeout: Duration,
+    /// Per-request HTTP timeout for wallet RPC clients.
+    pub rpc_request_timeout: Duration,
     /// Transaction confirmation timeout
     pub confirmation_timeout: Duration,
     /// Poll interval for receipt checking
@@ -99,6 +101,7 @@ impl std::fmt::Debug for WalletConfig {
             .field("default_gas_limit", &self.default_gas_limit)
             .field("max_pending_txs", &self.max_pending_txs)
             .field("broadcast_send_timeout", &self.broadcast_send_timeout)
+            .field("rpc_request_timeout", &self.rpc_request_timeout)
             .field("confirmation_timeout", &self.confirmation_timeout)
             .field("poll_interval", &self.poll_interval)
             .field("use_eip1559", &self.use_eip1559)
@@ -149,6 +152,7 @@ impl Default for WalletConfig {
             default_gas_limit: 21000,
             max_pending_txs: 100,
             broadcast_send_timeout: crate::rpc::DEFAULT_BROADCAST_SEND_TIMEOUT,
+            rpc_request_timeout: Duration::from_secs(30),
             confirmation_timeout: Duration::from_secs(120),
             poll_interval: Duration::from_millis(500),
             use_eip1559: true,
@@ -541,7 +545,10 @@ impl FastWallet {
     /// This will fetch the initial nonce from the chain.
     pub async fn new(private_key: &str, rpc_url: &str, config: WalletConfig) -> WalletResult<Self> {
         let signer = FastSigner::from_hex(private_key)?;
-        let rpc_client = Arc::new(RpcClient::new(rpc_url)?);
+        let rpc_client = Arc::new(RpcClient::with_request_timeout(
+            rpc_url,
+            config.rpc_request_timeout,
+        )?);
 
         // Fetch initial nonce
         let initial_nonce = rpc_client.get_nonce(signer.address()).await?;
@@ -578,8 +585,12 @@ impl FastWallet {
             let mut all_rpcs = vec![primary_rpc.to_string()];
             all_rpcs.extend(broadcast_rpcs);
             wallet.batch_client = Some(Arc::new(
-                BatchRpcClient::sharing_primary(&wallet.rpc_client, all_rpcs)?
-                    .with_send_timeout(wallet.config.broadcast_send_timeout),
+                BatchRpcClient::sharing_primary(
+                    &wallet.rpc_client,
+                    all_rpcs,
+                    wallet.config.rpc_request_timeout,
+                )?
+                .with_send_timeout(wallet.config.broadcast_send_timeout),
             ));
         }
 
@@ -594,7 +605,10 @@ impl FastWallet {
         config: WalletConfig,
     ) -> WalletResult<Self> {
         let signer = FastSigner::from_hex(private_key)?;
-        let rpc_client = Arc::new(RpcClient::new(rpc_url)?);
+        let rpc_client = Arc::new(RpcClient::with_request_timeout(
+            rpc_url,
+            config.rpc_request_timeout,
+        )?);
         let nonce_manager = SingleAddressNonceManager::new(signer.address(), initial_nonce);
 
         Ok(Self {
@@ -693,13 +707,22 @@ impl FastWallet {
             .find(|c| normalized_url(c.url()) == key)
         {
             Some(client) => Ok(client.clone()),
-            None => Ok(Arc::new(RpcClient::new(url)?)),
+            None => Ok(Arc::new(RpcClient::with_request_timeout(
+                url,
+                self.config.rpc_request_timeout,
+            )?)),
         }
     }
 
     /// Get config reference
     pub fn config(&self) -> &WalletConfig {
         &self.config
+    }
+
+    /// Advance only this wallet's nonce-ledger and stall-replacement clock.
+    #[cfg(feature = "test-util")]
+    pub fn advance_ledger_clock(&self, by: Duration) {
+        self.inflight_nonces.advance_ledger_clock(by);
     }
 
     // ==================== Self Check / Status ====================
@@ -1890,7 +1913,13 @@ impl FastWallet {
     ) -> WalletResult<ReplaceOutcome> {
         // Idempotency: skip a repeat replacement of the same nonce within the window.
         if let Some((nonce, at)) = *self.last_stall_replace.lock() {
-            if nonce == chain_next && at.elapsed() < STALL_REPLACE_WINDOW {
+            if nonce == chain_next
+                && self
+                    .inflight_nonces
+                    .ledger_now()
+                    .saturating_duration_since(at)
+                    < STALL_REPLACE_WINDOW
+            {
                 return Ok(ReplaceOutcome::NotStalled);
             }
         }
@@ -1981,7 +2010,8 @@ impl FastWallet {
                     .record_signed(chain_next, tx_hash, Some(max_fee), Some(tip));
                 self.inflight_nonces
                     .mark_rebroadcast_accepted(chain_next, tx_hash);
-                *self.last_stall_replace.lock() = Some((chain_next, Instant::now()));
+                *self.last_stall_replace.lock() =
+                    Some((chain_next, self.inflight_nonces.ledger_now()));
                 tracing::warn!(
                     nonce = chain_next,
                     %tx_hash,
@@ -2491,6 +2521,12 @@ impl FastWalletBuilder {
         self
     }
 
+    /// Set the HTTP request timeout for all wallet RPC endpoints.
+    pub fn rpc_request_timeout(mut self, timeout: Duration) -> Self {
+        self.config.rpc_request_timeout = timeout;
+        self
+    }
+
     /// Set receipt polling interval
     pub fn poll_interval(mut self, interval: Duration) -> Self {
         self.config.poll_interval = interval;
@@ -2577,8 +2613,12 @@ impl FastWalletBuilder {
                     self.exclusive_broadcast,
                 );
                 wallet.batch_client = Some(Arc::new(
-                    BatchRpcClient::sharing_primary(&wallet.rpc_client, all_rpcs)?
-                        .with_send_timeout(wallet.config.broadcast_send_timeout),
+                    BatchRpcClient::sharing_primary(
+                        &wallet.rpc_client,
+                        all_rpcs,
+                        wallet.config.rpc_request_timeout,
+                    )?
+                    .with_send_timeout(wallet.config.broadcast_send_timeout),
                 ));
             }
             wallet
@@ -2591,8 +2631,12 @@ impl FastWalletBuilder {
                 self.exclusive_broadcast,
             );
             wallet.batch_client = Some(Arc::new(
-                BatchRpcClient::sharing_primary(&wallet.rpc_client, all_rpcs)?
-                    .with_send_timeout(wallet.config.broadcast_send_timeout),
+                BatchRpcClient::sharing_primary(
+                    &wallet.rpc_client,
+                    all_rpcs,
+                    wallet.config.rpc_request_timeout,
+                )?
+                .with_send_timeout(wallet.config.broadcast_send_timeout),
             ));
             wallet
         } else {
@@ -2623,8 +2667,12 @@ impl FastWalletBuilder {
                 self.exclusive_broadcast,
             );
             wallet.batch_client = Some(Arc::new(
-                BatchRpcClient::sharing_primary(&wallet.rpc_client, all_rpcs)?
-                    .with_send_timeout(wallet.config.broadcast_send_timeout),
+                BatchRpcClient::sharing_primary(
+                    &wallet.rpc_client,
+                    all_rpcs,
+                    wallet.config.rpc_request_timeout,
+                )?
+                .with_send_timeout(wallet.config.broadcast_send_timeout),
             ));
         }
 
@@ -2640,6 +2688,38 @@ impl FastWalletBuilder {
 mod tests {
     use super::*;
     include!("wallet_exclusive_send_tests.rs");
+
+    #[test]
+    fn default_rpc_request_timeout_is_thirty_seconds() {
+        assert_eq!(
+            WalletConfig::default().rpc_request_timeout,
+            Duration::from_secs(30)
+        );
+    }
+
+    #[cfg(feature = "test-util")]
+    #[test]
+    fn ledger_clock_advance_is_per_wallet_and_covers_stall_window() {
+        let first = FastWalletBuilder::new(TEST_PRIVATE_KEY, "http://localhost:8545")
+            .build_with_nonce(0)
+            .unwrap();
+        let second = FastWalletBuilder::new(TEST_PRIVATE_KEY, "http://localhost:8545")
+            .build_with_nonce(0)
+            .unwrap();
+        first.sign(test_request()).unwrap();
+        second.sign(test_request()).unwrap();
+        *first.last_stall_replace.lock() = Some((0, first.inflight_nonces.ledger_now()));
+        first.advance_ledger_clock(Duration::from_secs(31));
+        assert!(first.lowest_unresolved_inflight(0).unwrap().age >= Duration::from_secs(30));
+        assert!(second.lowest_unresolved_inflight(0).unwrap().age < Duration::from_secs(30));
+        assert!(
+            first
+                .inflight_nonces
+                .ledger_now()
+                .saturating_duration_since(first.last_stall_replace.lock().unwrap().1)
+                >= STALL_REPLACE_WINDOW
+        );
+    }
 
     const TEST_PRIVATE_KEY: &str =
         "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
