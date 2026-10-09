@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Started at 0.2.1; earlier releases are recorded only in git tags and commit messages.
 
+## [0.2.12] - 2026-10-09
+
+### Fixed
+
+- `RpcClient::wait_for_receipt` (and so `FastWallet::wait_for_confirmation`) no longer ends
+  the wait on the first receipt-fetch error. A garbled body, connection reset or HTTP error
+  is logged at WARN and polling continues; the last error is returned only after
+  `MAX_CONSECUTIVE_RECEIPT_ERRORS` (3) consecutive failures, and any successful poll resets
+  the count. The overall timeout still returns `WalletError::Timeout`.
+
 ## [0.2.11] - 2026-10-08
 
 ### Added

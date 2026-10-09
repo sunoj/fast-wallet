@@ -17,6 +17,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// Consecutive receipt-fetch errors `wait_for_receipt` tolerates before it
+/// returns the last one. A garbled body, reset or 5xx is usually transient,
+/// but a dead endpoint must still fail well before the confirmation timeout.
+pub const MAX_CONSECUTIVE_RECEIPT_ERRORS: u32 = 3;
+
 /// JSON-RPC request
 #[derive(Debug, Serialize)]
 struct RpcRequest<'a> {
@@ -385,6 +390,11 @@ impl RpcClient {
     }
 
     /// Wait for transaction receipt with timeout
+    ///
+    /// A receipt-fetch error does not end the wait: it is logged and polling
+    /// continues, up to [`MAX_CONSECUTIVE_RECEIPT_ERRORS`] in a row, after which
+    /// the last error is returned. Any successful poll resets the count. The
+    /// overall `timeout` still returns [`WalletError::Timeout`].
     pub async fn wait_for_receipt(
         &self,
         tx_hash: B256,
@@ -392,14 +402,28 @@ impl RpcClient {
         poll_interval: Duration,
     ) -> WalletResult<Value> {
         let start = std::time::Instant::now();
+        let mut consecutive_errors = 0;
 
         loop {
             if start.elapsed() > timeout {
                 return Err(WalletError::Timeout);
             }
 
-            if let Some(receipt) = self.get_transaction_receipt(tx_hash).await? {
-                return Ok(receipt);
+            match self.get_transaction_receipt(tx_hash).await {
+                Ok(Some(receipt)) => return Ok(receipt),
+                Ok(None) => consecutive_errors = 0,
+                Err(error) => {
+                    consecutive_errors += 1;
+                    if consecutive_errors >= MAX_CONSECUTIVE_RECEIPT_ERRORS {
+                        return Err(error);
+                    }
+                    tracing::warn!(
+                        tx_hash = %tx_hash,
+                        error = %error,
+                        consecutive_errors,
+                        "receipt poll failed; retrying"
+                    );
+                }
             }
 
             tokio::time::sleep(poll_interval).await;
