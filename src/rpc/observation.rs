@@ -13,6 +13,7 @@ pub type EndpointObserver = Arc<dyn Fn(EndpointObservation) + Send + Sync>;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct EndpointObservation {
+    #[serde(serialize_with = "serialize_hash")]
     pub tx_hash: B256,
     /// Index in the deduplicated configured route list; not upstream identity.
     pub endpoint_id: usize,
@@ -23,6 +24,10 @@ pub struct EndpointObservation {
     pub completed_utc_ms: Option<u64>,
     pub elapsed_us: Option<u64>,
     pub connection_reused: Option<bool>,
+}
+
+fn serialize_hash<S: serde::Serializer>(hash: &B256, serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(&format!("{hash:#x}"))
 }
 
 pub(super) struct Observation {
