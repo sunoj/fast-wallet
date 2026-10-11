@@ -180,11 +180,11 @@ impl BatchRpcClient {
                             endpoint_id: index,
                             is_first_result: None,
                             phase: "first_success",
-                            result: "rpc_ack",
+                            result: "client_success",
                             started_utc_ms: None,
                             completed_utc_ms: observation::utc_ms(),
                             elapsed_us: Some(fanout_started.elapsed().as_micros() as u64),
-                            connection_reused: Some(reused),
+                            connection_reuse_hint: Some(reused),
                         },
                     );
                     log_remaining(remaining, hash);

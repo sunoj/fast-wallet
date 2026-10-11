@@ -8,7 +8,14 @@ use tokio::{
     net::TcpListener,
 };
 
+const RETURNED_HASH: &str = "0x1111111111111111111111111111111111111111111111111111111111111111";
+const HASH_BODY: &str = r#"{"jsonrpc":"2.0","id":1,"result":"0x1111111111111111111111111111111111111111111111111111111111111111"}"#;
+
 async fn server(delay: u64, error: bool) -> String {
+    response_server(delay, error, HASH_BODY).await
+}
+
+async fn response_server(delay: u64, error: bool, success_body: &'static str) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -24,7 +31,7 @@ async fn server(delay: u64, error: bool) -> String {
                 let body = if error && !fast {
                     r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"node error with secret"}}"#
                 } else {
-                    r#"{"jsonrpc":"2.0","id":1,"result":"0x1111111111111111111111111111111111111111111111111111111111111111"}"#
+                    success_body
                 };
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -128,7 +135,64 @@ async fn detached_ack_retains_its_own_completion_and_hash() {
         .iter()
         .find(|r| r.phase == "detached_completion")
         .unwrap();
-    assert_eq!(late.result, "rpc_ack");
+    assert_eq!(late.result, "client_success");
     assert_eq!(late.tx_hash, alloy::primitives::keccak256([1]));
     assert_eq!(late.is_first_result, Some(false));
+}
+
+async fn assert_client_success(body: &'static str, expected_hash: &str) {
+    let url = response_server(1, false, body).await;
+    let client = BatchRpcClient::new(vec![url]).unwrap();
+    let rows = observe(&client);
+    let result = client.broadcast_transaction_detailed("0x01").await.unwrap();
+    assert_eq!(result.tx_hash, expected_hash);
+    assert_eq!(result.first_success_endpoint_index, 0);
+    assert_eq!(result.failed_endpoints, 0);
+    assert!(!result.connection_reused);
+    let rows = rows.lock().unwrap();
+    assert_eq!(rows.len(), 3);
+    for phase in ["completion_before_return", "first_success"] {
+        let row = rows.iter().find(|row| row.phase == phase).unwrap();
+        assert_eq!(row.result, "client_success");
+        assert_eq!(row.tx_hash, alloy::primitives::keccak256([1]));
+    }
+}
+
+#[tokio::test]
+async fn returned_hash_keeps_send_result_and_client_success_label() {
+    assert_client_success(HASH_BODY, RETURNED_HASH).await;
+}
+
+#[tokio::test]
+async fn null_result_keeps_local_hash_and_client_success_label() {
+    let local_hash = format!("{:#x}", alloy::primitives::keccak256([1]));
+    assert_client_success(r#"{"jsonrpc":"2.0","id":1,"result":null}"#, &local_hash).await;
+}
+
+#[tokio::test]
+async fn missing_result_and_error_keeps_local_hash_and_client_success_label() {
+    let local_hash = format!("{:#x}", alloy::primitives::keccak256([1]));
+    assert_client_success(r#"{"jsonrpc":"2.0","id":1}"#, &local_hash).await;
+}
+
+#[tokio::test]
+async fn closed_connections_report_only_a_passive_reuse_hint() {
+    let url = server(1, false).await;
+    let client = BatchRpcClient::new(vec![url]).unwrap();
+    let rows = observe(&client);
+    for expected_hint in [false, true] {
+        let result = client.broadcast_transaction_detailed("0x01").await.unwrap();
+        assert_eq!(result.tx_hash, RETURNED_HASH);
+        assert_eq!(result.connection_reused, expected_hint);
+        let mut rows = rows.lock().unwrap();
+        assert_eq!(rows.len(), 3);
+        for row in rows.iter() {
+            let serialized = serde_json::to_value(row).unwrap();
+            assert!(serialized.get("connection_reused").is_none());
+            assert!(serialized.get("connection_reuse_hint").is_some());
+            let hint = (row.phase != "dispatch").then_some(expected_hint);
+            assert_eq!(serialized["connection_reuse_hint"], serde_json::json!(hint));
+        }
+        rows.clear();
+    }
 }

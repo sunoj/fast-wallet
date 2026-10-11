@@ -23,7 +23,8 @@ pub struct EndpointObservation {
     pub started_utc_ms: Option<u64>,
     pub completed_utc_ms: Option<u64>,
     pub elapsed_us: Option<u64>,
-    pub connection_reused: Option<bool>,
+    /// Passive prior-request hint; does not establish actual transport reuse.
+    pub connection_reuse_hint: Option<bool>,
 }
 
 fn serialize_hash<S: serde::Serializer>(hash: &B256, serializer: S) -> Result<S::Ok, S::Error> {
@@ -71,7 +72,7 @@ impl Observation {
             started_utc_ms: utc_ms(),
             completed_utc_ms: None,
             elapsed_us: None,
-            connection_reused: None,
+            connection_reuse_hint: None,
         };
         emit(&sink, row.clone());
         Self {
@@ -91,7 +92,7 @@ impl Observation {
             "completion_before_return"
         };
         self.row.result = match result {
-            Ok(_) => "rpc_ack",
+            Ok(_) => "client_success",
             Err(WalletError::Timeout | WalletError::SendTimeout { .. }) => "timeout_uncertain",
             Err(WalletError::NetworkError(_)) => "transport_uncertain",
             Err(WalletError::RpcError(_)) => "rpc_error",
@@ -99,7 +100,7 @@ impl Observation {
         };
         self.row.completed_utc_ms = utc_ms();
         self.row.elapsed_us = Some(self.started.elapsed().as_micros() as u64);
-        self.row.connection_reused = result.as_ref().ok().map(|(_, reused)| *reused);
+        self.row.connection_reuse_hint = result.as_ref().ok().map(|(_, reused)| *reused);
         emit(&self.sink, self.row);
     }
 }
