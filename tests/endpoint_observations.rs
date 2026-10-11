@@ -53,10 +53,22 @@ async fn duplicate_host_paths_keep_ids_first_ack_and_detached_error() {
     assert_eq!(result.first_success_endpoint_index, 1);
     tokio::time::sleep(Duration::from_millis(120)).await;
     let rows = rows.lock().unwrap();
-    assert_eq!(rows.iter().filter(|r| r.phase == "dispatch").count(), 2);
+    let mut ids: Vec<_> = rows
+        .iter()
+        .filter(|r| r.phase == "dispatch")
+        .map(|r| r.endpoint_id)
+        .collect();
+    ids.sort_unstable();
+    assert_eq!(ids, vec![0, 1]);
     assert!(rows
         .iter()
         .any(|r| r.phase == "first_success" && r.endpoint_id == 1));
+    assert_eq!(
+        rows.iter()
+            .filter(|r| r.is_first_result == Some(true))
+            .count(),
+        1
+    );
     let late = rows
         .iter()
         .find(|r| r.phase == "detached_completion")
@@ -101,4 +113,22 @@ async fn failed_observer_does_not_change_successful_send() {
     let client = BatchRpcClient::new(vec![url]).unwrap();
     client.set_observer(Arc::new(|_| panic!("broken telemetry consumer")));
     assert!(client.broadcast_transaction_detailed("0x01").await.is_ok());
+}
+
+#[tokio::test]
+async fn detached_ack_retains_its_own_completion_and_hash() {
+    let url = server(60, false).await;
+    let client = BatchRpcClient::new(vec![format!("{url}/slow"), format!("{url}/fast")]).unwrap();
+    let rows = observe(&client);
+    let result = client.broadcast_transaction_detailed("0x01").await.unwrap();
+    assert_eq!(result.first_success_endpoint_index, 1);
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    let rows = rows.lock().unwrap();
+    let late = rows
+        .iter()
+        .find(|r| r.phase == "detached_completion")
+        .unwrap();
+    assert_eq!(late.result, "rpc_ack");
+    assert_eq!(late.tx_hash, alloy::primitives::keccak256([1]));
+    assert_eq!(late.is_first_result, Some(false));
 }

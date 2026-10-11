@@ -86,9 +86,13 @@ impl BatchRpcClient {
 
     /// Send transaction to all endpoints in parallel with first-success timing.
     pub async fn broadcast_transaction_detailed(&self, raw_tx: &str) -> WalletResult<SendResult> {
-        let hash = hex::decode(raw_tx.trim_start_matches("0x"))
-            .map(alloy::primitives::keccak256)
-            .unwrap_or_default();
+        let hash = if self.observer.get().is_some() {
+            hex::decode(raw_tx.trim_start_matches("0x"))
+                .map(alloy::primitives::keccak256)
+                .unwrap_or_default()
+        } else {
+            B256::ZERO
+        };
         self.broadcast_transaction_observed(raw_tx, hash).await
     }
 
@@ -104,6 +108,7 @@ impl BatchRpcClient {
 
         let fanout_started = Instant::now();
         let detached = Arc::new(AtomicBool::new(false));
+        let first_result = Arc::new(AtomicBool::new(false));
         let pending: Vec<_> = self
             .clients
             .iter()
@@ -115,10 +120,16 @@ impl BatchRpcClient {
                 let timeout = self.send_timeout;
                 let observer = self.observer.get().cloned();
                 let detached = detached.clone();
+                let first_result = first_result.clone();
                 async move {
                     let started = Instant::now();
-                    let observation =
-                        observation::Observation::start(observer, hash, endpoint_index, detached);
+                    let observation = observation::Observation::start(
+                        observer,
+                        hash,
+                        endpoint_index,
+                        detached,
+                        first_result,
+                    );
                     let result = match tokio::time::timeout(
                         timeout,
                         client.send_raw_transaction_with_connection_hint(&tx),
@@ -167,6 +178,7 @@ impl BatchRpcClient {
                         observation::EndpointObservation {
                             tx_hash,
                             endpoint_id: index,
+                            is_first_result: None,
                             phase: "first_success",
                             result: "rpc_ack",
                             started_utc_ms: None,

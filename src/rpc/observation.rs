@@ -16,6 +16,7 @@ pub struct EndpointObservation {
     pub tx_hash: B256,
     /// Index in the deduplicated configured route list; not upstream identity.
     pub endpoint_id: usize,
+    pub is_first_result: Option<bool>,
     pub phase: &'static str,
     pub result: &'static str,
     pub started_utc_ms: Option<u64>,
@@ -29,6 +30,7 @@ pub(super) struct Observation {
     row: EndpointObservation,
     started: Instant,
     detached: Arc<AtomicBool>,
+    first_result: Arc<AtomicBool>,
 }
 
 pub(super) fn utc_ms() -> Option<u64> {
@@ -53,10 +55,12 @@ impl Observation {
         tx_hash: B256,
         endpoint_id: usize,
         detached: Arc<AtomicBool>,
+        first_result: Arc<AtomicBool>,
     ) -> Self {
         let row = EndpointObservation {
             tx_hash,
             endpoint_id,
+            is_first_result: None,
             phase: "dispatch",
             result: "pending",
             started_utc_ms: utc_ms(),
@@ -70,10 +74,12 @@ impl Observation {
             row,
             started: Instant::now(),
             detached,
+            first_result,
         }
     }
 
     pub(super) fn finish(mut self, result: &WalletResult<(B256, bool)>) {
+        self.row.is_first_result = Some(!self.first_result.swap(true, Ordering::AcqRel));
         self.row.phase = if self.detached.load(Ordering::Acquire) {
             "detached_completion"
         } else {
