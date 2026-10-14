@@ -84,6 +84,9 @@ impl RpcClient {
     ) -> WalletResult<Self> {
         crate::tls::ensure_provider();
         let client = Client::builder()
+            // A redirect would resend the signed transaction to another URL, outside the
+            // configured (possibly exclusive, private) endpoint set.
+            .redirect(reqwest::redirect::Policy::none())
             .pool_max_idle_per_host(10)
             // Never evict an idle connection: the HTTP/2 pings below keep it
             // alive and drop it if the peer stops answering.

@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Started at 0.2.1; earlier releases are recorded only in git tags and commit messages.
 
+## [0.2.13] - 2026-10-14
+
+### Fixed
+
+- `RpcClient` (and so `BatchRpcClient` and every wallet broadcast) and `TransactionBroadcaster`
+  no longer follow HTTP redirects. reqwest's default policy followed up to ten, and a 307/308
+  resends the POST body: a send endpoint answering with a redirect forwarded the signed
+  transaction to the `Location` URL, outside the configured endpoint set, including an
+  exclusive (`broadcast_rpcs_exclusive`) private set. A redirect now surfaces as that
+  endpoint's failure. Regression: `tests/redirect_isolation.rs`.
+
 ## [0.2.12] - 2026-10-09
 
 ### Fixed
