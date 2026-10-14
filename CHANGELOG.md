@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Started at 0.2.1; earlier releases are recorded only in git tags and commit messages.
 
-## [0.2.13] - 2026-10-14
+## [0.3.0] - 2026-10-14
 
 ### Fixed
 
@@ -17,6 +17,12 @@ Started at 0.2.1; earlier releases are recorded only in git tags and commit mess
   transaction to the `Location` URL, outside the configured endpoint set, including an
   exclusive (`broadcast_rpcs_exclusive`) private set. A redirect now surfaces as that
   endpoint's failure. Regression: `tests/redirect_isolation.rs`.
+
+### Removed
+
+- `RpcClient::with_client`. It stored a caller-built `reqwest::Client` unchanged and used it for
+  signed sends, so a client with the default redirect policy reopened the leak above. It had no
+  callers in this crate.
 
 ## [0.2.12] - 2026-10-09
 

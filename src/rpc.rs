@@ -110,18 +110,6 @@ impl RpcClient {
         })
     }
 
-    /// Create with custom client configuration
-    pub fn with_client(client: Client, url: impl Into<String>) -> Self {
-        let url = url.into();
-        Self {
-            client,
-            warm: WarmState::for_url(&url),
-            url,
-            request_id: AtomicU64::new(1),
-            request_seen: AtomicBool::new(false),
-        }
-    }
-
     /// RPC endpoint URL.
     pub fn url(&self) -> &str {
         &self.url
