@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Started at 0.2.1; earlier releases are recorded only in git tags and commit messages.
 
+## [0.2.14] - 2026-10-14
+
+### Added
+
+- `FastWallet::set_endpoint_observer` (and `BatchRpcClient::set_observer`) installs an
+  optional, nonblocking `EndpointObserver` that receives one `EndpointObservation` per
+  endpoint attempt of a batch broadcast: endpoint index in the deduplicated route list,
+  phase, result, UTC start/finish, elapsed time, whether it was the first result, and a
+  passive connection-reuse hint. Observations carry no URLs, error bodies or signed bytes.
+  The observer can be set once; sends behave as before when none is set.
+
+### Fixed
+
+- The RPC benchmark initialises the RPC transport before its Anvil preflight and requires
+  chain 31337 before sending; it still skips when Anvil is absent.
+
 ## [0.2.13] - 2026-10-14
 
 ### Fixed
