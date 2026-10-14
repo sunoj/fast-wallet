@@ -541,7 +541,10 @@ fn parse_b256_hex(s: &str) -> WalletResult<B256> {
 }
 
 /// Batch RPC client for sending multiple requests in parallel
+pub mod observation;
+
 pub struct BatchRpcClient {
+    observer: std::sync::OnceLock<observation::EndpointObserver>,
     send_timeout: Duration,
     clients: Vec<Arc<RpcClient>>,
     current: AtomicU64,

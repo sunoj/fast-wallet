@@ -17,6 +17,7 @@ impl BatchRpcClient {
             .collect();
 
         Ok(Self {
+            observer: std::sync::OnceLock::new(),
             send_timeout: DEFAULT_BROADCAST_SEND_TIMEOUT,
             clients: clients?,
             current: AtomicU64::new(0),
@@ -48,6 +49,7 @@ impl BatchRpcClient {
             }
         }
         Ok(Self {
+            observer: std::sync::OnceLock::new(),
             send_timeout: DEFAULT_BROADCAST_SEND_TIMEOUT,
             clients,
             current: AtomicU64::new(0),
@@ -65,6 +67,11 @@ impl BatchRpcClient {
         self
     }
 
+    /// Install once at startup. The sink must be bounded and nonblocking.
+    pub fn set_observer(&self, observer: observation::EndpointObserver) -> bool {
+        self.observer.set(observer).is_ok()
+    }
+
     /// Get the next client (round-robin)
     pub fn next_client(&self) -> Arc<RpcClient> {
         let idx = self.current.fetch_add(1, Ordering::Relaxed) as usize;
@@ -79,11 +86,29 @@ impl BatchRpcClient {
 
     /// Send transaction to all endpoints in parallel with first-success timing.
     pub async fn broadcast_transaction_detailed(&self, raw_tx: &str) -> WalletResult<SendResult> {
+        let hash = if self.observer.get().is_some() {
+            hex::decode(raw_tx.trim_start_matches("0x"))
+                .map(alloy::primitives::keccak256)
+                .unwrap_or_default()
+        } else {
+            B256::ZERO
+        };
+        self.broadcast_transaction_observed(raw_tx, hash).await
+    }
+
+    /// Same send semantics, with the already-known signed hash for correlation.
+    pub async fn broadcast_transaction_observed(
+        &self,
+        raw_tx: &str,
+        hash: B256,
+    ) -> WalletResult<SendResult> {
         if self.clients.is_empty() {
             return Err(WalletError::RpcError("No RPC endpoints".to_string()));
         }
 
         let fanout_started = Instant::now();
+        let detached = Arc::new(AtomicBool::new(false));
+        let first_result = Arc::new(AtomicBool::new(false));
         let pending: Vec<_> = self
             .clients
             .iter()
@@ -93,8 +118,18 @@ impl BatchRpcClient {
                 let url = client.url().to_string();
                 let tx = raw_tx.to_string();
                 let timeout = self.send_timeout;
+                let observer = self.observer.get().cloned();
+                let detached = detached.clone();
+                let first_result = first_result.clone();
                 async move {
                     let started = Instant::now();
+                    let observation = observation::Observation::start(
+                        observer,
+                        hash,
+                        endpoint_index,
+                        detached,
+                        first_result,
+                    );
                     let result = match tokio::time::timeout(
                         timeout,
                         client.send_raw_transaction_with_connection_hint(&tx),
@@ -106,6 +141,7 @@ impl BatchRpcClient {
                             elapsed_ms: timeout.as_millis() as u64,
                         }),
                     };
+                    observation.finish(&result);
                     (
                         endpoint_index,
                         url,
@@ -117,13 +153,16 @@ impl BatchRpcClient {
             })
             .collect();
 
-        self.collect_broadcast(pending, fanout_started).await
+        self.collect_broadcast(pending, fanout_started, detached, hash)
+            .await
     }
 
     async fn collect_broadcast(
         &self,
         mut pending: Vec<EndpointFuture>,
         fanout_started: Instant,
+        detached: Arc<AtomicBool>,
+        tx_hash: B256,
     ) -> WalletResult<SendResult> {
         let mut failures = Vec::new();
         let mut slowest_endpoint_ms = 0;
@@ -133,6 +172,21 @@ impl BatchRpcClient {
             slowest_endpoint_ms = slowest_endpoint_ms.max(elapsed_ms);
             match result {
                 Ok((hash, reused)) => {
+                    detached.store(true, Ordering::Release);
+                    observation::emit(
+                        &self.observer.get().cloned(),
+                        observation::EndpointObservation {
+                            tx_hash,
+                            endpoint_id: index,
+                            is_first_result: None,
+                            phase: "first_success",
+                            result: "client_success",
+                            started_utc_ms: None,
+                            completed_utc_ms: observation::utc_ms(),
+                            elapsed_us: Some(fanout_started.elapsed().as_micros() as u64),
+                            connection_reuse_hint: Some(reused),
+                        },
+                    );
                     log_remaining(remaining, hash);
                     return Ok(success_result(
                         index,

@@ -15,7 +15,7 @@
 
 use alloy::primitives::{Address, U256};
 use criterion::{criterion_group, criterion_main, Criterion};
-use fast_wallet::{FastWalletBuilder, TransactionRequest};
+use fast_wallet::{rpc::RpcClient, FastWalletBuilder, TransactionRequest};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::runtime::Runtime;
@@ -24,22 +24,16 @@ const ANVIL_PRIVATE_KEY: &str =
     "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
 const ANVIL_RPC_URL: &str = "http://127.0.0.1:8545";
 
-/// Check if Anvil is running
+/// Initialize RPC transport and require the local Anvil chain before benchmarking.
 fn check_anvil(rt: &Runtime) -> bool {
     rt.block_on(async {
-        let client = reqwest::Client::new();
-        client
-            .post(ANVIL_RPC_URL)
-            .json(&serde_json::json!({
-                "jsonrpc": "2.0",
-                "method": "eth_chainId",
-                "params": [],
-                "id": 1
-            }))
-            .timeout(Duration::from_secs(1))
-            .send()
-            .await
-            .is_ok()
+        let Ok(client) = RpcClient::new(ANVIL_RPC_URL) else {
+            return false;
+        };
+        matches!(
+            tokio::time::timeout(Duration::from_secs(1), client.chain_id()).await,
+            Ok(Ok(31337))
+        )
     })
 }
 

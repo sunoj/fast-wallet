@@ -1544,6 +1544,11 @@ impl FastWallet {
         self.record_signed_or_release(nonce, request.build_and_sign(&self.signer))
     }
 
+    /// Install a bounded nonblocking batch-send observer; false means unsupported/already set.
+    pub fn set_endpoint_observer(&self, observer: crate::rpc::observation::EndpointObserver) -> bool {
+        self.batch_client.as_ref().is_some_and(|batch| batch.set_observer(observer))
+    }
+
     // ==================== Transaction Sending ====================
 
     fn record_signed_or_release(
@@ -1627,7 +1632,7 @@ impl FastWallet {
 
         let hex_tx = tx.to_hex();
         let result = if let Some(batch_client) = &self.batch_client {
-            batch_client.broadcast_transaction_detailed(&hex_tx).await
+            batch_client.broadcast_transaction_observed(&hex_tx, tx.hash()).await
         } else {
             self.rpc_client.send_raw_transaction_detailed(&hex_tx).await
         };
