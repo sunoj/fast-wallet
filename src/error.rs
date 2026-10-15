@@ -139,7 +139,8 @@ impl WalletError {
         }
     }
 
-    /// True when every endpoint definitively rejected the transaction at pre-check.
+    /// True when every endpoint definitively rejected the transaction at pre-check,
+    /// including `execution reverted` refusals with no ambiguous outcome.
     ///
     /// This is the release policy of `send_signed` and `send_signed_detailed`: they
     /// call `release` on the nonce exactly when the error they return satisfies this.

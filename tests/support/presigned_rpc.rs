@@ -18,6 +18,7 @@ pub const AMBIGUOUS: &str = "replacement transaction underpriced";
 
 pub enum Reply {
     Error(&'static str),
+    Revert,
     Disconnect,
     Accept,
 }
@@ -70,6 +71,8 @@ async fn serve(stream: TcpStream, sends: mpsc::UnboundedSender<oneshot::Sender<R
             match receiver.await {
                 Ok(Reply::Error(message)) => serde_json::json!({"jsonrpc":"2.0", "id":id,
                     "error":{"code":-32000, "message":message}}),
+                Ok(Reply::Revert) => serde_json::json!({"jsonrpc":"2.0", "id":id,
+                    "error":{"code":3, "message":"execution reverted", "data":"0x08c379a0…"}}),
                 Ok(Reply::Accept) => {
                     let raw = request["params"][0].as_str().unwrap();
                     serde_json::json!({"jsonrpc":"2.0", "id":id,

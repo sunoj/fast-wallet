@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Started at 0.2.1; earlier releases are recorded only in git tags and commit messages.
 
+## [Unreleased]
+
+### Changed
+
+- Sends now release their nonce when every broadcast endpoint refuses with
+  `execution reverted`, regardless of RPC error code or revert data. Mixed or
+  ambiguous outcomes still retain the nonce. Callers that release the nonce
+  themselves on a revert refusal must stop: `release` is not idempotent, and a
+  second release can hand the nonce out twice.
+
 ## [0.2.14] - 2026-10-14
 
 ### Added

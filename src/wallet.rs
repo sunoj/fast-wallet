@@ -446,6 +446,7 @@ pub(crate) fn is_definitive_precheck_rejection(error: &WalletError) -> bool {
     }
 
     let definitive = [
+        "execution reverted",
         "insufficient funds for gas",
         "insufficient funds",
         "exceeds block gas limit",
@@ -3276,6 +3277,42 @@ mod tests {
             1,
             "proxy 'malformed' noise is not a node pre-check rejection; must not recycle"
         );
+    }
+
+    #[test]
+    fn revert_refusal_classifier_preserves_ambiguity() {
+        use crate::error::{BroadcastFailure, EndpointFailureClass, EndpointVerdict};
+
+        let revert = "RPC error 3: execution reverted data=0x08c379a0…";
+        for message in [
+            revert,
+            "RPC error -32000: execution reverted",
+            "execution reverted",
+        ] {
+            assert!(is_definitive_precheck_rejection(&WalletError::RpcError(
+                message.into()
+            )));
+        }
+        assert!(!is_definitive_precheck_rejection(&WalletError::RpcError(
+            format!("{revert}: already known")
+        )));
+        let rejection = EndpointVerdict {
+            host: "rpc.test".into(),
+            error: revert.into(),
+            elapsed_ms: 0,
+            class: EndpointFailureClass::Rejection,
+        };
+        let transport = EndpointVerdict {
+            error: "timeout".into(),
+            class: EndpointFailureClass::Transport,
+            ..rejection.clone()
+        };
+        for (second, definitive) in [(transport, false), (rejection.clone(), true)] {
+            let error = WalletError::BroadcastFailed(BroadcastFailure {
+                endpoints: vec![rejection.clone(), second],
+            });
+            assert_eq!(is_definitive_precheck_rejection(&error), definitive);
+        }
     }
 
     #[test]
