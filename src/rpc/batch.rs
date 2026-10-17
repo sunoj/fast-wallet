@@ -130,18 +130,7 @@ impl BatchRpcClient {
                         detached,
                         first_result,
                     );
-                    let result = match tokio::time::timeout(
-                        timeout,
-                        client.send_raw_transaction_with_connection_hint(&tx),
-                    )
-                    .await
-                    {
-                        Ok(result) => result,
-                        Err(_) => Err(WalletError::SendTimeout {
-                            elapsed_ms: timeout.as_millis() as u64,
-                        }),
-                    };
-                    observation.finish(&result);
+                    let result = observation.send(&client, &tx, timeout).await;
                     (
                         endpoint_index,
                         url,
@@ -173,19 +162,12 @@ impl BatchRpcClient {
             match result {
                 Ok((hash, reused)) => {
                     detached.store(true, Ordering::Release);
-                    observation::emit(
-                        &self.observer.get().cloned(),
-                        observation::EndpointObservation {
-                            tx_hash,
-                            endpoint_id: index,
-                            is_first_result: None,
-                            phase: "first_success",
-                            result: "client_success",
-                            started_utc_ms: None,
-                            completed_utc_ms: observation::utc_ms(),
-                            elapsed_us: Some(fanout_started.elapsed().as_micros() as u64),
-                            connection_reuse_hint: Some(reused),
-                        },
+                    observation::first_success(
+                        self.observer.get().cloned(),
+                        tx_hash,
+                        index,
+                        reused,
+                        fanout_started,
                     );
                     log_remaining(remaining, hash);
                     return Ok(success_result(

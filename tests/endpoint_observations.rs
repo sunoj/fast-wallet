@@ -9,7 +9,10 @@ use tokio::{
 };
 
 const RETURNED_HASH: &str = "0x1111111111111111111111111111111111111111111111111111111111111111";
-const HASH_BODY: &str = r#"{"jsonrpc":"2.0","id":1,"result":"0x1111111111111111111111111111111111111111111111111111111111111111"}"#;
+const HASH_BODY: &str = concat!(
+    r#"{"jsonrpc":"2.0","id":1,"result":"0x"#,
+    r#"1111111111111111111111111111111111111111111111111111111111111111"}"#,
+);
 
 async fn server(delay: u64, error: bool) -> String {
     response_server(delay, error, HASH_BODY).await
@@ -81,6 +84,10 @@ async fn duplicate_host_paths_keep_ids_first_ack_and_detached_error() {
         .find(|r| r.phase == "detached_completion")
         .unwrap();
     assert_eq!((late.endpoint_id, late.result), (0, "rpc_error"));
+    assert_eq!(
+        (late.http_status, late.rpc_code, late.cause),
+        (Some(200), Some(-32000), Some("rpc_error"))
+    );
     assert!(
         late.started_utc_ms.is_some()
             && late.completed_utc_ms.is_some()
