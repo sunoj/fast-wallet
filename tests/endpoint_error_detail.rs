@@ -41,9 +41,9 @@ async fn server(success_ready: Arc<Notify>) -> String {
 
 fn reply(path: &str) -> (&'static str, String) {
     let body = match path {
-        "/status" => return ("403 Forbidden", "private response text".into()),
+        "/status" => return ("403 Forbidden", "execution reverted".into()),
         "/decode" => return ("200 OK", "invalid JSON".into()),
-        "/missing" => r#"{"error":{"message":"private response text"}}"#.to_string(),
+        "/missing" => r#"{"error":{"message":"execution reverted"}}"#.to_string(),
         "/string" => r#"{"error":{"code":"denied","message":"private response text"}}"#.to_string(),
         "/numeric" => r#"{"error":{"code":-32000,"message":"private response text"}}"#.to_string(),
         _ => format!(r#"{{"result":"{HASH}"}}"#),
@@ -153,6 +153,9 @@ async fn malformed_codes_are_rpc_causes_without_changing_returned_errors() {
             .broadcast_transaction_detailed("0x01")
             .await
             .unwrap_err();
+        assert!(!baseline.is_definitive_rejection());
+        assert!(!plain.is_definitive_rejection());
+        let batch_error = endpoint_error(&baseline).to_string();
         assert_eq!(without_timing(baseline), without_timing(plain));
         assert_eq!(
             (row.http_status, row.rpc_code, row.cause),
@@ -163,13 +166,17 @@ async fn malformed_codes_are_rpc_causes_without_changing_returned_errors() {
             .send_raw_transaction("0x01")
             .await
             .unwrap_err();
-        let expected = if path == "numeric" {
-            "RPC error -32000: private response text"
-        } else {
-            "error decoding response body"
-        };
-        assert!(direct.to_string().contains(expected));
+        assert!(!direct.is_definitive_rejection());
+        assert_eq!(batch_error, direct.to_string());
     }
+}
+
+fn endpoint_error(error: &WalletError) -> &str {
+    let WalletError::BroadcastFailed(failure) = error else {
+        panic!("expected structured broadcast failure");
+    };
+    assert_eq!(failure.endpoints.len(), 1);
+    &failure.endpoints[0].error
 }
 
 fn without_timing(error: WalletError) -> String {

@@ -13,7 +13,8 @@ Started at 0.2.1; earlier releases are recorded only in git tags and commit mess
 
 - Endpoint completion observations include HTTP status, integer JSON-RPC code, and a fixed
   cause label, including detached completions. Missing and non-integer RPC codes are
-  classified as RPC errors in observations while returned errors retain their prior behavior.
+  classified as RPC errors in observations; returned errors remain URL-redacted reqwest
+  decode errors because the response envelope requires an integer code.
   Observations contain no response bodies, headers, URLs, or free-form error messages.
 
 ### Changed

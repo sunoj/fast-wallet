@@ -175,7 +175,6 @@ mod batch;
 pub(crate) use batch::normalized_url;
 pub use batch::DEFAULT_BROADCAST_SEND_TIMEOUT;
 
-#[cfg(test)]
 mod client;
 mod detail;
 mod reads;

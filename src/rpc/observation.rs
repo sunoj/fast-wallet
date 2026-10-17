@@ -102,7 +102,9 @@ impl Observation {
     ) -> WalletResult<(B256, bool)> {
         let mut detail = super::detail::ErrorDetail::default();
         let result =
-            match tokio::time::timeout(timeout, client.send_with_detail(tx, metadata)).await {
+            match tokio::time::timeout(timeout, client.send_with_detail(tx, Some(&mut detail)))
+                .await
+            {
                 Ok(result) => result,
                 Err(_) => {
                     detail.cause = Some("timeout");
