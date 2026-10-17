@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Started at 0.2.1; earlier releases are recorded only in git tags and commit messages.
 
+## [0.3.0] - 2026-10-17
+
+### Added
+
+- Endpoint completion observations include HTTP status, integer JSON-RPC code, and a fixed
+  cause label, including detached completions. Missing and non-integer RPC codes are
+  classified as RPC errors in observations while returned errors retain their prior behavior.
+  Observations contain no response bodies, headers, URLs, or free-form error messages.
+
+### Changed
+
+- `EndpointObservation` is now non-exhaustive and has three additional fields. This breaks
+  external struct construction and exhaustive destructuring. Dispatch and first-success
+  summaries have no response metadata; completion observations carry the response details.
+- Broadcast requests, first-success selection, returned errors, and detached execution retain
+  their existing behavior. HTTP status is observed without imposing an HTTP rejection policy.
+
 ## [0.2.15] - 2026-10-15
 
 ### Changed
