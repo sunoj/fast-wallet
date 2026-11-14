@@ -6,20 +6,20 @@
 //! - Race-based broadcasting (first success wins)
 //! - Configurable retry strategies
 
+mod race;
+
 use crate::error::{WalletError, WalletResult};
 use crate::transaction::Transaction;
 use crate::warm::WarmState;
 use alloy::primitives::B256;
 use dashmap::DashMap;
-use futures_util::future::{join_all, select_all};
-use futures_util::FutureExt;
+use futures_util::future::join_all;
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
 const SLOW_WARMUP_MS: u128 = 100;
@@ -399,28 +399,14 @@ impl TransactionBroadcaster {
         Arc::clone(&state)
     }
 
-    /// POST a JSON-RPC `body` to `endpoint` and read its answer. Unless the
-    /// whole answer arrives, `endpoint` loses its warm state: an error, the
-    /// timeout, a body cut short or a send dropped as a race loser may each
-    /// leave no usable pooled connection.
+    fn limit(&self, endpoint: &RpcEndpoint) -> Duration {
+        endpoint.timeout.unwrap_or(self.default_timeout)
+    }
+
+    /// POST a JSON-RPC `body` to `endpoint`; see [`race::post`] for warm-state loss.
     async fn call(&self, endpoint: &RpcEndpoint, body: &Value) -> WalletResult<RpcResponse> {
         let warm = self.warm_state(&endpoint.url);
-        let guard = warm.loss_guard();
-        let mut request = self.client.post(&endpoint.url).json(body);
-        if let Some((key, value)) = &endpoint.auth_header {
-            request = request.header(key, value);
-        }
-        let limit = endpoint.timeout.unwrap_or(self.default_timeout);
-        let response = timeout(limit, request.send())
-            .await
-            .map_err(|_| WalletError::Timeout)?
-            .map_err(|e| WalletError::NetworkError(crate::redact_urls(&e.to_string())))?;
-        let answer = response
-            .json()
-            .await
-            .map_err(|e| WalletError::RpcError(crate::redact_urls(&e.to_string())))?;
-        guard.disarm();
-        Ok(answer)
+        race::post(&self.client, endpoint, &warm, self.limit(endpoint), body).await
     }
 
     /// Warm up a single endpoint
@@ -477,40 +463,31 @@ impl TransactionBroadcaster {
         }
     }
 
-    /// Send transaction to a single endpoint
-    async fn send_to_endpoint(&self, endpoint: &RpcEndpoint, raw_tx: &str) -> WalletResult<B256> {
-        let request_body = json!({
-            "jsonrpc": "2.0",
-            "method": "eth_sendRawTransaction",
-            "params": [raw_tx],
-            "id": self.next_id(),
-        });
-        let rpc_response = self.call(endpoint, &request_body).await?;
-
-        if let Some(error) = rpc_response.error {
-            return Err(WalletError::RpcError(format_rpc_error(&error)));
+    /// Send transaction to a single endpoint, owning its inputs so it can outlive a race.
+    fn send_to_endpoint(&self, endpoint: &RpcEndpoint, raw_tx: &str) -> race::EndpointSend {
+        race::EndpointSend {
+            client: self.client.clone(),
+            endpoint: endpoint.clone(),
+            warm: self.warm_state(&endpoint.url),
+            limit: self.limit(endpoint),
+            id: self.next_id(),
+            raw_tx: raw_tx.to_string(),
         }
+    }
 
-        // Clean result only — a rejected send leaves the endpoint eligible for
-        // the next warmup probe.
-        self.warm_state(&endpoint.url).mark_success();
-
-        match rpc_response.result {
-            Some(s) => parse_b256_hex(&s),
-            None => {
-                // RPC accepted the TX but returned null result — compute hash locally
-                let hex_str = raw_tx.strip_prefix("0x").unwrap_or(raw_tx);
-                let tx_bytes = hex::decode(hex_str)
-                    .map_err(|e| WalletError::RpcError(format!("Failed to decode raw tx: {e}")))?;
-                let hash = alloy::primitives::keccak256(&tx_bytes);
-                tracing::warn!(
-                    tx_hash = %hash,
-                    endpoint = %crate::rpc::endpoint_host(&endpoint.url),
-                    "RPC returned null result for eth_sendRawTransaction — TX likely accepted"
-                );
-                Ok(hash)
-            }
-        }
+    /// One host-labelled send per endpoint, for [`race::first_success`].
+    fn sends<'a>(
+        &self,
+        endpoints: impl IntoIterator<Item = &'a RpcEndpoint>,
+        raw_tx: &str,
+    ) -> Vec<(String, race::EndpointSend)> {
+        endpoints
+            .into_iter()
+            .map(|endpoint| {
+                let host = crate::endpoint_host(&endpoint.url).to_string();
+                (host, self.send_to_endpoint(endpoint, raw_tx))
+            })
+            .collect()
     }
 
     /// Broadcast transaction using configured strategy.
@@ -556,47 +533,7 @@ impl TransactionBroadcaster {
             };
         }
 
-        let futures: Vec<_> = self
-            .endpoints
-            .iter()
-            .map(|endpoint| {
-                let endpoint_host = crate::endpoint_host(&endpoint.url).to_string();
-                self.send_to_endpoint(endpoint, raw_tx)
-                    .map(move |result| (endpoint_host, result))
-                    .boxed()
-            })
-            .collect();
-
-        let mut errors = Vec::new();
-        let mut pending = futures;
-
-        while !pending.is_empty() {
-            let (result, _index, remaining) = select_all(pending).await;
-            pending = remaining;
-
-            match result {
-                (endpoint_host, Ok(hash)) => {
-                    return BroadcastResult {
-                        tx_hash: Some(hash),
-                        success_count: 1,
-                        failure_count: errors.len(),
-                        errors,
-                        first_success: Some(endpoint_host),
-                    };
-                }
-                (endpoint_host, Err(e)) => {
-                    errors.push((endpoint_host, e));
-                }
-            }
-        }
-
-        BroadcastResult {
-            tx_hash: None,
-            success_count: 0,
-            failure_count: errors.len(),
-            errors,
-            first_success: None,
-        }
+        race::first_success(self.sends(&self.endpoints, raw_tx)).await
     }
 
     /// Broadcast to all endpoints, wait for all responses
@@ -606,7 +543,8 @@ impl TransactionBroadcaster {
             .iter()
             .map(|endpoint| {
                 let endpoint_host = crate::endpoint_host(&endpoint.url).to_string();
-                async move { (endpoint_host, self.send_to_endpoint(endpoint, raw_tx).await) }
+                let send = self.send_to_endpoint(endpoint, raw_tx);
+                async move { (endpoint_host, send.run().await) }
             })
             .collect();
 
@@ -646,7 +584,7 @@ impl TransactionBroadcaster {
         let mut errors = Vec::new();
 
         for endpoint in &self.endpoints {
-            match self.send_to_endpoint(endpoint, raw_tx).await {
+            match self.send_to_endpoint(endpoint, raw_tx).run().await {
                 Ok(hash) => {
                     return BroadcastResult {
                         tx_hash: Some(hash),
@@ -675,39 +613,11 @@ impl TransactionBroadcaster {
     async fn broadcast_private_first(&self, raw_tx: &str) -> BroadcastResult {
         let (private, public): (Vec<_>, Vec<_>) = self.endpoints.iter().partition(|e| e.is_private);
 
-        // Try private relays first (in parallel)
+        // Try private relays first (in parallel); public endpoints only if all fail
         if !private.is_empty() {
-            let futures: Vec<_> = private
-                .iter()
-                .map(|endpoint| {
-                    let endpoint_host = crate::endpoint_host(&endpoint.url).to_string();
-                    self.send_to_endpoint(endpoint, raw_tx)
-                        .map(move |result| (endpoint_host, result))
-                        .boxed()
-                })
-                .collect();
-
-            let mut pending = futures;
-            let mut private_errors = Vec::new();
-
-            while !pending.is_empty() {
-                let (result, _index, remaining) = select_all(pending).await;
-                pending = remaining;
-
-                match result {
-                    (endpoint_host, Ok(hash)) => {
-                        return BroadcastResult {
-                            tx_hash: Some(hash),
-                            success_count: 1,
-                            failure_count: private_errors.len(),
-                            errors: private_errors,
-                            first_success: Some(endpoint_host),
-                        };
-                    }
-                    (endpoint_host, Err(e)) => {
-                        private_errors.push((endpoint_host, e));
-                    }
-                }
+            let result = race::first_success(self.sends(private, raw_tx)).await;
+            if result.tx_hash.is_some() {
+                return result;
             }
         }
 
@@ -721,56 +631,7 @@ impl TransactionBroadcaster {
         endpoints: &[&RpcEndpoint],
         raw_tx: &str,
     ) -> BroadcastResult {
-        if endpoints.is_empty() {
-            return BroadcastResult {
-                tx_hash: None,
-                success_count: 0,
-                failure_count: 0,
-                errors: vec![],
-                first_success: None,
-            };
-        }
-
-        let futures: Vec<_> = endpoints
-            .iter()
-            .map(|endpoint| {
-                let endpoint_host = crate::endpoint_host(&endpoint.url).to_string();
-                self.send_to_endpoint(endpoint, raw_tx)
-                    .map(move |result| (endpoint_host, result))
-                    .boxed()
-            })
-            .collect();
-
-        let mut pending = futures;
-        let mut errors = Vec::new();
-
-        while !pending.is_empty() {
-            let (result, _index, remaining) = select_all(pending).await;
-            pending = remaining;
-
-            match result {
-                (endpoint_host, Ok(hash)) => {
-                    return BroadcastResult {
-                        tx_hash: Some(hash),
-                        success_count: 1,
-                        failure_count: errors.len(),
-                        errors,
-                        first_success: Some(endpoint_host),
-                    };
-                }
-                (endpoint_host, Err(e)) => {
-                    errors.push((endpoint_host, e));
-                }
-            }
-        }
-
-        BroadcastResult {
-            tx_hash: None,
-            success_count: 0,
-            failure_count: errors.len(),
-            errors,
-            first_success: None,
-        }
+        race::first_success(self.sends(endpoints.iter().copied(), raw_tx)).await
     }
 }
 

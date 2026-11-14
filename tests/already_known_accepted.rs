@@ -7,9 +7,10 @@ mod rpc;
 
 use alloy::primitives::{keccak256, B256};
 use fast_wallet::broadcast::{RpcEndpoint, TransactionBroadcaster};
+use fast_wallet::rpc::{observation::EndpointObservation, BatchRpcClient};
 use fast_wallet::{FastWallet, Transaction, WalletError};
 use rpc::{request, wallet, Reply, Rpc, NONCE};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -69,7 +70,12 @@ async fn batch_already_known_returns_without_waiting_for_a_hung_endpoint() {
 async fn single_endpoint_known_transaction_phrases_are_sends() {
     let geth_legacy = format!("known transaction: {:x}", B256::repeat_byte(9));
     let geth_legacy: &'static str = Box::leak(geth_legacy.into_boxed_str());
-    for message in ["already known", "Already Known", "Known transaction", geth_legacy] {
+    for message in [
+        "already known",
+        "Already Known",
+        "Known transaction",
+        geth_legacy,
+    ] {
         let mut rpc = Rpc::start().await;
         let wallet = wallet(&rpc, vec![]);
         let tx = wallet.sign(request()).unwrap();
@@ -97,8 +103,8 @@ async fn messages_that_only_contain_the_phrase_stay_errors() {
     }
 }
 
-#[tokio::test]
-async fn broadcaster_already_known_reports_the_local_hash() {
+/// One loopback endpoint answering a single request with a JSON-RPC "already known".
+async fn already_known_endpoint() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let url = format!("http://{}", listener.local_addr().expect("address"));
     tokio::spawn(async move {
@@ -112,6 +118,36 @@ async fn broadcaster_already_known_reports_the_local_hash() {
         );
         let _ = stream.write_all(reply.as_bytes()).await;
     });
+    url
+}
+
+#[tokio::test]
+async fn already_known_observation_is_a_success_that_keeps_its_rpc_code() {
+    let client = BatchRpcClient::new(vec![already_known_endpoint().await]).unwrap();
+    let rows = Arc::new(Mutex::new(Vec::new()));
+    let sink = rows.clone();
+    assert!(
+        client.set_observer(Arc::new(move |row: EndpointObservation| {
+            sink.lock().unwrap().push(row)
+        }))
+    );
+    let result = client.broadcast_transaction_detailed("0x01").await;
+    assert_eq!(
+        result.expect("send").tx_hash,
+        format!("{:#x}", keccak256([1]))
+    );
+    let rows = rows.lock().unwrap();
+    let done = rows
+        .iter()
+        .find(|row| row.phase == "completion_before_return")
+        .expect("completion row");
+    assert_eq!(done.result, "client_success");
+    assert_eq!((done.rpc_code, done.cause), (Some(-32000), None));
+}
+
+#[tokio::test]
+async fn broadcaster_already_known_reports_the_local_hash() {
+    let url = already_known_endpoint().await;
     let broadcaster = TransactionBroadcaster::new(vec![RpcEndpoint::public(url)]).unwrap();
     let result = broadcaster.broadcast_raw("0x01").await;
     assert_eq!(result.tx_hash, Some(keccak256([1])), "{:?}", result.errors);

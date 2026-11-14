@@ -61,7 +61,10 @@ async fn assert_still_waited_for(waiting: oneshot::Receiver<bool>) {
         .await
         .expect("slow endpoint got the request")
         .expect("slow endpoint report");
-    assert!(connected, "the losing send was dropped before its endpoint answered");
+    assert!(
+        connected,
+        "the losing send was dropped before its endpoint answered"
+    );
 }
 
 #[tokio::test]
@@ -105,7 +108,10 @@ async fn private_first_success_still_skips_public_endpoints() {
     let result = broadcaster.broadcast_raw("0x01").await;
     assert!(result.tx_hash.is_some(), "{:?}", result.errors);
     let contacted = tokio::time::timeout(Duration::from_millis(200), listener.accept()).await;
-    assert!(contacted.is_err(), "a private success must not reach public endpoints");
+    assert!(
+        contacted.is_err(),
+        "a private success must not reach public endpoints"
+    );
 }
 
 #[tokio::test]

@@ -1,5 +1,5 @@
 // Raw transaction submission and endpoint timing.
-// Implements RpcClient sends, preserving null-result hash fallback.
+// Implements RpcClient sends; null results and already-known answers count as sent.
 use super::*;
 
 impl RpcClient {
@@ -38,13 +38,20 @@ impl RpcClient {
             Ok(result) => parse_b256_hex(&result).map(|hash| (hash, connection_reused)),
             Err(WalletError::RpcError(msg)) if msg == "Empty response" => {
                 // RPC accepted the TX but returned null result — compute hash locally
-                let hex_str = raw_tx.strip_prefix("0x").unwrap_or(raw_tx);
-                let tx_bytes = hex::decode(hex_str)
-                    .map_err(|e| WalletError::RpcError(format!("Failed to decode raw tx: {e}")))?;
-                let hash = alloy::primitives::keccak256(&tx_bytes);
+                let hash = raw_tx_hash(raw_tx)?;
                 tracing::warn!(
                     tx_hash = %hash,
                     "RPC returned null result for eth_sendRawTransaction — TX likely accepted"
+                );
+                Ok((hash, connection_reused))
+            }
+            // The endpoint's pool already holds these signed bytes: a send, not a failure.
+            Err(WalletError::RpcError(msg)) if crate::error::is_already_known_rpc_error(&msg) => {
+                let hash = raw_tx_hash(raw_tx)?;
+                tracing::debug!(
+                    tx_hash = %hash,
+                    endpoint = %endpoint_host(&self.url),
+                    "endpoint already holds the transaction; counted as sent"
                 );
                 Ok((hash, connection_reused))
             }
@@ -79,4 +86,12 @@ impl RpcClient {
         let hex_tx = format!("0x{}", hex::encode(tx_bytes));
         self.send_raw_transaction(&hex_tx).await
     }
+}
+
+/// Hash of a hex-encoded signed transaction, for answers that carry no hash.
+pub(crate) fn raw_tx_hash(raw_tx: &str) -> WalletResult<B256> {
+    let hex_str = raw_tx.strip_prefix("0x").unwrap_or(raw_tx);
+    let tx_bytes = hex::decode(hex_str)
+        .map_err(|e| WalletError::RpcError(format!("Failed to decode raw tx: {e}")))?;
+    Ok(alloy::primitives::keccak256(&tx_bytes))
 }

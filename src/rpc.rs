@@ -180,6 +180,7 @@ mod detail;
 mod reads;
 mod request;
 mod send;
+pub(crate) use send::raw_tx_hash;
 
 #[cfg(test)]
 mod tests;
