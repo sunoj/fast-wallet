@@ -45,16 +45,18 @@ impl RpcClient {
                 );
                 Ok((hash, connection_reused))
             }
-            // The endpoint's pool already holds these signed bytes: a send, not a failure.
-            Err(WalletError::RpcError(msg)) if crate::error::is_already_known_rpc_error(&msg) => {
-                let hash = raw_tx_hash(raw_tx)?;
-                tracing::debug!(
-                    tx_hash = %hash,
-                    endpoint = %endpoint_host(&self.url),
-                    "endpoint already holds the transaction; counted as sent"
-                );
-                Ok((hash, connection_reused))
-            }
+            Err(WalletError::RpcError(msg)) => match raw_tx_hash(raw_tx) {
+                // The endpoint's pool already holds these signed bytes: a send, not a failure.
+                Ok(hash) if crate::error::is_already_known_rpc_error(&msg, &hash) => {
+                    tracing::debug!(
+                        tx_hash = %hash,
+                        endpoint = %endpoint_host(&self.url),
+                        "endpoint already holds the transaction; counted as sent"
+                    );
+                    Ok((hash, connection_reused))
+                }
+                _ => Err(WalletError::RpcError(msg)),
+            },
             Err(e) => Err(e),
         }
     }

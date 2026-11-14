@@ -7,7 +7,7 @@ mod rpc;
 
 use alloy::primitives::{keccak256, B256};
 use fast_wallet::broadcast::{RpcEndpoint, TransactionBroadcaster};
-use fast_wallet::rpc::{observation::EndpointObservation, BatchRpcClient};
+use fast_wallet::rpc::{observation::EndpointObservation, BatchRpcClient, RpcClient};
 use fast_wallet::{FastWallet, Transaction, WalletError};
 use rpc::{request, wallet, Reply, Rpc, NONCE};
 use std::sync::{Arc, Mutex};
@@ -66,52 +66,66 @@ async fn batch_already_known_returns_without_waiting_for_a_hung_endpoint() {
     }
 }
 
+/// Sends one signed tx through a single-endpoint wallet answered with `message(tx hash)`.
+async fn single_send(
+    message: fn(B256) -> String,
+) -> (Arc<FastWallet>, Transaction, Result<B256, WalletError>) {
+    let mut rpc = Rpc::start().await;
+    let wallet = wallet(&rpc, vec![]);
+    let tx = wallet.sign(request()).unwrap();
+    let message: &'static str = Box::leak(message(tx.hash()).into_boxed_str());
+    let sending = send_hash(&wallet, &tx, false);
+    assert!(rpc.next_send().await.send(Reply::Error(message)).is_ok());
+    let outcome = finish(sending).await;
+    (wallet, tx, outcome)
+}
+
 #[tokio::test]
 async fn single_endpoint_known_transaction_phrases_are_sends() {
-    let geth_legacy = format!("known transaction: {:x}", B256::repeat_byte(9));
-    let geth_legacy: &'static str = Box::leak(geth_legacy.into_boxed_str());
-    for message in [
-        "already known",
-        "Already Known",
-        "Known transaction",
-        geth_legacy,
-    ] {
-        let mut rpc = Rpc::start().await;
-        let wallet = wallet(&rpc, vec![]);
-        let tx = wallet.sign(request()).unwrap();
-        let sending = send_hash(&wallet, &tx, false);
-        assert!(rpc.next_send().await.send(Reply::Error(message)).is_ok());
-        assert_accepted(&wallet, &tx, finish(sending).await);
+    let phrases: [fn(B256) -> String; 5] = [
+        |_| "already known".into(),
+        |_| "Already Known".into(),
+        |_| "Known transaction".into(),
+        |hash| format!("known transaction: {}", hex::encode(hash)),
+        |hash| format!("known transaction: {hash:#x}"),
+    ];
+    for phrase in phrases {
+        let (wallet, tx, outcome) = single_send(phrase).await;
+        assert_accepted(&wallet, &tx, outcome);
     }
 }
 
 #[tokio::test]
 async fn messages_that_only_contain_the_phrase_stay_errors() {
-    for message in [
-        "unknown transaction",
-        "execution reverted: already known",
-        "already known: gas price below minimum",
-        "transaction already known to be invalid",
-    ] {
-        let mut rpc = Rpc::start().await;
-        let wallet = wallet(&rpc, vec![]);
-        let tx = wallet.sign(request()).unwrap();
-        let sending = send_hash(&wallet, &tx, false);
-        assert!(rpc.next_send().await.send(Reply::Error(message)).is_ok());
-        let error = finish(sending).await.expect_err(message);
-        assert!(error.to_string().contains(message), "{error}");
+    let messages: [fn(B256) -> String; 7] = [
+        |_| "unknown transaction".into(),
+        |_| "execution reverted: already known".into(),
+        |_| "already known: gas price below minimum".into(),
+        |_| "transaction already known to be invalid".into(),
+        |_| format!("known transaction: {}", hex::encode(B256::repeat_byte(9))),
+        |hash| format!("known transaction: {}; nonce too low", hex::encode(hash)),
+        |hash| format!("known transaction: {}", &hex::encode(hash)[..62]),
+    ];
+    for message in messages {
+        let (wallet, tx, outcome) = single_send(message).await;
+        let error = outcome.expect_err("a partial match must stay an error");
+        assert!(error.to_string().contains(&message(tx.hash())), "{error}");
+        assert_eq!(
+            wallet.inflight_count(),
+            1,
+            "{error}: the nonce stays consumed"
+        );
     }
 }
 
-/// One loopback endpoint answering a single request with a JSON-RPC "already known".
-async fn already_known_endpoint() -> String {
+/// One loopback endpoint answering a single request with `body`.
+async fn answer_once(body: &'static str) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let url = format!("http://{}", listener.local_addr().expect("address"));
     tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.expect("accept");
         let mut buf = [0; 4096];
         let _ = stream.read(&mut buf).await;
-        let body = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"already known"}}"#;
         let reply = format!(
             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
@@ -121,9 +135,24 @@ async fn already_known_endpoint() -> String {
     url
 }
 
+const KNOWN: &str = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"already known"}}"#;
+const KNOWN_WITH_DATA: &str =
+    r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"already known","data":"0x01"}}"#;
+
+#[tokio::test]
+async fn an_already_known_error_carrying_data_stays_an_error() {
+    let client = RpcClient::new(answer_once(KNOWN_WITH_DATA).await).unwrap();
+    let error = client.send_raw_transaction("0x01").await.expect_err("data");
+    assert!(error.to_string().contains("data=0x01"), "{error}");
+    let url = answer_once(KNOWN_WITH_DATA).await;
+    let broadcaster = TransactionBroadcaster::new(vec![RpcEndpoint::public(url)]).unwrap();
+    let result = broadcaster.broadcast_raw("0x01").await;
+    assert_eq!((result.tx_hash, result.failure_count), (None, 1));
+}
+
 #[tokio::test]
 async fn already_known_observation_is_a_success_that_keeps_its_rpc_code() {
-    let client = BatchRpcClient::new(vec![already_known_endpoint().await]).unwrap();
+    let client = BatchRpcClient::new(vec![answer_once(KNOWN).await]).unwrap();
     let rows = Arc::new(Mutex::new(Vec::new()));
     let sink = rows.clone();
     assert!(
@@ -147,7 +176,7 @@ async fn already_known_observation_is_a_success_that_keeps_its_rpc_code() {
 
 #[tokio::test]
 async fn broadcaster_already_known_reports_the_local_hash() {
-    let url = already_known_endpoint().await;
+    let url = answer_once(KNOWN).await;
     let broadcaster = TransactionBroadcaster::new(vec![RpcEndpoint::public(url)]).unwrap();
     let result = broadcaster.broadcast_raw("0x01").await;
     assert_eq!(result.tx_hash, Some(keccak256([1])), "{:?}", result.errors);

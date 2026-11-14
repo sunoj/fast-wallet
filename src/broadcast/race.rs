@@ -62,13 +62,17 @@ impl EndpointSend {
         let host = crate::rpc::endpoint_host(&self.endpoint.url);
         if let Some(error) = answer.error {
             // Same exact match as RpcClient, which never matches an error carrying data.
-            if error.data.is_some() || !crate::error::is_already_known(&error.message) {
-                return Err(WalletError::RpcError(format_rpc_error(&error)));
-            }
-            // The endpoint's pool already holds these signed bytes: a send, not a failure.
-            let hash = crate::rpc::raw_tx_hash(&self.raw_tx)?;
-            debug!(tx_hash = %hash, endpoint = %host, "endpoint already holds the transaction; counted as sent");
-            return Ok(hash);
+            return match crate::rpc::raw_tx_hash(&self.raw_tx) {
+                // The endpoint's pool already holds these signed bytes: a send, not a failure.
+                Ok(hash)
+                    if error.data.is_none()
+                        && crate::error::is_already_known(&error.message, &hash) =>
+                {
+                    debug!(tx_hash = %hash, endpoint = %host, "endpoint already holds the transaction; counted as sent");
+                    Ok(hash)
+                }
+                _ => Err(WalletError::RpcError(format_rpc_error(&error))),
+            };
         }
         // Clean result only — a rejected send leaves the endpoint eligible for
         // the next warmup probe.
@@ -92,15 +96,22 @@ impl EndpointSend {
 /// Run every send on its own task and return on the first success, else with every
 /// error. A send still running when this returns runs to its end and logs its verdict,
 /// so a slow endpoint (a remote sequencer behind a fresh TLS handshake) still gets the
-/// transaction directly when a nearer one answers first.
+/// transaction directly when a nearer one answers first. The sends also outlive a
+/// cancelled caller; each then logs its own verdict.
 pub(super) async fn first_success(sends: Vec<(String, EndpointSend)>) -> BroadcastResult {
     let (report, mut verdicts) = mpsc::unbounded_channel();
     for (host, send) in sends {
         let report = report.clone();
         tokio::spawn(async move {
+            let tx_hash = crate::rpc::raw_tx_hash(&send.raw_tx).unwrap_or_default();
             let started = Instant::now();
             let result = send.run().await;
-            let _ = report.send((host, result, started.elapsed().as_millis() as u64));
+            let verdict = (host, result, started.elapsed().as_millis() as u64);
+            if let Err(mpsc::error::SendError((endpoint, result, endpoint_ms))) =
+                report.send(verdict)
+            {
+                log_late(tx_hash, &endpoint, &result, endpoint_ms);
+            }
         });
     }
     drop(report);
@@ -108,7 +119,7 @@ pub(super) async fn first_success(sends: Vec<(String, EndpointSend)>) -> Broadca
     while let Some((host, result, _)) = verdicts.recv().await {
         match result {
             Ok(hash) => {
-                tokio::spawn(log_late(verdicts, hash));
+                tokio::spawn(drain_late(verdicts, hash));
                 return BroadcastResult {
                     tx_hash: Some(hash),
                     success_count: 1,
@@ -129,18 +140,22 @@ pub(super) async fn first_success(sends: Vec<(String, EndpointSend)>) -> Broadca
     }
 }
 
-async fn log_late(mut verdicts: Verdicts, hash: B256) {
+async fn drain_late(mut verdicts: Verdicts, hash: B256) {
     while let Some((endpoint, result, endpoint_ms)) = verdicts.recv().await {
-        match result {
-            Ok(_) => debug!(
-                tx_hash = %hash, %endpoint, endpoint_ms,
-                "late broadcast endpoint accepted"
-            ),
-            Err(error) => warn!(
-                tx_hash = %hash, %endpoint, endpoint_ms,
-                error = %crate::redact_urls(&error.to_string()),
-                "late broadcast endpoint rejected"
-            ),
-        }
+        log_late(hash, &endpoint, &result, endpoint_ms);
+    }
+}
+
+fn log_late(hash: B256, endpoint: &str, result: &WalletResult<B256>, endpoint_ms: u64) {
+    match result {
+        Ok(_) => debug!(
+            tx_hash = %hash, %endpoint, endpoint_ms,
+            "late broadcast endpoint accepted"
+        ),
+        Err(error) => warn!(
+            tx_hash = %hash, %endpoint, endpoint_ms,
+            error = %crate::redact_urls(&error.to_string()),
+            "late broadcast endpoint rejected"
+        ),
     }
 }
