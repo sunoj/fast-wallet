@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Started at 0.2.1; earlier releases are recorded only in git tags and commit messages.
 
+## [Unreleased]
+
+### Changed
+
+- An `eth_sendRawTransaction` answered with the whole node message "already known" or
+  "known transaction" (any case), or "known transaction: <hash>" whose hash is the submitted
+  transaction's, is a successful send that returns the locally computed hash of the signed
+  bytes. Such answers are keyed by transaction hash, so the endpoint already holds these
+  exact bytes. This applies to
+  `RpcClient::send_raw_transaction*`, every `BatchRpcClient` endpoint, and every
+  `TransactionBroadcaster` endpoint. `FastWallet::send_signed*` therefore returns
+  `Ok(tx.hash())` and records the nonce as broadcast instead of returning `BroadcastFailed`.
+  A batch returns at the first such answer instead of waiting for a hung endpoint's send
+  timeout. Messages that only contain the phrase, such as a revert reason
+  ("execution reverted: already known") or "unknown transaction", and errors that carry
+  `data`, are still errors. The endpoint's observation is `client_success` and keeps the
+  endpoint's `rpc_code`.
+
+### Fixed
+
+- `TransactionBroadcaster` `RaceAll` and `PrivateFirst` (and the public fallback of
+  `PrivateFirst`) ran every endpoint's send on the caller's task and dropped the losers when
+  the first success returned, so a slower endpoint's request was cancelled mid-flight with
+  its connection. Each send now runs on its own task to its end, and the call still returns
+  on the first success. A send that completes after the return logs
+  `late broadcast endpoint accepted` or `late broadcast endpoint rejected` with its endpoint
+  host and redacted error. The sends of a cancelled caller also run to their end, without
+  logging their verdicts. A loser costs its endpoint the warmup window only when it ends
+  without a whole answer. `BatchRpcClient` already ran its losing sends to their end.
+
 ## [0.3.0] - 2026-10-17
 
 ### Added

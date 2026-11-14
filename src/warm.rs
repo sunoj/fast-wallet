@@ -68,8 +68,8 @@ impl WarmState {
     }
 }
 
-/// Held across one request: an error, a timeout, a body cut short or a send
-/// dropped as a race loser each end it armed, and may each leave no usable
+/// Held across one request: an error, a timeout, a body cut short or a request
+/// its caller dropped each end it armed, and may each leave no usable
 /// pooled connection behind.
 pub(crate) struct LossGuard<'a>(Option<&'a WarmState>);
 

@@ -4,8 +4,10 @@
 use thiserror::Error;
 
 mod broadcast;
+mod known;
 pub(crate) use broadcast::matches_fee_or_gas_precheck;
 pub use broadcast::{BroadcastFailure, EndpointFailureClass, EndpointVerdict};
+pub(crate) use known::{is_already_known, is_already_known_rpc_error};
 
 /// Parse the authoritative next nonce from a recognized nonce-too-low error.
 ///

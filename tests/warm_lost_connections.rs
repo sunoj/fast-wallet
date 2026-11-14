@@ -1,5 +1,5 @@
 // Loopback regressions for connections lost without a send() error: a body cut short after its
-// headers, a send dropped as a race loser, a read its caller cancelled, and a server that closes
+// headers, a race loser that times out, a read its caller cancelled, and a server that closes
 // idle HTTP/1.1 connections. Each shows whether the next warmup probes or trusts a dead connection.
 #[allow(dead_code)] // each test binary uses part of the shared mock
 mod support;
@@ -47,16 +47,18 @@ async fn a_broadcast_whose_body_is_cut_short_costs_the_window() {
     assert_eq!(traffic, (2, 2), "the probe re-dialled the cut connection");
 }
 
-/// RaceAll and PrivateFirst return on the first accepted send and drop the
-/// others mid-flight; on HTTP/1.1 that discards their connections.
+/// RaceAll and PrivateFirst return on the first accepted send and leave the
+/// others running on their own tasks. A loser that never answers ends at its
+/// endpoint timeout without a whole answer, which costs that endpoint the window.
 #[tokio::test]
-async fn a_send_dropped_as_a_race_loser_costs_the_window() {
+async fn a_race_loser_that_times_out_costs_the_window() {
+    const LOSER_LIMIT: Duration = Duration::from_millis(50);
     for strategy in [BroadcastStrategy::RaceAll, BroadcastStrategy::PrivateFirst] {
         let fast = Mock::start().await;
         let slow = Mock::start().await;
         let endpoints = vec![
             RpcEndpoint::private(fast.url.clone(), "key"),
-            RpcEndpoint::private(slow.url.clone(), "key"),
+            RpcEndpoint::private(slow.url.clone(), "key").with_timeout(LOSER_LIMIT),
         ];
         let broadcaster = TransactionBroadcaster::new(endpoints)
             .expect("broadcaster")
@@ -66,13 +68,14 @@ async fn a_send_dropped_as_a_race_loser_costs_the_window() {
         slow.mode.store(HANG_SENDS, Ordering::SeqCst);
         let result = broadcaster.broadcast_raw("0x01").await;
         assert!(result.tx_hash.is_some(), "{strategy:?}");
+        tokio::time::sleep(LOSER_LIMIT * 4).await;
 
         assert_eq!(broadcaster.warmup().await, 2);
         let probes = (fast.count("eth_chainId"), slow.count("eth_chainId"));
         assert_eq!(
             probes,
             (1, 2),
-            "{strategy:?}: the winner stays warm, the dropped loser probes again"
+            "{strategy:?}: the winner stays warm, the timed-out loser probes again"
         );
     }
 }
