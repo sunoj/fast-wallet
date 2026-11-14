@@ -31,9 +31,10 @@ Started at 0.2.1; earlier releases are recorded only in git tags and commit mess
   `PrivateFirst`) ran every endpoint's send on the caller's task and dropped the losers when
   the first success returned, so a slower endpoint's request was cancelled mid-flight with
   its connection. Each send now runs on its own task to its end, and the call still returns
-  on the first success. A send that completes after the return, or after its caller was
-  cancelled, logs `late broadcast endpoint accepted` or `late broadcast endpoint rejected`
-  with its endpoint host and redacted error. A loser costs its endpoint the warmup window only when it ends
+  on the first success. A send that completes after the return logs
+  `late broadcast endpoint accepted` or `late broadcast endpoint rejected` with its endpoint
+  host and redacted error. The sends of a cancelled caller also run to their end, without
+  logging their verdicts. A loser costs its endpoint the warmup window only when it ends
   without a whole answer. `BatchRpcClient` already ran its losing sends to their end.
 
 ## [0.3.0] - 2026-10-17

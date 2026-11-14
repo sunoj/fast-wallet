@@ -97,21 +97,15 @@ impl EndpointSend {
 /// error. A send still running when this returns runs to its end and logs its verdict,
 /// so a slow endpoint (a remote sequencer behind a fresh TLS handshake) still gets the
 /// transaction directly when a nearer one answers first. The sends also outlive a
-/// cancelled caller; each then logs its own verdict.
+/// cancelled caller and run to their end, but their verdicts are then not logged.
 pub(super) async fn first_success(sends: Vec<(String, EndpointSend)>) -> BroadcastResult {
     let (report, mut verdicts) = mpsc::unbounded_channel();
     for (host, send) in sends {
         let report = report.clone();
         tokio::spawn(async move {
-            let tx_hash = crate::rpc::raw_tx_hash(&send.raw_tx).unwrap_or_default();
             let started = Instant::now();
             let result = send.run().await;
-            let verdict = (host, result, started.elapsed().as_millis() as u64);
-            if let Err(mpsc::error::SendError((endpoint, result, endpoint_ms))) =
-                report.send(verdict)
-            {
-                log_late(tx_hash, &endpoint, &result, endpoint_ms);
-            }
+            let _ = report.send((host, result, started.elapsed().as_millis() as u64));
         });
     }
     drop(report);
