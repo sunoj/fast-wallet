@@ -44,6 +44,9 @@ pub struct InflightNonceSnapshot {
 struct InflightNonceRecord {
     nonce: u64,
     tx_hashes: BTreeSet<B256>,
+    /// Hashes signed since this nonce was last handed out: a release followed by a re-sign
+    /// starts a new set, while `tx_hashes` keeps the whole history for liveness probes.
+    current_hashes: BTreeSet<B256>,
     status: InflightNonceStatus,
     first_seen: Instant,
     accepted_broadcasts: u32,
@@ -71,6 +74,7 @@ impl InflightNonceRecord {
         tx_hashes.insert(tx_hash);
         Self {
             nonce,
+            current_hashes: tx_hashes.clone(),
             tx_hashes,
             status: InflightNonceStatus::Signed,
             first_seen: now,
@@ -162,7 +166,9 @@ impl InflightNonceLedger {
                     record.release_reason = None;
                     record.first_seen = now;
                     record.accepted_broadcasts = 0;
+                    record.current_hashes.clear();
                 }
+                record.current_hashes.insert(tx_hash);
             })
             .or_insert_with(|| {
                 InflightNonceRecord::new(nonce, tx_hash, max_fee, max_priority, now)

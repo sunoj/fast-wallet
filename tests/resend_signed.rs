@@ -65,3 +65,25 @@ async fn a_released_or_foreign_transaction_is_refused_without_sending() {
         ResendOutcome::Refused(ResendRefusal::NotTracked)
     ));
 }
+
+#[tokio::test]
+async fn the_bytes_of_a_released_nonce_are_refused_after_it_is_reissued() {
+    let mut rpc = Rpc::start().await;
+    let wallet = wallet(&rpc, vec![]);
+    let first = wallet.sign(request()).unwrap();
+    let sending = send(&wallet, &first, true);
+    assert!(rpc.next_send().await.send(Reply::Error(DEFINITIVE)).is_ok());
+    assert!(sending.await.unwrap().is_err());
+    let second = wallet
+        .sign(request().value(alloy::primitives::U256::from(1u64)))
+        .unwrap();
+    assert_eq!(
+        second.nonce(),
+        first.nonce(),
+        "the released nonce is handed out again"
+    );
+    assert!(matches!(
+        wallet.resend_signed(&first, MAX_AGE).await.unwrap(),
+        ResendOutcome::Refused(ResendRefusal::UnknownHash)
+    ));
+}

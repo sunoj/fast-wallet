@@ -2,7 +2,7 @@
 //! Exports ResendRefusal and InflightNonceLedger::resend_eligible; pure, reads the ledger only.
 //! Used by FastWallet::resend_signed before any network call.
 
-use super::{is_unresolved, InflightNonceLedger};
+use super::{is_broadcast_acceptance, is_unresolved, InflightNonceLedger, InflightNonceStatus};
 use alloy::primitives::B256;
 use std::time::Duration;
 
@@ -13,7 +13,7 @@ pub enum ResendRefusal {
     NotTracked,
     /// The nonce is mined or released: the bytes can no longer land, or the nonce may be reused.
     Resolved,
-    /// The ledger never saw this hash at this nonce.
+    /// This hash was not signed at this nonce since the nonce was last handed out.
     UnknownHash,
     /// An unresolved nonce at or below this one is at least `max_age` old.
     TooOld,
@@ -36,7 +36,7 @@ impl InflightNonceLedger {
         if !is_unresolved(record.status) {
             return Err(ResendRefusal::Resolved);
         }
-        if !record.tx_hashes.contains(&hash) {
+        if !record.current_hashes.contains(&hash) {
             return Err(ResendRefusal::UnknownHash);
         }
         let now = self.ledger_now();
@@ -48,6 +48,20 @@ impl InflightNonceLedger {
             return Err(ResendRefusal::TooOld);
         }
         Ok(())
+    }
+
+    /// Record an accepted copy, but only on the record the copy was cleared against: a receipt,
+    /// release, reissue or prune during the send leaves the ledger as it is.
+    pub(crate) fn mark_resend_accepted(&self, nonce: u64, hash: B256) {
+        let mut records = self.records.lock();
+        let Some(record) = records.get_mut(&nonce) else {
+            return;
+        };
+        if is_unresolved(record.status) && record.current_hashes.contains(&hash) {
+            let status = InflightNonceStatus::RebroadcastAccepted;
+            record.status = status;
+            record.accepted_broadcasts += u32::from(is_broadcast_acceptance(status));
+        }
     }
 }
 
@@ -119,6 +133,45 @@ mod tests {
             ledger.resend_eligible(10, hash(2), AGE),
             Err(ResendRefusal::TooOld)
         );
+    }
+
+    #[test]
+    fn a_reissued_nonce_refuses_the_bytes_of_its_previous_owner() {
+        let ledger = InflightNonceLedger::default();
+        ledger.record_signed(10, hash(1), None, None);
+        ledger.mark_released(10, "definitive rejection");
+        ledger.record_signed(10, hash(2), None, None);
+        assert_eq!(
+            ledger.resend_eligible(10, hash(1), AGE),
+            Err(ResendRefusal::UnknownHash)
+        );
+        assert_eq!(ledger.resend_eligible(10, hash(2), AGE), Ok(()));
+        ledger.record_signed(10, hash(3), None, None);
+        assert_eq!(
+            ledger.resend_eligible(10, hash(2), AGE),
+            Ok(()),
+            "an unreleased re-sign keeps both"
+        );
+    }
+
+    #[test]
+    fn an_accepted_copy_does_not_revive_a_resolved_or_missing_record() {
+        let ledger = InflightNonceLedger::default();
+        ledger.record_signed(10, hash(1), None, None);
+        ledger.mark_mined(10, hash(1));
+        ledger.mark_resend_accepted(10, hash(1));
+        assert_eq!(
+            ledger.resend_eligible(10, hash(1), AGE),
+            Err(ResendRefusal::Resolved)
+        );
+        ledger.mark_resend_accepted(11, hash(2));
+        assert_eq!(
+            ledger.resend_eligible(11, hash(2), AGE),
+            Err(ResendRefusal::NotTracked)
+        );
+        ledger.record_signed(12, hash(3), None, None);
+        ledger.mark_resend_accepted(12, hash(3));
+        assert_eq!(ledger.resend_eligible(12, hash(3), AGE), Ok(()));
     }
 
     #[test]

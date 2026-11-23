@@ -26,9 +26,11 @@ impl FastWallet {
     /// Refused without a network call unless the ledger holds `tx`'s nonce, unresolved, with
     /// this hash, and every unresolved nonce at or below it is younger than `max_age`. Pick
     /// `max_age` so a copy and its send timeout end before the caller's stall recovery may
-    /// rewind or cancel by unresolved age. Unlike `send_signed`, no outcome changes the nonce
-    /// state: recycling the nonce of a rejected copy would hand out a nonce whose first copy
-    /// may still be queued. An accepted copy is recorded as a rebroadcast.
+    /// rewind or cancel by unresolved age. Only hashes signed since the nonce was last handed
+    /// out qualify, so a released and reissued nonce never carries its previous owner's bytes.
+    /// Unlike `send_signed`, no outcome changes the nonce state: recycling the nonce of a
+    /// rejected copy would hand out a nonce whose first copy may still be queued. An accepted
+    /// copy is recorded as a rebroadcast only if its record is still the one it was cleared on.
     pub async fn resend_signed(
         &self,
         tx: &Transaction,
@@ -42,7 +44,7 @@ impl FastWallet {
         }
         let result = self.broadcast_signed_result(tx, 0.0).await?;
         self.inflight_nonces
-            .mark_rebroadcast_accepted(tx.nonce(), tx.hash());
+            .mark_resend_accepted(tx.nonce(), tx.hash());
         Ok(ResendOutcome::Sent(result))
     }
 }
