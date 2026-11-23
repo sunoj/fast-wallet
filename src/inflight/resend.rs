@@ -17,6 +17,9 @@ pub enum ResendRefusal {
     UnknownHash,
     /// An unresolved nonce at or below this one is at least `max_age` old.
     TooOld,
+    /// The wallet's allocator holds this nonce as free: released, dropped or rewound and not
+    /// handed out again, or never handed out (`sign_alternatives` signs at the next nonce).
+    NotAllocated,
 }
 
 impl InflightNonceLedger {
@@ -48,6 +51,14 @@ impl InflightNonceLedger {
             return Err(ResendRefusal::TooOld);
         }
         Ok(())
+    }
+
+    /// The wallet handed `nonce` out: hashes signed under an earlier allocation stop being
+    /// current. Status, age and the hash history are left as they are for the other readers.
+    pub(crate) fn start_allocation(&self, nonce: u64) {
+        if let Some(record) = self.records.lock().get_mut(&nonce) {
+            record.current_hashes.clear();
+        }
     }
 
     /// Record an accepted copy, but only on the record the copy was cleared against: a receipt,
@@ -172,6 +183,41 @@ mod tests {
         ledger.record_signed(12, hash(3), None, None);
         ledger.mark_resend_accepted(12, hash(3));
         assert_eq!(ledger.resend_eligible(12, hash(3), AGE), Ok(()));
+    }
+
+    #[test]
+    fn a_new_allocation_retires_the_old_hashes_and_nothing_else() {
+        let ledger = InflightNonceLedger::default();
+        ledger.record_signed(10, hash(1), None, None);
+        ledger.mark_broadcast_accepted(10, hash(1));
+        ledger.backdate_first_seen_for_tests(10, AGE / 2);
+        ledger.start_allocation(10);
+        assert_eq!(
+            ledger.resend_eligible(10, hash(1), AGE),
+            Err(ResendRefusal::UnknownHash)
+        );
+        let snapshot = ledger
+            .lowest_unresolved_at_or_above(10)
+            .expect("still tracked");
+        assert_eq!(snapshot.tx_hashes, vec![hash(1)], "history kept");
+        assert_eq!(snapshot.status, InflightNonceStatus::BroadcastAccepted);
+        assert!(snapshot.age >= AGE / 2, "age kept");
+
+        ledger.record_signed(10, hash(2), None, None);
+        ledger.record_signed(10, hash(3), None, None);
+        assert_eq!(ledger.resend_eligible(10, hash(2), AGE), Ok(()));
+        assert_eq!(
+            ledger.resend_eligible(10, hash(3), AGE),
+            Ok(()),
+            "signatures within one allocation are all current"
+        );
+
+        ledger.start_allocation(11);
+        assert_eq!(
+            ledger.resend_eligible(11, hash(4), AGE),
+            Err(ResendRefusal::NotTracked),
+            "no record is created"
+        );
     }
 
     #[test]

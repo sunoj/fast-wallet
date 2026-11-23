@@ -126,6 +126,13 @@ impl NonceTracker {
         self.gap_count.load(Ordering::Relaxed)
     }
 
+    /// Whether `nonce` is handed out: below the next fresh nonce and not waiting in the
+    /// recycled gaps. A released, dropped or rewound nonce is not, until it is handed out again.
+    pub fn is_allocated(&self, nonce: u64) -> bool {
+        let gaps = self.gaps.lock();
+        nonce < self.current.load(Ordering::Acquire) && !gaps.contains(&nonce)
+    }
+
     /// Sync from chain without rewinding over locally reserved nonces.
     ///
     /// When a nonce-too-low error reports state above the locally believed
@@ -584,6 +591,12 @@ impl SingleAddressNonceManager {
     pub fn gap_count(&self) -> u64 {
         self.tracker.gap_count()
     }
+
+    /// Whether `nonce` is currently handed out. See [`NonceTracker::is_allocated`].
+    #[inline]
+    pub fn is_allocated(&self, nonce: u64) -> bool {
+        self.tracker.is_allocated(nonce)
+    }
 }
 
 #[cfg(test)]
@@ -638,6 +651,37 @@ mod tests {
 
         tracker.release(0);
         assert_eq!(tracker.pending_count(), 0);
+    }
+
+    #[test]
+    fn a_nonce_is_allocated_from_hand_out_until_it_is_released_or_rewound() {
+        let tracker = Arc::new(NonceTracker::new(10));
+        assert!(!tracker.is_allocated(10), "never handed out");
+        let mut first = tracker.reserve();
+        let second = tracker.reserve();
+        assert!(tracker.is_allocated(10) && tracker.is_allocated(11));
+        assert!(!tracker.is_allocated(12), "the next fresh nonce is free");
+
+        first.release();
+        assert!(
+            !tracker.is_allocated(10),
+            "a released middle nonce waits in the gaps"
+        );
+        let mut again = tracker.reserve();
+        assert_eq!(again.nonce(), 10);
+        assert!(tracker.is_allocated(10), "handed out again");
+        again.commit();
+
+        drop(second);
+        assert!(
+            !tracker.is_allocated(11),
+            "a dropped top nonce rolls current back"
+        );
+        assert!(tracker.recover_stalled(10));
+        assert!(
+            !tracker.is_allocated(10),
+            "a rewind frees everything from the chain nonce up"
+        );
     }
 
     #[test]

@@ -44,8 +44,9 @@ pub struct InflightNonceSnapshot {
 struct InflightNonceRecord {
     nonce: u64,
     tx_hashes: BTreeSet<B256>,
-    /// Hashes signed since this nonce was last handed out: a release followed by a re-sign
-    /// starts a new set, while `tx_hashes` keeps the whole history for liveness probes.
+    /// Hashes signed since this nonce was last handed out: the wallet's hand-out
+    /// (`start_allocation`) and a release followed by a re-sign each start a new set, while
+    /// `tx_hashes` keeps the whole history for liveness probes.
     current_hashes: BTreeSet<B256>,
     status: InflightNonceStatus,
     first_seen: Instant,

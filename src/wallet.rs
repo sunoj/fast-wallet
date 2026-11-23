@@ -885,7 +885,7 @@ impl FastWallet {
         let total_start = Instant::now();
 
         let nonce_start = Instant::now();
-        let reservation = self.nonce_manager.reserve();
+        let reservation = self.reserve_allocation();
         let nonce = reservation.nonce();
         let nonce_ms = nonce_start.elapsed().as_millis();
         let mut ctx = PreheatedContext::new(reservation);
@@ -951,7 +951,7 @@ impl FastWallet {
 
         // Allocate all nonces first (lock-free, very fast)
         for _ in 0..count {
-            let reservation = self.nonce_manager.reserve();
+            let reservation = self.reserve_allocation();
             contexts.push(PreheatedContext::new(reservation));
         }
 
@@ -1367,7 +1367,7 @@ impl FastWallet {
     #[inline]
     pub fn sign(&self, mut request: TransactionRequest) -> WalletResult<Transaction> {
         // Auto-assign nonce
-        let nonce = self.nonce_manager.get_nonce();
+        let nonce = self.allocate_nonce();
         request.nonce = nonce;
         request.chain_id = self.config.chain_id;
 
@@ -1424,7 +1424,7 @@ impl FastWallet {
     /// Use with `sign_with_nonce()` to sign a transaction later.
     #[inline]
     pub fn reserve_nonce(&self) -> ReservedNonce {
-        self.nonce_manager.reserve()
+        self.reserve_allocation()
     }
 
     /// Release a reserved nonce number back to the recycling pool.
@@ -1459,7 +1459,7 @@ impl FastWallet {
         let nonce = {
             let mut reservation = ctx.reservation.lock();
             if reservation.is_none() {
-                *reservation = Some(self.nonce_manager.reserve());
+                *reservation = Some(self.reserve_allocation());
             }
             reservation
                 .as_ref()
@@ -1510,7 +1510,7 @@ impl FastWallet {
         max_fee_per_gas: U256,
         max_priority_fee_per_gas: U256,
     ) -> WalletResult<Transaction> {
-        let nonce = self.nonce_manager.get_nonce();
+        let nonce = self.allocate_nonce();
         let request = TransactionRequest::new()
             .to(to)
             .value(value)
@@ -1534,7 +1534,7 @@ impl FastWallet {
         gas_limit: u64,
         gas_price: U256,
     ) -> WalletResult<Transaction> {
-        let nonce = self.nonce_manager.get_nonce();
+        let nonce = self.allocate_nonce();
         let request = TransactionRequest::new()
             .to(to)
             .value(value)
