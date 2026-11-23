@@ -7,6 +7,9 @@ use parking_lot::Mutex;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
+mod resend;
+pub use resend::ResendRefusal;
+
 const MAX_TRACKED_NONCES: usize = 256;
 
 /// Lifecycle state for the latest known activity on a nonce.

@@ -56,14 +56,16 @@ mod warm;
 pub use broadcast::{BroadcastStrategy, BroadcasterBuilder, RpcEndpoint, TransactionBroadcaster};
 pub use error::{parse_nonce_too_low, WalletError, WalletResult};
 pub use gas_provider::GasPriceProvider;
-pub use inflight::{InflightNonceLedger, InflightNonceSnapshot, InflightNonceStatus};
+pub use inflight::{
+    InflightNonceLedger, InflightNonceSnapshot, InflightNonceStatus, ResendRefusal,
+};
 pub use nonce::{NonceManager, ReservedNonce};
 pub use rpc::{endpoint_host, redact_urls, SendResult};
 pub use signer::{FastSigner, KeySource};
 pub use transaction::{Transaction, TransactionRequest, TypedTransaction};
 pub use wallet::{
-    FastWallet, FastWalletBuilder, NonceHealth, PreheatedContext, ReplaceOutcome, VerifyOutcome,
-    WalletConfig, WalletStatus,
+    FastWallet, FastWalletBuilder, NonceHealth, PreheatedContext, ReplaceOutcome, ResendOutcome,
+    VerifyOutcome, WalletConfig, WalletStatus,
 };
 
 /// Re-export commonly used types

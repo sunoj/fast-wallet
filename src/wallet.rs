@@ -23,6 +23,9 @@ use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 use tracing::info;
 
+mod resend;
+pub use resend::ResendOutcome;
+
 /// Gas fetch serializer - uses double-checked locking to ensure only one RPC call
 /// is made when multiple concurrent requests need gas prices.
 struct GasFetchSerializer {
